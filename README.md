@@ -2,6 +2,8 @@
 
 Telegram bot for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), configured from the Harness Web UI.
 
+> Found a bug or have an idea? [Open an issue](https://github.com/Boobaw/dsh-telegram-bot/issues).
+
 The bot connects to Telegram, enforces the allowlists, and bridges DSH agent sessions to Telegram **DM topics**. The **All** topic stays global; every DSH session gets its own topic. The assistant answer is the first message and streams in place as text arrives; the current reasoning block and a rolling tool-call list update after it, then both transient messages are deleted when the answer is ready. A separate **System** topic mirrors bot lifecycle notifications, which also appear in **All**.
 
 ## Features
