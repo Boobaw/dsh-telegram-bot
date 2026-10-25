@@ -4,7 +4,7 @@ Telegram bot for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harn
 
 > Found a bug or have an idea? [Open an issue](https://github.com/Boobaw/dsh-telegram-bot/issues).
 
-The bot connects to Telegram, enforces the allowlists, and bridges DSH agent sessions to Telegram **DM topics**. The **All** topic stays global; every DSH session gets its own topic. The assistant answer is the first message and streams in place as text arrives; the current reasoning block and a rolling tool-call list update after it, then both transient messages are deleted when the answer is ready. A separate **System** topic mirrors bot lifecycle notifications, which also appear in **All**.
+The bot connects to Telegram, enforces the allowlists, and bridges DSH agent sessions to Telegram **DM topics**. The **All** topic stays global; every DSH session gets its own topic. The assistant answer is the first message and streams in place as text arrives; the current reasoning block and a rolling tool-call list update after it, then both transient messages are deleted when the answer is ready. Bot lifecycle notifications go to **All**.
 
 ## Features
 
@@ -17,7 +17,7 @@ The bot connects to Telegram, enforces the allowlists, and bridges DSH agent ses
 - **Plugins page** — the bundle page is informational and points to Settings → Telegram. The bundle switch above it is the plugin on/off control; turning it off unmounts the runtime and aborts polling.
 - **Agent bridge** — an ordinary text message in a session topic starts a DSH agent turn in that session, with assistant text streamed back.
 - **DM topics** — `/sessions` in **All** is the single place for DSH sessions: choose a workspace, then create a new session in it or open an existing one. The selected session continues in its own topic. Requires **Threaded mode** in @BotFather → Bot Settings.
-- **All and System topics** — All is Telegram's default topic and the management hub; System receives bot lifecycle notifications, mirrored into All.
+- **All topic** — Telegram's default topic and the management hub; lifecycle notifications are posted there.
 - **Thinking and tool calls** — reasoning deltas and tool calls are mirrored into the topic, with independent **Show model thinking** / **Show tool calls** switches. Thinking is a 10-line rolling window; the tool-call message shows the last ten calls.
 - **Commands** — `/start`, `/help`, `/sessions`, `/stop`, `/status`, `/current`, `/menu`, `/rename`, `/last`, `/restart`, `/id`, `/ping`.
 - **Approval prompts** — when a tool asks for approval, the session topic gets a styled prompt with **Deny** and **Allow** inline buttons; the decision resolves the exact pending request.
@@ -68,7 +68,7 @@ The token field reports only whether a token is configured. A token supplied by 
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) and save its token in **Settings → Telegram**.
 2. In @BotFather open the bot's **Bot Settings → Threaded mode** and enable it. Without this, private-chat topics cannot be created.
-3. Open the bot chat, tap the bot name and enable **Topics**. **All** is Telegram's default topic; the bot creates **System** for lifecycle notifications.
+3. Open the bot chat, tap the bot name and enable **Topics**. **All** is Telegram's default topic.
 4. Send `/start` in **All**. With an empty user list the bot replies with your user id and chat id, plus the Threaded-mode reminder.
 5. Add your user id to **Allowed users** and press **Save** (or **Restart bot**).
 6. In **All** send `/sessions` to create a new session or pick an existing DSH session. The dialog continues in its own topic.

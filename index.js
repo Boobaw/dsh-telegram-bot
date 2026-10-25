@@ -398,27 +398,23 @@ async function loadState() {
   return { version: 2, sessions: {}, threads: {} }
 }
 
-/** Durable control/system topic ids for the bot chat. */
+/** Durable control-chat id for lifecycle notifications. */
 const TOPICS_PATH = join(STATUS_DIR, 'topics.json')
 
 /**
- * Read the control/system topic mapping.
- * @returns the mapping, or empty ids when absent.
+ * Read the control chat used for lifecycle notifications.
+ * @returns the chat id, or 0 when absent.
  */
 async function loadTopics() {
   try {
     const parsed = JSON.parse(await readFile(TOPICS_PATH, 'utf8'))
-    if (parsed !== null && typeof parsed === 'object') {
-      return {
-        chatId: typeof parsed.chatId === 'number' ? parsed.chatId : 0,
-        allThreadId: typeof parsed.allThreadId === 'number' ? parsed.allThreadId : 0,
-        systemThreadId: typeof parsed.systemThreadId === 'number' ? parsed.systemThreadId : 0,
-      }
+    if (parsed !== null && typeof parsed === 'object' && typeof parsed.chatId === 'number') {
+      return { chatId: parsed.chatId }
     }
   } catch {
-    // Topics are optional until /start creates them.
+    // The control chat is learned on the first /start.
   }
-  return { chatId: 0, allThreadId: 0, systemThreadId: 0 }
+  return { chatId: 0 }
 }
 
 /** Last published runtime snapshot, mirrored to a local diagnostics file. */
@@ -430,7 +426,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'markdown-previews',
+  codeRevision: 'all-only',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -483,8 +479,8 @@ export function apply(ctx, config) {
   const chats = new Map()
   /** Agent API calls use this lifetime; the bot polling lifetime is separate. */
   const bridgeAbort = new AbortController()
-  /** Control/System topic ids. */
-  let topics = { chatId: 0, allThreadId: 0, systemThreadId: 0 }
+  /** Control chat id used for lifecycle notifications. */
+  let topics = { chatId: 0 }
   /** Resolves after the mapping and topic files have been read. */
   const stateReady = Promise.all([
     loadState().then((loaded) => { state = loaded }),
@@ -1918,46 +1914,30 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Ensure the All and System topics exist for this control chat.
-   * @param chatId - chat with Topics enabled.
-   * @param signal - request lifetime.
+   * Remember the chat that owns lifecycle notifications (All, thread 0).
+   * @param chatId - control chat id.
    */
-  async function ensureTopics(chatId, signal) {
-    if (topics.chatId === chatId && topics.systemThreadId !== 0) {
-      if (topics.allThreadId !== 0) {
-        topics.allThreadId = 0
-        await writeFile(TOPICS_PATH, JSON.stringify(topics, null, 2) + '\n', { mode: 0o600 })
-      }
-      return
-    }
-    try {
-      const systemThreadId = await createTopic(chatId, 'System', signal)
-      topics = { chatId, allThreadId: 0, systemThreadId: systemThreadId ?? 0 }
-      await mkdir(STATUS_DIR, { recursive: true })
-      await writeFile(TOPICS_PATH, JSON.stringify(topics, null, 2) + '\n', { mode: 0o600 })
-    } catch (error) {
-      if (!signal.aborted) warn(`ensureTopics failed: ${messageOf(error)}`)
-    }
+  async function rememberControlChat(chatId) {
+    if (topics.chatId === chatId) return
+    topics = { chatId }
+    await mkdir(STATUS_DIR, { recursive: true })
+    await writeFile(TOPICS_PATH, JSON.stringify(topics, null, 2) + '\n', { mode: 0o600 })
   }
 
   /**
-   * Publish a system notification to System and All.
+   * Publish a lifecycle notification into All.
    * @param text - HTML-safe body.
    * @param signal - request lifetime.
    */
-  async function notifySystem(text, signal) {
+  async function notifyAll(text, signal) {
     if (topics.chatId === 0) return
-    const ids = [...new Set([topics.systemThreadId, topics.allThreadId])]
-    for (const threadId of ids) {
-      await call('sendMessage', {
-        chat_id: topics.chatId,
-        ...(threadId === 0 ? {} : { message_thread_id: threadId }),
-        text,
-        parse_mode: 'HTML',
-      }, signal).catch((error) => {
-        if (!signal.aborted) warn(`system notification failed: ${messageOf(error)}`)
-      })
-    }
+    await call('sendMessage', {
+      chat_id: topics.chatId,
+      text,
+      parse_mode: 'HTML',
+    }, signal).catch((error) => {
+      if (!signal.aborted) warn(`lifecycle notification failed: ${messageOf(error)}`)
+    })
   }
 
   /** @returns the display name for a permission preset. */
@@ -2284,7 +2264,7 @@ export function apply(ctx, config) {
     state.sessions[sessionId] = record
     state.threads[`${chatId}:${threadId}`] = sessionId
     await persistState()
-    await notifySystem(`📂 ${tr('Session opened', 'Открыта сессия')} <code>${escapeHtml(sessionId)}</code>`, signal)
+    await notifyAll(`📂 ${tr('Session opened', 'Открыта сессия')} <code>${escapeHtml(sessionId)}</code>`, signal)
     await deliverSessionTopic(record, chatId, signal)
     return record
   }
@@ -2645,7 +2625,7 @@ export function apply(ctx, config) {
     }
 
     if (command === '/start' || command === '/help') {
-      if (!inSession) await ensureTopics(chat.id, signal)
+      await rememberControlChat(chat.id)
       await send(
         chat.id,
         `<b>DeepSeek Harness Telegram bot</b>\n\n` +
@@ -2852,7 +2832,7 @@ export function apply(ctx, config) {
       info(`connected as @${me.username ?? me.id}`)
       await publishStatus({ state: 'running', detail: '', username: me.username ?? String(me.id) })
       await publishCommands(tokenLifetime.signal)
-      await notifySystem(`🟢 ${tr('Bot online', 'Бот онлайн')}: @${escapeHtml(me.username ?? String(me.id))}`, tokenLifetime.signal)
+      await notifyAll(`🟢 ${tr('Bot online', 'Бот онлайн')}: @${escapeHtml(me.username ?? String(me.id))}`, tokenLifetime.signal)
     } catch (error) {
       if (!tokenLifetime.signal.aborted) {
         warn(`getMe failed: ${messageOf(error)}`)
