@@ -16,7 +16,7 @@ The bot connects to Telegram, enforces the allowlists, and bridges DSH agent ses
 - **Restart bot** button — reapplies the saved settings and restarts long polling.
 - **Plugins page** — the bundle page is informational and points to Settings → Telegram. The bundle switch above it is the plugin on/off control; turning it off unmounts the runtime and aborts polling.
 - **Agent bridge** — an ordinary text message in a session topic starts a DSH agent turn in that session, with assistant text streamed back.
-- **DM topics** — `/sessions` in **All** is the single place for DSH sessions: choose a workspace, then create a new session in it or open an existing one. The selected session continues in its own topic.
+- **DM topics** — `/sessions` in **All** is the single place for DSH sessions: choose a workspace, then create a new session in it or open an existing one. The selected session continues in its own topic. Requires **Threaded mode** in @BotFather → Bot Settings.
 - **All and System topics** — All is Telegram's default topic and the management hub; System receives bot lifecycle notifications, mirrored into All.
 - **Thinking and tool calls** — reasoning deltas and tool calls are mirrored into the topic, with independent **Show model thinking** / **Show tool calls** switches. Thinking is a 10-line rolling window; the tool-call message shows the last ten calls.
 - **Commands** — `/start`, `/help`, `/sessions`, `/stop`, `/status`, `/current`, `/menu`, `/rename`, `/last`, `/restart`, `/id`, `/ping`.
@@ -67,10 +67,11 @@ The token field reports only whether a token is configured. A token supplied by 
 ### First run
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) and save its token in **Settings → Telegram**.
-2. Open the bot chat, tap the bot name and enable **Topics**. **All** is Telegram's default topic; the bot creates **System** for lifecycle notifications.
-3. Send `/start` in **All**. With an empty user list the bot replies with your user id and chat id.
-4. Add your user id to **Allowed users** and press **Save** (or **Restart bot**).
-5. In **All** send `/sessions` to create a new session or pick an existing DSH session. The dialog continues in its own topic.
+2. In @BotFather open the bot's **Bot Settings → Threaded mode** and enable it. Without this, private-chat topics cannot be created.
+3. Open the bot chat, tap the bot name and enable **Topics**. **All** is Telegram's default topic; the bot creates **System** for lifecycle notifications.
+4. Send `/start` in **All**. With an empty user list the bot replies with your user id and chat id, plus the Threaded-mode reminder.
+5. Add your user id to **Allowed users** and press **Save** (or **Restart bot**).
+6. In **All** send `/sessions` to create a new session or pick an existing DSH session. The dialog continues in its own topic.
 
 The runtime starts only when **Enable bot** is on, a token is configured, and the profile process is running. It logs connection and polling diagnostics with the `[telegram]` prefix. Runtime state is at `$DSH_HOME/telegram/status.json`, and the topic → session mapping is at `$DSH_HOME/telegram/state.json` (neither contains the token).
 

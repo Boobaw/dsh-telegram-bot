@@ -430,7 +430,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'final-audit',
+  codeRevision: 'threaded-mode',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -2081,7 +2081,7 @@ export function apply(ctx, config) {
         const message = messageOf(error).toLowerCase()
         if (message.includes('duplicate') || message.includes('already')) continue
         if (message.includes('forum') || message.includes('topic')) {
-          throw new Error(tr('Enable Topics in the bot chat: tap the bot name → Topics.', 'Включи Topics в чате с ботом: имя бота сверху → Topics.'))
+          throw new Error(tr('Enable Threaded mode in @BotFather → Bot Settings, then enable Topics in the bot chat (tap the bot name → Topics).', 'Включи Threaded mode в @BotFather → Bot Settings, затем включи Topics в чате с ботом (имя бота сверху → Topics).'))
         }
         throw error
       }
@@ -2510,8 +2510,8 @@ export function apply(ctx, config) {
         await send(
           chat.id,
           tr(
-            `Setup mode.\nYour user id: <code>${from.id}</code>\nYour chat id: <code>${chat.id}</code>\n\nAdd the user id to <b>Settings → Telegram → Allowed users</b>, then press Restart.`,
-            `Режим настройки.\nТвой user id: <code>${from.id}</code>\nТвой chat id: <code>${chat.id}</code>\n\nДобавь user id в <b>Settings → Telegram → Allowed users</b> и нажми Restart.`,
+            `Setup mode.\nYour user id: <code>${from.id}</code>\nYour chat id: <code>${chat.id}</code>\n\nAdd the user id to <b>Settings → Telegram → Allowed users</b>, then press Restart.\n\nBefore opening sessions, enable <b>Threaded mode</b> in @BotFather → Bot Settings.`,
+            `Режим настройки.\nТвой user id: <code>${from.id}</code>\nТвой chat id: <code>${chat.id}</code>\n\nДобавь user id в <b>Settings → Telegram → Allowed users</b> и нажми Restart.\n\nПеред открытием сессий включи <b>Threaded mode</b> в @BotFather → Bot Settings.`,
           ),
           signal,
           threadId,
@@ -2558,6 +2558,7 @@ export function apply(ctx, config) {
           (inSession
             ? `${tr('Current session', 'Текущая сессия')}: <code>${chatState.sessionId}</code>\n`
             : `${tr('Global topic. Choose a session or create a new one.', 'Глобальный чат. Выбери сессию или создай новую.')}\n`) +
+          `\n<b>${tr('First run', 'Первый запуск')}:</b> @BotFather → Bot Settings → <b>Threaded mode</b> → ${tr('Enable', 'Включить')}.\n` +
           `${tr('Commands', 'Команды')}: /sessions, /current, /menu, /rename, /last, /stop, /restart, /status, /id, /ping.`,
         signal,
         threadId,
