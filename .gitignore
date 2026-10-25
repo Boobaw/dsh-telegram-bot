@@ -1,0 +1,29 @@
+# Dependencies and package-manager state
+node_modules/
+.npm-cache/
+pnpm-lock.yaml
+
+# Build and publish artifacts
+*.tgz
+*.log
+.DS_Store
+
+# Local DSH runtime data and test scratch space
+.dsh/
+.dsh-test/
+.dsh-test-*/
+.firefox-test/
+.firefox.log
+test-session-archive/
+state.json
+status.json
+topics.json
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+.credentials.yaml
+*.credentials.yaml
+.npmrc
+cordis.patch.local.yml

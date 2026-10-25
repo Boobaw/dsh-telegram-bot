@@ -1,0 +1,8 @@
+# Bundle layer for dsh-telegram-bot.
+#
+# The row id doubles as the settings namespace the Web page edits. Every
+# editable field is declared `.volatile()` in index.js so the Host can persist
+# it through the profile patch without restarting the plugin.
+- insert:
+    - id: telegram-bot
+      name: 'dsh-telegram-bot'
