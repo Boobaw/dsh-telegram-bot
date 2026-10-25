@@ -151,6 +151,19 @@ function fitAnswerText(text, limit = ANSWER_MARKDOWN_LIMIT) {
 }
 
 /**
+ * Trim a session preview at a line boundary so formatting is not cut mid-construct.
+ * @param text - raw assistant Markdown.
+ * @param limit - maximum characters.
+ * @returns clipped preview.
+ */
+function clipPreview(text, limit = 2500) {
+  if (text.length <= limit) return text
+  const cut = text.slice(0, limit)
+  const newline = cut.lastIndexOf('\n')
+  return newline > limit / 2 ? cut.slice(0, newline) : cut
+}
+
+/**
  * Split raw Markdown into chunks whose converted MarkdownV2 fits Telegram.
  * @param text - complete answer.
  * @param limit - converted character budget.
@@ -426,7 +439,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'questions-1',
+  codeRevision: 'preview-format',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -1138,7 +1151,11 @@ export function apply(ctx, config) {
         reply_markup: { inline_keyboard: keyboard },
       }, signal)
     } catch (error) {
-      if (!signal.aborted) warn(`MarkdownV2 keyboard send failed, falling back: ${messageOf(error)}`)
+      const detail = messageOf(error)
+      if (!signal.aborted) {
+        warn(`MarkdownV2 keyboard send failed, falling back: ${detail}`)
+        await publishStatus({ lastFormatFallback: detail })
+      }
       return call('sendMessage', {
         chat_id: chatId,
         ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }),
@@ -1173,7 +1190,10 @@ export function apply(ctx, config) {
     } catch (error) {
       const detail = messageOf(error)
       if (/not modified/i.test(detail)) return true
-      if (!signal.aborted) warn(`MarkdownV2 keyboard edit failed, falling back: ${detail}`)
+      if (!signal.aborted) {
+        warn(`MarkdownV2 keyboard edit failed, falling back: ${detail}`)
+        await publishStatus({ lastFormatFallback: detail })
+      }
       try {
         await call('editMessageText', {
           chat_id: chatId,
@@ -2532,7 +2552,7 @@ export function apply(ctx, config) {
     const delivered = await sendKeyboardMarkdown(
       chatId,
       record.threadId,
-      `📂 **${title}**\n\n${preview.length > 0 ? preview.slice(0, 1200) : tr('No assistant messages yet.', 'Пока нет ответов ассистента.')}\n\n${tr('Send a message to continue this session.', 'Напиши сообщение, чтобы продолжить эту сессию.')}`,
+      `📂 **${title}**\n\n${preview.length > 0 ? clipPreview(preview) : tr('No assistant messages yet.', 'Пока нет ответов ассистента.')}\n\n${tr('Send a message to continue this session.', 'Напиши сообщение, чтобы продолжить эту сессию.')}`,
       [],
       signal,
     )
@@ -2654,7 +2674,7 @@ export function apply(ctx, config) {
       `**${title}**\n` +
       `${tr('Workspace', 'Workspace')}: \`${String(record?.header.cwd ?? 'unknown').replaceAll('`', '\\`')}\`\n` +
       `${tr('Status', 'Статус')}: ${record?.live ? tr('live', 'активна') : tr('persisted', 'сохранена')}\n\n` +
-      `${preview.length > 0 ? preview.slice(0, 1600) : tr('No assistant messages yet.', 'Пока нет ответов ассистента.')}`
+      `${preview.length > 0 ? clipPreview(preview) : tr('No assistant messages yet.', 'Пока нет ответов ассистента.')}`
     const workspace = ctx.get('workspaceRegistry')?.list()
       ?.find((entry) => entry.path === record?.header.cwd)
     const rows = []
