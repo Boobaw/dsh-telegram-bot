@@ -10,7 +10,7 @@ window.__ModuleLoader__.load({
     const { Button, SettingsSecretField, Switch } = primitives
     const h = React.createElement
 
-    /** Loader row id / settings namespace, equal to the package name. */
+    /** Loader row id / settings namespace; the npm package name is dsh-telegram-bot. */
     const NS = 'telegram-bot'
     /** Default credential reference holding the Telegram bot token. */
     const DEFAULT_TOKEN_REF = 'TELEGRAM_BOT_TOKEN'
@@ -51,7 +51,6 @@ window.__ModuleLoader__.load({
       saving: 'Saving…',
       saved: 'Saved.',
       restart: 'Restart bot',
-      restarting: 'Restarting…',
       restartRequested: 'Restart requested. Check Telegram or the DSH log.',
       restartFailed: 'The Host did not accept the restart request.',
       bundleSummary: 'Telegram bot',
@@ -61,20 +60,6 @@ window.__ModuleLoader__.load({
       pluginConfigSettings: 'plugin settings (cordis.patch.yml)',
       pluginConfigToken: 'bot token (credential store)',
       pluginConfigEnv: 'token fallback for headless deployments',
-      running: 'Running',
-      stopped: 'Stopped',
-      runtimeMissingShort: 'Host not loaded',
-      on: 'On',
-      off: 'Off',
-      pluginRuntimeHint: 'Runtime state from this DSH process. Turning the bundle off stops polling.',
-      pluginQuickControls: 'Quick controls',
-      pluginDisplay: 'Display',
-      bundleSettingsHint: 'Full allowlists are in Settings → Telegram.',
-      tokenConfiguredShort: 'token configured',
-      tokenMissingShort: 'no token',
-      usersShort: 'users',
-      chatsShort: 'chats',
-      bundleDisableHint: 'Turning the plugin off in Plugins stops polling.',
       hostNeedsRestart: 'The Telegram runtime is not loaded in this DSH process yet. Restart dsh web once; after that this page can restart the bot.',
       discard: 'Discard',
       saveFailed: 'The Host did not accept these values.',
@@ -121,7 +106,6 @@ window.__ModuleLoader__.load({
       saving: 'Сохранение…',
       saved: 'Сохранено.',
       restart: 'Перезапустить бота',
-      restarting: 'Перезапуск…',
       restartRequested: 'Запрошен перезапуск. Проверьте Telegram или лог DSH.',
       restartFailed: 'Host не принял запрос на перезапуск.',
       bundleSummary: 'Telegram-бот',
@@ -131,20 +115,6 @@ window.__ModuleLoader__.load({
       pluginConfigToken: 'токен бота (credential store)',
       pluginConfigEnv: 'fallback токена для headless',
       pluginPageLocation: 'Открой Settings → Telegram, чтобы настроить плагин.',
-      running: 'Работает',
-      stopped: 'Остановлен',
-      runtimeMissingShort: 'Host не загружен',
-      on: 'Вкл',
-      off: 'Выкл',
-      pluginRuntimeHint: 'Состояние runtime в этом процессе DSH. Выключение bundle останавливает polling.',
-      pluginQuickControls: 'Быстрые настройки',
-      pluginDisplay: 'Отображение',
-      bundleSettingsHint: 'Полные списки доступа — в Settings → Telegram.',
-      tokenConfiguredShort: 'токен настроен',
-      tokenMissingShort: 'нет токена',
-      usersShort: 'пользователей',
-      chatsShort: 'чатов',
-      bundleDisableHint: 'Выключение плагина в Plugins останавливает polling.',
       hostNeedsRestart: 'Telegram runtime ещё не загружен в этот процесс DSH. Перезапусти dsh web один раз; после этого кнопка рестарта заработает.',
       discard: 'Отменить',
       saveFailed: 'Host не принял эти значения.',
@@ -189,22 +159,9 @@ window.__ModuleLoader__.load({
       .dtb-message{min-height:20px;font-size:12px;line-height:20px}
       .dtb-messageOk{color:var(--dsw-alias-state-success-primary)}
       .dtb-messageError{color:var(--dsw-alias-state-error-primary)}
-      .dtb-bundle{display:flex;flex-direction:column;gap:12px}
       .dtb-plugin{display:flex;flex-direction:column;gap:16px;padding-top:4px}
-      .dtb-pluginTop{display:flex;flex-direction:column;gap:8px}
-      .dtb-bundleMeta{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
-      .dtb-pluginGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
-      .dtb-stat{display:flex;flex-direction:column;gap:2px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1)}
-      .dtb-statLabel{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}
-      .dtb-statValue{font-size:15px;line-height:22px;font-weight:600}
-      .dtb-pluginSection{display:flex;flex-direction:column;gap:10px}
-      .dtb-pluginSectionTitle{margin:0;font-size:13px;font-weight:600;line-height:20px}
-      .dtb-pluginControls{display:flex;flex-direction:column;gap:10px}
-      .dtb-pluginControl{display:flex;align-items:center;justify-content:space-between;gap:16px}
-      .dtb-pluginActions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
       .dtb-notice{margin:0;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}
       .dtb-loading{padding:16px 0;color:var(--dsw-alias-label-tertiary);font-size:13px}
-      .dtb-note{margin:0;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:17px}
       @media (max-width:560px){.dtb-toggleRow{align-items:flex-start;flex-direction:column;gap:8px}.dtb-footer{align-items:stretch;flex-direction:column}.dtb-footerActions{justify-content:flex-end}}
     `
 
@@ -715,11 +672,11 @@ window.__ModuleLoader__.load({
 
 
     /**
-     * Compact controls on the Plugins page's bundle detail. The full allowlists
-     * stay in Settings → Telegram; this card owns the restart and token/status
-     * summary. The bundle switch itself is the plugin's on/off control.
-     * @param props - locale reader, settings form, credential operations, view.
-     * @returns the summary line or the quick controls.
+     * Informational card on the Plugins page's bundle detail. All controls live
+     * in Settings → Telegram; this card only points there and lists the manual
+     * configuration files. The bundle switch is the plugin's on/off control.
+     * @param props - locale reader and slot view.
+     * @returns the summary line or the settings pointer.
      */
     function BundleSettings(props) {
       const { t, view } = props
@@ -809,7 +766,7 @@ window.__ModuleLoader__.load({
                 name: 'plugins.bundle.config',
                 key: 'dsh-telegram-bot',
                 locale: NS,
-                inject: () => ({ t, form, token }),
+                inject: () => ({ t }),
               },
               BundleSettings,
             ),

@@ -14,26 +14,26 @@ The bot connects to Telegram, enforces the allowlists, and bridges DSH agent ses
 - **Allowed chats** — Telegram chat ids or `@channelnames`; empty means private chats only.
 - **Enable bot** toggle.
 - **Restart bot** button — reapplies the saved settings and restarts long polling.
-- **Quick controls on the Plugins page** — the bundle's detail page shows token state, access counts, and the same restart button. The bundle switch itself is the on/off control; turning the plugin off unmounts it and aborts polling.
+- **Plugins page** — the bundle page is informational and points to Settings → Telegram. The bundle switch above it is the plugin on/off control; turning it off unmounts the runtime and aborts polling.
 - **Agent bridge** — an ordinary text message in a session topic starts a DSH agent turn in that session, with assistant text streamed back.
 - **DM topics** — `/sessions` in **All** is the single place for DSH sessions: choose a workspace, then create a new session in it or open an existing one. The selected session continues in its own topic.
 - **All and System topics** — All is Telegram's default topic and the management hub; System receives bot lifecycle notifications, mirrored into All.
-- **Thinking and tool calls** — reasoning deltas and tool calls are mirrored into the topic, with independent **Show model thinking** / **Show tool calls** switches.
+- **Thinking and tool calls** — reasoning deltas and tool calls are mirrored into the topic, with independent **Show model thinking** / **Show tool calls** switches. Thinking is a 10-line rolling window; the tool-call message shows the last ten calls.
 - **Commands** — `/start`, `/help`, `/sessions`, `/stop`, `/status`, `/current`, `/menu`, `/rename`, `/last`, `/restart`, `/id`, `/ping`.
 - **Approval prompts** — when a tool asks for approval, the session topic gets a styled prompt with **Deny** and **Allow** inline buttons; the decision resolves the exact pending request.
 - **Session controls** — an inline 2×2 panel in each session topic: **Model** (Flash/Pro), **Effort** (off/low/high/max), **Mode** (permission preset), and **Context** (window, last request usage, and cache-hit percentage). Telegram reply keyboards are chat-wide, so the controls are a per-topic inline panel rather than a bottom keyboard.
-- **Recovery** — `/last [n]` shows the latest assistant answer(s) from the bound session, useful after switching between Web and Telegram. `/rename <name>` changes the Telegram topic title; `/restart` restarts the Telegram runtime; `/menu` reposts the bottom controls.
+- **Recovery** — `/last [n]` shows the latest assistant answer(s) from the bound session, useful after switching between Web and Telegram. `/rename <name>` changes the Telegram topic title; `/restart` restarts the Telegram runtime; `/menu` opens the inline session controls.
 - **Language** — bot messages and the Telegram command menu default to English; a Settings selector switches them to Russian.
 - **Formatting** — assistant Markdown (headings, bold, lists, code, links, tables) is converted to Telegram MarkdownV2.
-- **Command hints** — the runtime publishes the list with `setMyCommands`, so Telegram shows the commands and descriptions when the user types `/`. English is the default; Russian clients get localized descriptions.
+- **Command hints** — the runtime publishes the list with `setMyCommands`, so Telegram shows the commands and descriptions when the user types `/`. The descriptions follow the selected Bot language; English is the default.
 - English and Russian page copy; Russian is registered as an optional language pack.
 
 ## Install
 
-From this checkout:
+From this checkout, run in the repository root:
 
 ```sh
-npx @deepseek-ai/dsh plugin --profile web add /home/boobaw/dsh-plugin-tg-bot
+npx @deepseek-ai/dsh plugin --profile web add .
 ```
 
 After publishing to npm:
@@ -44,7 +44,7 @@ npx @deepseek-ai/dsh plugin --profile web add dsh-telegram-bot
 
 `dsh plugin add` installs the package and selects its bundle in `dsh.profile.bundles` when the package declares `dsh.bundle`. Restart `dsh web` if the running profile does not pick the new bundle up through HMR.
 
-Then open **Settings → Telegram** (or **Plugins → dsh-telegram-bot**) in the Web UI.
+Then open **Settings → Telegram** (or **Plugins → Telegram Bot**) in the Web UI.
 
 ## Configure
 
@@ -127,15 +127,13 @@ No browser and no port are opened. `Ctrl+C` stops the process; `$DSH_HOME/telegr
 
 ## Plugins page
 
-The bundle detail page in **Plugins** renders a compact card with:
+The bundle detail page in **Plugins** is a short informational panel:
 
-- token state and the current number of allowed users/chats;
-- **Restart bot**;
-- a pointer to **Settings → Telegram** for editing the full lists.
+- it points to **Settings → Telegram** for token, access lists, language and display options;
+- it lists the manual configuration files for headless setups;
+- it does not duplicate the settings controls.
 
-There is deliberately no bot on/off switch on this page: the bundle switch above the card disables the whole plugin, and the runtime's `ctx.effect` cleanup aborts polling when it unmounts. **Settings → Telegram → Enable bot** remains a soft pause that keeps the plugin loaded.
-
-The full page remains in Settings because allowlist editing needs room for chips and validation.
+The bundle switch above the panel is the plugin on/off control. **Settings → Telegram → Enable bot** is a soft pause that keeps the plugin loaded but stops polling.
 
 ## Security
 
@@ -178,11 +176,9 @@ A Git URL or tarball also works for DSH (`dsh plugin add github:you/dsh-telegram
 
 ## Roadmap
 
-1. Approval and question answerers with inline buttons.
-2. Tool-call cards and richer streaming presentation.
-3. File attachments and voice input.
-4. Model/preset selection from the chat.
-5. Multiple chats and group/topic routing.
+1. File attachments and voice input.
+2. Multiple chats and group/topic routing.
+3. Richer tool-result summaries.
 
 ## License
 

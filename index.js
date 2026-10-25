@@ -1,14 +1,10 @@
 /**
  * Host half of dsh-telegram-bot.
  *
- * It owns two things:
- *  - the editable settings namespace (`enabled`, allowlists, restart request);
- *  - a deliberately small Telegram long-polling runtime, so the Restart button
- *    and the allowlists do something real before the full agent bridge lands.
- *
- * The runtime answers only a handful of diagnostic commands. Wiring Telegram
- * chats to DSH agents is the next step; keeping this layer small means a bad
- * token or a conflicting poller can never take the Host down.
+ * It owns the editable settings namespace, the Telegram long-polling runtime,
+ * the DM-topic session browser, and the bridge between Telegram topics and
+ * DSH agent sessions. Keeping the runtime isolated means a bad token or a
+ * conflicting poller cannot take the Host down.
  */
 import z from '@deepseek-ai/schemastery'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
@@ -18,13 +14,11 @@ import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import telegramifyMarkdown from 'telegramify-markdown'
 
-/** Loader row id; keep it equal to the package name and the client namespace. */
+/** Loader row id and settings namespace; the npm package name stays dsh-telegram-bot. */
 export const name = 'telegram-bot'
 
 /** Default credential reference holding the bot token. */
 const DEFAULT_TOKEN_REF = 'TELEGRAM_BOT_TOKEN'
-/** Telegram Bot API root; the token is appended per request. */
-const API_ROOT = 'https://api.telegram.org'
 /** Long-poll timeout requested from Telegram, in seconds. */
 const POLL_TIMEOUT_SECONDS = 25
 /** Pause after a failed poll before trying again, in milliseconds. */
@@ -436,7 +430,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'format-4',
+  codeRevision: 'final-audit',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -540,7 +534,6 @@ export function apply(ctx, config) {
         thinkingMessageId: null,
         thinkingTimer: null,
         thinkingLastText: '',
-        thinkingIsStatus: false,
         tools: [],
         toolMessageId: null,
         toolTimer: null,
@@ -574,19 +567,6 @@ export function apply(ctx, config) {
       ...(chat.permission === undefined ? {} : { permission: chat.permission }),
       updatedAt: Date.now(),
     }
-    await persistState()
-  }
-
-  /**
-   * Remove one topic's session binding without deleting the session.
-   * @param chat - chat bridge state.
-   */
-  async function unbindSession(chat) {
-    const sessionId = chat.sessionId
-    chat.sessionId = undefined
-    chat.boundAgent = undefined
-    delete state.threads[chat.key]
-    if (typeof sessionId === 'string') delete state.sessions[sessionId]
     await persistState()
   }
 
@@ -1004,7 +984,7 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Send one HTML-safe diagnostic message.
+   * Send one HTML-formatted message.
    * @param chatId - target chat.
    * @param text - message body.
    * @param signal - runtime lifetime.
@@ -1499,7 +1479,6 @@ export function apply(ctx, config) {
     chat.thinkingText = ''
     chat.thinkingLastText = ''
     chat.thinkingMessageId = null
-    chat.thinkingIsStatus = false
     chat.tools = []
     chat.toolLastText = ''
     chat.toolMessageId = null
@@ -1625,7 +1604,6 @@ export function apply(ctx, config) {
     }
     if (frame.type === 'chunk' && frame.chunk?.type === 'reasoning-delta') {
       if (readLive(config.showThinking, true) !== true) return
-      chat.thinkingIsStatus = false
       chat.thinkingText += frame.chunk.text
       scheduleThinking(chat)
       return
@@ -1669,7 +1647,7 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Flush the final assistant text, replacing or splitting the placeholder.
+   * Flush the final assistant text into the first answer message and split it.
    * @param chat - chat bridge state.
    */
   async function finalizeChat(chat) {
@@ -1922,7 +1900,7 @@ export function apply(ctx, config) {
     return [
       [
         { text: `🤖 ${modelLabel(current.model)}`, callback_data: 'o:model' },
-        { text: `🧠 ${tr('Effort', 'Режим')}: ${effortLabel(current.reasoningEffort)}`, callback_data: 'o:effort' },
+        { text: `🧠 ${tr('Effort', 'Усилие')}: ${effortLabel(current.reasoningEffort)}`, callback_data: 'o:effort' },
       ],
       [
         { text: `🛡 ${permissionLabel(permission)}`, callback_data: 'o:mode' },
@@ -2484,8 +2462,7 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Answer one authorized message. This is intentionally a diagnostic surface
-   * until the DSH Agent bridge replaces it.
+   * Handle one authorized Telegram message and dispatch its command or prompt.
    * @param message - Telegram message.
    * @param signal - runtime lifetime.
    * @param type - Telegram update key, for diagnostics.
@@ -2944,5 +2921,3 @@ export function apply(ctx, config) {
     'dsh-telegram-bot: runtime',
   )
 }
-
-export { preprocessTables, toTelegramMarkdown, splitAnswerText, fitAnswerText }

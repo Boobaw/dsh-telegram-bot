@@ -49,5 +49,13 @@
     "telegram",
     "bot"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Boobaw/dsh-telegram-bot.git"
+  },
+  "homepage": "https://github.com/Boobaw/dsh-telegram-bot#readme",
+  "bugs": {
+    "url": "https://github.com/Boobaw/dsh-telegram-bot/issues"
+  }
 }
