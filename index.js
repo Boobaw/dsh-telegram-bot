@@ -426,7 +426,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'all-only',
+  codeRevision: 'questions-1',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -535,6 +535,7 @@ export function apply(ctx, config) {
         toolTimer: null,
         toolLastText: '',
         boundAgent: undefined,
+        questionAgent: undefined,
       }
       chats.set(key, chat)
     }
@@ -1236,6 +1237,8 @@ export function apply(ctx, config) {
 
   /** Pending inline approval prompts keyed by short callback id. */
   const pendingApprovals = new Map()
+  /** Pending structured user questions keyed by short callback id. */
+  const pendingQuestions = new Map()
 
   /**
    * Resolve one pending approval and update its prompt in place.
@@ -1318,6 +1321,292 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Find a pending question batch for one Telegram topic.
+   * @param chatId - Telegram chat id.
+   * @param threadId - topic thread.
+   * @returns the pending batch, if any.
+   */
+  function pendingQuestionFor(chatId, threadId) {
+    for (const pending of pendingQuestions.values()) {
+      if (pending.chatId === chatId && pending.threadId === threadId) return pending
+    }
+    return undefined
+  }
+
+  /**
+   * Render the current question prompt as raw Markdown.
+   * @param pending - in-flight question batch.
+   * @returns Markdown body.
+   */
+  function questionText(pending) {
+    const question = pending.questions[pending.index]
+    const lines = []
+    if (question.header !== undefined) lines.push(`**${question.header}**`)
+    if (question.intent?.kind === 'plan-review') lines.push(`**${tr('Plan review', 'Проверка плана')}**`)
+    lines.push(question.question)
+    if (question.detail !== undefined) {
+      const detail = question.detail.length > 3000 ? `${question.detail.slice(0, 2999)}…` : question.detail
+      lines.push('', detail)
+    }
+    lines.push('', `_${tr('Question', 'Вопрос')} ${pending.index + 1}/${pending.questions.length}_`)
+    if (pending.awaitingCustom) lines.push(`**${tr('Reply to this message with your answer.', 'Ответь на это сообщение своим вариантом.')}**`)
+    else if ((question.options ?? []).length === 0) lines.push(`**${tr('Reply to this message with your answer.', 'Ответь на это сообщение своим вариантом.')}**`)
+    return lines.join('\n')
+  }
+
+  /**
+   * Build the inline keyboard for the current question.
+   * @param pending - in-flight question batch.
+   * @returns keyboard rows.
+   */
+  function questionKeyboard(pending) {
+    const question = pending.questions[pending.index]
+    const rows = []
+    for (const [index, option] of (question.options ?? []).slice(0, 8).entries()) {
+      const mark = pending.selected.has(option.label) ? '✅ ' : ''
+      rows.push([{ text: `${mark}${shortLabel(option.label, 50)}`, callback_data: `q:${pending.id}:${index}` }])
+    }
+    if (question.multiSelect === true) {
+      rows.push([{ text: tr('✅ Done', '✅ Готово'), callback_data: `q:${pending.id}:done` }])
+    }
+    if ((question.options ?? []).length > 0) {
+      rows.push([{ text: tr('✍️ Custom answer', '✍️ Свой ответ'), callback_data: `q:${pending.id}:custom` }])
+    }
+    return rows
+  }
+
+  /**
+   * Send or update the current question prompt in its topic.
+   * @param pending - in-flight question batch.
+   * @returns true when Telegram accepted the prompt.
+   */
+  async function sendQuestionPrompt(pending) {
+    const question = pending.questions[pending.index]
+    pending.awaitingCustom = (question.options ?? []).length === 0
+    const keyboard = pending.awaitingCustom ? [] : questionKeyboard(pending)
+    const result = await sendKeyboardMarkdown(
+      pending.chatId,
+      pending.threadId,
+      questionText(pending),
+      keyboard,
+      pending.signal,
+    )
+    if (result?.message_id === undefined) return false
+    pending.messageId = result.message_id
+    return true
+  }
+
+  /**
+   * Finish a question batch and resolve the DSH request.
+   * @param pending - completed batch.
+   */
+  function finishQuestions(pending) {
+    if (!pendingQuestions.delete(pending.id)) return
+    pending.signal?.removeEventListener('abort', pending.onAbort)
+    pending.resolve({ answers: pending.answers })
+    void editKeyboardMarkdown(
+      pending.chatId,
+      pending.threadId,
+      pending.messageId,
+      `✅ **${tr('Answer recorded', 'Ответ принят')}**`,
+      [],
+      bridgeAbort.signal,
+    )
+  }
+
+  /**
+   * Record one answer and advance to the next question.
+   * @param pending - in-flight batch.
+   * @param selected - selected option labels.
+   * @param custom - optional free-text answer.
+   * @param signal - request lifetime.
+   */
+  async function completeQuestion(pending, selected, custom, signal) {
+    if (pending.busy) return
+    pending.busy = true
+    try {
+      const question = pending.questions[pending.index]
+      pending.answers.push({
+        id: question.id,
+        selected,
+        ...(custom === undefined || custom.length === 0 ? {} : { custom }),
+      })
+      const summary = [
+        `✅ **${tr('Answer recorded', 'Ответ принят')}**`,
+        '',
+        question.question,
+        ...(selected.length > 0 ? [`${tr('Selected', 'Выбрано')}: ${selected.join(', ')}`] : []),
+        ...(custom !== undefined && custom.length > 0 ? [`${tr('Custom', 'Свой ответ')}: ${custom}`] : []),
+      ].join('\n')
+      await editKeyboardMarkdown(pending.chatId, pending.threadId, pending.messageId, summary, [], signal)
+      pending.selected = new Set()
+      pending.awaitingCustom = false
+      pending.index += 1
+      if (pending.index < pending.questions.length) {
+        if (!await sendQuestionPrompt(pending)) {
+          pendingQuestions.delete(pending.id)
+          pending.signal?.removeEventListener('abort', pending.onAbort)
+          pending.reject(new Error('Telegram could not display the next question'))
+        }
+      } else {
+        finishQuestions(pending)
+      }
+    } finally {
+      pending.busy = false
+    }
+  }
+
+  /**
+   * Ask the Telegram user one structured question batch.
+   * @param agent - requesting agent.
+   * @param chat - chat bridge state.
+   * @param req - user-questions request.
+   * @param next - downstream answerer chain.
+   * @returns the structured answer.
+   */
+  async function requestUserQuestions(agent, chat, req, next) {
+    if (chat.boundAgent !== agent || typeof chat.sessionId !== 'string') return next()
+    if (pendingQuestionFor(chat.chatId, chat.threadId) !== undefined) return next()
+    const signal = req.signal ?? bridgeAbort.signal
+    if (signal.aborted) return next()
+    const id = randomUUID().replaceAll('-', '').slice(0, 10)
+    let resolvePromise
+    let rejectPromise
+    const promise = new Promise((resolve, reject) => {
+      resolvePromise = resolve
+      rejectPromise = reject
+    })
+    const pending = {
+      id,
+      chatId: chat.chatId,
+      threadId: chat.threadId,
+      signal,
+      questions: Array.isArray(req.questions) ? req.questions : [],
+      index: 0,
+      answers: [],
+      selected: new Set(),
+      awaitingCustom: false,
+      busy: false,
+      messageId: undefined,
+      resolve: resolvePromise,
+      reject: rejectPromise,
+      onAbort: undefined,
+    }
+    if (pending.questions.length === 0) return next()
+    pending.onAbort = () => {
+      if (!pendingQuestions.delete(id)) return
+      signal.removeEventListener('abort', pending.onAbort)
+      rejectPromise(signal.reason ?? new Error('User question cancelled'))
+      if (pending.messageId !== undefined) {
+        void editKeyboardMarkdown(
+          pending.chatId,
+          pending.threadId,
+          pending.messageId,
+          `⏹ **${tr('Question cancelled', 'Вопрос отменён')}**`,
+          [],
+          bridgeAbort.signal,
+        )
+      }
+    }
+    signal.addEventListener('abort', pending.onAbort, { once: true })
+    pendingQuestions.set(id, pending)
+    let sent = false
+    try {
+      sent = await sendQuestionPrompt(pending)
+    } catch (error) {
+      if (!signal.aborted) warn(`user question prompt failed: ${messageOf(error)}`)
+    }
+    if (!sent) {
+      pendingQuestions.delete(id)
+      signal.removeEventListener('abort', pending.onAbort)
+      return next()
+    }
+    return promise
+  }
+
+  /**
+   * Handle one callback belonging to a pending user question.
+   * @param ref - callback payload after `q:`.
+   * @param chatId - Telegram chat id.
+   * @param threadId - topic thread.
+   * @param signal - request lifetime.
+   * @returns true when the callback belonged to a question.
+   */
+  async function handleQuestionCallback(ref, chatId, threadId, signal) {
+    const colon = ref.indexOf(':')
+    const id = colon === -1 ? ref : ref.slice(0, colon)
+    const action = colon === -1 ? '' : ref.slice(colon + 1)
+    const pending = pendingQuestions.get(id)
+    if (pending === undefined || pending.chatId !== chatId || pending.threadId !== threadId) {
+      await send(chatId, tr('This question is already closed.', 'Этот вопрос уже закрыт.'), signal, threadId)
+      return true
+    }
+    if (pending.busy) return true
+    const question = pending.questions[pending.index]
+    if (action === 'custom') {
+      pending.awaitingCustom = true
+      await editKeyboardMarkdown(pending.chatId, pending.threadId, pending.messageId, questionText(pending), [], signal)
+      return true
+    }
+    if (action === 'done') {
+      await completeQuestion(pending, [...pending.selected], undefined, signal)
+      return true
+    }
+    const optionIndex = Number.parseInt(action, 10)
+    if (!Number.isFinite(optionIndex) || question.options?.[optionIndex] === undefined) return true
+    const label = question.options[optionIndex].label
+    if (question.multiSelect === true) {
+      if (pending.selected.has(label)) pending.selected.delete(label)
+      else pending.selected.add(label)
+      await editKeyboardMarkdown(pending.chatId, pending.threadId, pending.messageId, questionText(pending), questionKeyboard(pending), signal)
+      return true
+    }
+    await completeQuestion(pending, [label], undefined, signal)
+    return true
+  }
+
+  /**
+   * Consume a free-text answer for the active question in this topic.
+   * @param chat - chat bridge state.
+   * @param text - user message.
+   * @param signal - request lifetime.
+   * @returns true when the message was an answer.
+   */
+  async function consumeQuestionReply(chat, text, signal) {
+    const command = text.trim().split(/\s+/u)[0]?.toLowerCase()
+    if (BOT_COMMANDS.some((entry) => `/${entry.command}` === command)) return false
+    const pending = pendingQuestionFor(chat.chatId, chat.threadId)
+    if (pending === undefined || !pending.awaitingCustom) return false
+    const question = pending.questions[pending.index]
+    const selected = question.multiSelect === true ? [...pending.selected] : []
+    await completeQuestion(pending, selected, text.trim(), signal)
+    return true
+  }
+
+  /**
+   * Cancel any pending questions in one topic.
+   * @param chat - chat bridge state.
+   */
+  function cancelQuestionsForChat(chat) {
+    for (const pending of [...pendingQuestions.values()]) {
+      if (pending.chatId !== chat.chatId || pending.threadId !== chat.threadId) continue
+      pendingQuestions.delete(pending.id)
+      pending.signal?.removeEventListener('abort', pending.onAbort)
+      pending.reject(new Error('Question cancelled by /stop'))
+      if (pending.messageId !== undefined) {
+        void editKeyboardMarkdown(
+          pending.chatId,
+          pending.threadId,
+          pending.messageId,
+          `⏹ **${tr('Question cancelled', 'Вопрос отменён')}**`,
+          [],
+          bridgeAbort.signal,
+        )
+      }
+    }
+  }
+
+  /**
    * Register stream/error listeners on one live agent.
    * @param agent - agent to observe.
    * @param chat - chat bridge state.
@@ -1338,6 +1627,13 @@ export function apply(ctx, config) {
       agent.ctx.on('approval/request', (req, next) => {
         if (chat.boundAgent !== agent) return next()
         return requestApproval(agent, chat, req, next)
+      }, { prepend: true })
+    }
+    if (chat.questionAgent !== agent) {
+      chat.questionAgent = agent
+      agent.ctx.on('user-questions/request', (req, next) => {
+        if (chat.boundAgent !== agent) return next()
+        return requestUserQuestions(agent, chat, req, next)
       }, { prepend: true })
     }
   }
@@ -2411,6 +2707,10 @@ export function apply(ctx, config) {
         settleApproval(id, action === 'y' ? 'allowed-once' : 'rejected')
         return
       }
+      if (prefix === 'q') {
+        await handleQuestionCallback(ref, chat.id, threadId, signal)
+        return
+      }
       if (prefix === 'o') {
         const chatState = await chatFor(chat.id, threadId)
         if (typeof chatState.sessionId !== 'string') {
@@ -2599,6 +2899,7 @@ export function apply(ctx, config) {
     }
 
     const chatState = await chatFor(chat.id, threadId)
+    if (await consumeQuestionReply(chatState, text, signal)) return
     const inSession = typeof chatState.sessionId === 'string'
     const parts = text.trim().split(/\s+/u)
     const command = parts[0]?.toLowerCase()
@@ -2751,6 +3052,7 @@ export function apply(ctx, config) {
       chatState.done = true
       clearEditTimer(chatState)
       clearAuxTimers(chatState)
+      cancelQuestionsForChat(chatState)
       if (chatState.thinkingMessageId !== null) {
         await deleteMessage(chat.id, threadId, chatState.thinkingMessageId)
         chatState.thinkingMessageId = null
