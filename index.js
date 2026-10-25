@@ -430,7 +430,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'threaded-mode',
+  codeRevision: 'existing-topics',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -2164,10 +2164,30 @@ export function apply(ctx, config) {
    * @param signal - request lifetime.
    * @returns topic record, or undefined.
    */
+  async function deliverSessionTopic(record, chatId, signal) {
+    const preview = await lastAssistantText(record.sessionId)
+    const title = record.title || await sessionTitle(record.sessionId)
+    const delivered = await sendKeyboard(
+      chatId,
+      record.threadId,
+      `📂 <b>${escapeHtml(title)}</b>\n\n${preview.length > 0 ? escapeHtml(preview.slice(0, 1200)) : tr('No assistant messages yet.', 'Пока нет ответов ассистента.')}\n\n${tr('Send a message to continue this session.', 'Напиши сообщение, чтобы продолжить эту сессию.')}`,
+      [],
+      signal,
+    )
+    if (delivered === undefined) return false
+    await sendMenu(chatId, record.threadId, await chatFor(chatId, record.threadId), signal)
+    return true
+  }
+
   async function openTopicForSession(sessionId, chatId, signal) {
     const existing = state.sessions[sessionId]
     if (existing !== undefined && existing.chatId === chatId && typeof existing.threadId === 'number') {
-      return existing
+      // Re-open the stored topic and make it visible in Telegram. If the
+      // thread was deleted, drop the stale mapping and create a fresh one.
+      if (await deliverSessionTopic(existing, chatId, signal)) return existing
+      delete state.sessions[sessionId]
+      delete state.threads[`${chatId}:${existing.threadId}`]
+      await persistState()
     }
     const title = await sessionTitle(sessionId)
     const records = await ctx.get('sessionQuery')?.listSessions(signal)
@@ -2179,15 +2199,7 @@ export function apply(ctx, config) {
     state.threads[`${chatId}:${threadId}`] = sessionId
     await persistState()
     await notifySystem(`📂 ${tr('Session opened', 'Открыта сессия')} <code>${escapeHtml(sessionId)}</code>`, signal)
-    const preview = await lastAssistantText(sessionId)
-    await sendKeyboard(
-      chatId,
-      threadId,
-      `📂 <b>${escapeHtml(title)}</b>\n\n${preview.length > 0 ? escapeHtml(preview.slice(0, 1200)) : tr('No assistant messages yet.', 'Пока нет ответов ассистента.')}\n\n${tr('Send a message to continue this session.', 'Напиши сообщение, чтобы продолжить эту сессию.')}`,
-      [],
-      signal,
-    )
-    await sendMenu(chatId, threadId, await chatFor(chatId, threadId), signal)
+    await deliverSessionTopic(record, chatId, signal)
     return record
   }
 
