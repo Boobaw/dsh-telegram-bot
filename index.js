@@ -430,7 +430,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'existing-topics',
+  codeRevision: 'markdown-previews',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -1119,6 +1119,92 @@ export function apply(ctx, config) {
       }
       return editPlain(chatId, messageId, text, signal, threadId)
     }
+  }
+
+  /**
+   * Send one Markdown-formatted message with an inline keyboard.
+   * @param chatId - target chat.
+   * @param threadId - topic thread.
+   * @param text - raw Markdown body.
+   * @param keyboard - inline keyboard rows.
+   * @param signal - request lifetime.
+   * @returns the Bot API result, or undefined.
+   */
+  async function sendKeyboardMarkdown(chatId, threadId, text, keyboard, signal) {
+    const body = toTelegramMarkdown(text)
+    try {
+      return await call('sendMessage', {
+        chat_id: chatId,
+        ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }),
+        text: body,
+        parse_mode: 'MarkdownV2',
+        reply_markup: { inline_keyboard: keyboard },
+      }, signal)
+    } catch (error) {
+      if (!signal.aborted) warn(`MarkdownV2 keyboard send failed, falling back: ${messageOf(error)}`)
+      return call('sendMessage', {
+        chat_id: chatId,
+        ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }),
+        text,
+        reply_markup: { inline_keyboard: keyboard },
+      }, signal).catch(() => undefined)
+    }
+  }
+
+  /**
+   * Edit one Markdown-formatted message and replace its keyboard.
+   * @param chatId - target chat.
+   * @param threadId - topic thread.
+   * @param messageId - message to edit.
+   * @param text - raw Markdown body.
+   * @param keyboard - inline keyboard rows.
+   * @param signal - request lifetime.
+   * @returns true when the edit succeeded.
+   */
+  async function editKeyboardMarkdown(chatId, threadId, messageId, text, keyboard, signal) {
+    const body = toTelegramMarkdown(text)
+    try {
+      await call('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }),
+        text: body,
+        parse_mode: 'MarkdownV2',
+        reply_markup: { inline_keyboard: keyboard },
+      }, signal)
+      return true
+    } catch (error) {
+      const detail = messageOf(error)
+      if (/not modified/i.test(detail)) return true
+      if (!signal.aborted) warn(`MarkdownV2 keyboard edit failed, falling back: ${detail}`)
+      try {
+        await call('editMessageText', {
+          chat_id: chatId,
+          message_id: messageId,
+          ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }),
+          text,
+          reply_markup: { inline_keyboard: keyboard },
+        }, signal)
+        return true
+      } catch {
+        return false
+      }
+    }
+  }
+
+  /**
+   * Render a Markdown main menu, editing the previous one when possible.
+   * @param chatId - target chat.
+   * @param threadId - topic thread.
+   * @param messageId - panel message to edit.
+   * @param text - raw Markdown body.
+   * @param keyboard - inline keyboard rows.
+   * @param signal - request lifetime.
+   * @returns resolves after the send/edit.
+   */
+  async function renderMenuMarkdown(chatId, threadId, messageId, text, keyboard, signal) {
+    if (messageId !== undefined && await editKeyboardMarkdown(chatId, threadId, messageId, text, keyboard, signal)) return
+    await sendKeyboardMarkdown(chatId, threadId, text, keyboard, signal)
   }
 
   /**
@@ -2167,10 +2253,10 @@ export function apply(ctx, config) {
   async function deliverSessionTopic(record, chatId, signal) {
     const preview = await lastAssistantText(record.sessionId)
     const title = record.title || await sessionTitle(record.sessionId)
-    const delivered = await sendKeyboard(
+    const delivered = await sendKeyboardMarkdown(
       chatId,
       record.threadId,
-      `📂 <b>${escapeHtml(title)}</b>\n\n${preview.length > 0 ? escapeHtml(preview.slice(0, 1200)) : tr('No assistant messages yet.', 'Пока нет ответов ассистента.')}\n\n${tr('Send a message to continue this session.', 'Напиши сообщение, чтобы продолжить эту сессию.')}`,
+      `📂 **${title}**\n\n${preview.length > 0 ? preview.slice(0, 1200) : tr('No assistant messages yet.', 'Пока нет ответов ассистента.')}\n\n${tr('Send a message to continue this session.', 'Напиши сообщение, чтобы продолжить эту сессию.')}`,
       [],
       signal,
     )
@@ -2289,10 +2375,10 @@ export function apply(ctx, config) {
     const record = records?.find((entry) => entry.header.id === sessionId)
     const title = await sessionTitle(sessionId, record?.header)
     const text =
-      `<b>${escapeHtml(title)}</b>\n` +
-      `${tr('Workspace', 'Workspace')}: <code>${escapeHtml(record?.header.cwd ?? 'unknown')}</code>\n` +
+      `**${title}**\n` +
+      `${tr('Workspace', 'Workspace')}: \`${String(record?.header.cwd ?? 'unknown').replaceAll('`', '\\`')}\`\n` +
       `${tr('Status', 'Статус')}: ${record?.live ? tr('live', 'активна') : tr('persisted', 'сохранена')}\n\n` +
-      `${preview.length > 0 ? escapeHtml(preview.slice(0, 1600)) : tr('No assistant messages yet.', 'Пока нет ответов ассистента.')}`
+      `${preview.length > 0 ? preview.slice(0, 1600) : tr('No assistant messages yet.', 'Пока нет ответов ассистента.')}`
     const workspace = ctx.get('workspaceRegistry')?.list()
       ?.find((entry) => entry.path === record?.header.cwd)
     const rows = []
@@ -2307,7 +2393,7 @@ export function apply(ctx, config) {
       text: tr('⬅️ Back', '⬅️ Назад'),
       callback_data: `w:${workspaceRef}`,
     }])
-    await renderMenu(chatId, threadId, messageId, text, rows, signal)
+    await renderMenuMarkdown(chatId, threadId, messageId, text, rows, signal)
   }
 
   /**
@@ -2625,11 +2711,11 @@ export function apply(ctx, config) {
       }
       const title = await sessionTitle(chatState.sessionId)
       const body = texts
-        .map((text, index) => `${limit === 1 ? '' : `<b>${index + 1}.</b> `}${escapeHtml(text.slice(0, 3500))}`)
+        .map((text, index) => `${limit === 1 ? '' : `**${index + 1}.** `}${text.slice(0, 3500)}`)
         .join('\n\n')
-      const header = limit === 1 ? tr('Latest assistant answer', 'Последний ответ ассистента') : `${tr('Latest', 'Последние')} ${texts.length} ${tr('answers', 'ответа')}`
-      for (const chunk of splitTelegramText(`${header} · ${escapeHtml(title)}\n\n${body}`)) {
-        await send(chat.id, chunk, signal, threadId)
+      const header = limit === 1 ? `**${tr('Latest assistant answer', 'Последний ответ ассистента')}**` : `**${tr('Latest', 'Последние')} ${texts.length} ${tr('answers', 'ответа')}**`
+      for (const chunk of splitAnswerText(`${header} · ${title}\n\n${body}`)) {
+        await sendAnswer(chat.id, chunk, signal, threadId)
       }
       return
     }

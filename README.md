@@ -24,7 +24,7 @@ The bot connects to Telegram, enforces the allowlists, and bridges DSH agent ses
 - **Session controls** — an inline 2×2 panel in each session topic: **Model** (Flash/Pro), **Effort** (off/low/high/max), **Mode** (permission preset), and **Context** (window, last request usage, and cache-hit percentage). Telegram reply keyboards are chat-wide, so the controls are a per-topic inline panel rather than a bottom keyboard.
 - **Recovery** — `/last [n]` shows the latest assistant answer(s) from the bound session, useful after switching between Web and Telegram. `/rename <name>` changes the Telegram topic title; `/restart` restarts the Telegram runtime; `/menu` opens the inline session controls.
 - **Language** — bot messages and the Telegram command menu default to English; a Settings selector switches them to Russian.
-- **Formatting** — assistant Markdown (headings, bold, lists, code, links, tables) is converted to Telegram MarkdownV2.
+- **Formatting** — assistant Markdown (headings, bold, lists, code, links, tables) is converted to Telegram MarkdownV2. The same formatting is used for session previews and `/last`.
 - **Command hints** — the runtime publishes the list with `setMyCommands`, so Telegram shows the commands and descriptions when the user types `/`. The descriptions follow the selected Bot language; English is the default.
 - English and Russian page copy; Russian is registered as an optional language pack.
 
