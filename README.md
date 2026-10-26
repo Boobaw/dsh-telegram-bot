@@ -6,6 +6,14 @@ Telegram bot for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harn
 
 The bot connects to Telegram, enforces the allowlists, and bridges DSH agent sessions to Telegram **DM topics**. The **All** topic stays global; every DSH session gets its own topic. The assistant answer is the first message and streams in place as text arrives; the current reasoning block and a rolling tool-call list update after it, then both transient messages are deleted when the answer is ready. Bot lifecycle notifications go to **All**.
 
+## Demo
+
+<p align="center">
+  <img src="docs/demo.gif" alt="Demo: install the plugin, configure the bot and test a prompt" width="720">
+</p>
+
+The recording covers the first-run flow: install the plugin, save the bot token, enable Threaded mode, allowlist the user, run `/start`, open `/sessions`, and send a test prompt.
+
 ## Features
 
 - **Settings → Telegram** page in the Web UI.
@@ -46,6 +54,16 @@ npx @deepseek-ai/dsh plugin --profile web add dsh-telegram-bot
 `dsh plugin add` installs the package and selects its bundle in `dsh.profile.bundles` when the package declares `dsh.bundle`. Restart `dsh web` if the running profile does not pick the new bundle up through HMR.
 
 Then open **Settings → Telegram** (or **Plugins → Telegram Bot**) in the Web UI.
+
+### Where it lives
+
+DSH plugins are profile packages, not files inside the DeepSeek Harness checkout. A normal install resolves `dsh-telegram-bot` from npm into:
+
+```text
+~/.dsh/profiles/web/node_modules/dsh-telegram-bot
+```
+
+A local development install can instead link this repository into the profile. Either way, users do not need to know or copy a local checkout path: `dsh plugin --profile web add dsh-telegram-bot` is enough.
 
 ## Configure
 
@@ -149,6 +167,18 @@ The bundle switch above the panel is the plugin on/off control. **Settings → T
 ## Develop
 
 No build step is needed: `index.js` is the Host half and `client.js` is the browser bundle in the module-loader factory format.
+
+### Architecture
+
+This is a transport plugin, not a tool plugin:
+
+- `index.js` owns the Telegram runtime, topic routing and the bridge to existing DSH sessions;
+- `client.js` only registers the Settings page and the Plugins-page note;
+- the plugin adds **no model-facing tools**, **no system-prompt text** and no new agent capabilities;
+- it consumes existing services with `ctx.get`, observes session and approval events with `ctx.on`, and owns its polling lifetime with `ctx.effect`;
+- Telegram commands such as `/sessions` and `/last` are transport commands handled by the bot, not DSH tools exposed to the model.
+
+That is why the model's toolset is unchanged after installing it: Telegram is another front door to the same DSH agent, not a second agent.
 
 ```sh
 npm install

@@ -18,7 +18,8 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
-    "CREDITS.md"
+    "CREDITS.md",
+    "docs"
   ],
   "dsh": {
     "bundle": {
