@@ -8,11 +8,17 @@ The bot connects to Telegram, enforces the allowlists, and bridges DSH agent ses
 
 ## Demo
 
+[![Watch the 2-minute walkthrough](docs/video-thumbnail.png)](https://youtu.be/REPLACE_ME)
+
+The video walks through install → bot token → BotFather setup → allowlist → `/start` → `/sessions` → a test prompt.
+
+### Enable Threaded mode
+
 <p align="center">
-  <img src="docs/demo.gif" alt="Demo: install the plugin, configure the bot and test a prompt" width="720">
+  <img src="docs/threaded-mode.gif" alt="BotFather: Bot Settings → Threaded mode → Enable" width="720">
 </p>
 
-The recording covers the first-run flow: install the plugin, save the bot token, enable Threaded mode, allowlist the user, run `/start`, open `/sessions`, and send a test prompt.
+This short GIF covers only the BotFather step: **Bot Settings → Threaded mode → Enable**.
 
 ## Features
 
@@ -86,7 +92,7 @@ The token field reports only whether a token is configured. A token supplied by 
 ### First run
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) and save its token in **Settings → Telegram**.
-2. In @BotFather open the bot's **Bot Settings → Threaded mode** and enable it. Without this, private-chat topics cannot be created.
+2. In @BotFather open the bot's **Bot Settings → Threaded mode** and enable it ([short GIF](docs/threaded-mode.gif)). Without this, private-chat topics cannot be created.
 3. Open the bot chat, tap the bot name and enable **Topics**. **All** is Telegram's default topic.
 4. Send `/start` in **All**. With an empty user list the bot replies with your user id and chat id, plus the Threaded-mode reminder.
 5. Add your user id to **Allowed users** and press **Save** (or **Restart bot**).
