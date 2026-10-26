@@ -636,6 +636,7 @@ export function apply(ctx, config) {
         thinkingLastText: '',
         tools: [],
         toolMessageId: null,
+        toolExpanded: false,
         toolTimer: null,
         toolLastText: '',
         boundAgent: undefined,
@@ -824,7 +825,7 @@ export function apply(ctx, config) {
    * @param tool - tool name and streamed JSON arguments.
    * @returns HTML for the rolling tool message.
    */
-  function formatToolCall(tool) {
+  function formatToolCall(tool, expanded = false) {
     const name = String(tool.name || 'tool')
     const args = parseToolArguments(tool.args)
     let detail
@@ -914,6 +915,11 @@ export function apply(ctx, config) {
     }
     const label = `<b>${escapeHtml(name)}:</b>`
     if (detail === undefined || String(detail).trim().length === 0) return `${toolEmoji(name)} <b>${escapeHtml(name)}</b>`
+    if (!expanded) {
+      const preview = compactToolValue(detail).replace(/\s+/gu, ' ').trim()
+      const cut = preview.length > 48 ? preview.slice(0, 48) : preview
+      return `${toolEmoji(name)} ${label} <code>${escapeHtml(cut)}</code>`
+    }
     known = [
       'bash', 'shell', 'read', 'read_image', 'write', 'edit', 'glob', 'grep',
       'web_search', 'free_search', 'web_fetch', 'ask_user_question', 'subagent',
@@ -1193,136 +1199,6 @@ export function apply(ctx, config) {
       request.on('close', () => signal.removeEventListener('abort', abort))
       request.end(body)
     })
-  }
-
-  /**
-   * Send one HTML-formatted message.
-   * @param chatId - target chat.
-   * @param text - message body.
-   * @param signal - runtime lifetime.
-   * @returns resolves after the send attempt.
-   */
-  async function send(chatId, text, signal, threadId) {
-    try {
-      await call('sendMessage', { chat_id: chatId, ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }), text, parse_mode: 'HTML' }, signal)
-      await publishStatus({ lastOutcome: 'replied' })
-      return true
-    } catch (error) {
-      if (!signal.aborted) warn(`sendMessage failed: ${messageOf(error)}`)
-      await publishStatus({ lastOutcome: 'send-failed', detail: messageOf(error) })
-      return false
-    }
-  }
-
-
-  /**
-   * Publish the command menu so Telegram clients show hints while typing `/`.
-   * The English list is the default; Russian clients get localized copy.
-   * @param signal - runtime lifetime.
-   */
-  async function publishCommands(signal) {
-    const language = botLanguage()
-    const commands = language === 'ru' ? BOT_COMMANDS_RU : BOT_COMMANDS
-    try {
-      await call('setMyCommands', { commands, scope: { type: 'default' } }, signal, 15_000)
-      if (language === 'ru') {
-        await call(
-          'setMyCommands',
-          { commands, scope: { type: 'default' }, language_code: 'ru' },
-          signal,
-          15_000,
-        )
-      } else {
-        await call('deleteMyCommands', { scope: { type: 'default' }, language_code: 'ru' }, signal, 15_000).catch(() => {})
-      }
-      await publishStatus({ commands: 'published', commandsLanguage: language })
-    } catch (error) {
-      if (!signal.aborted) warn(`setMyCommands failed: ${messageOf(error)}`)
-      await publishStatus({ commands: 'failed', detail: messageOf(error) })
-    }
-  }
-
-  /**
-   * Send a plain-text message and return Telegram's result.
-   * @param chatId - target chat.
-   * @param text - body.
-   * @param signal - request lifetime.
-   * @returns the Bot API result, or undefined on failure.
-   */
-  async function sendPlain(chatId, text, signal, threadId) {
-    try {
-      return await call('sendMessage', { chat_id: chatId, ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }), text }, signal)
-    } catch (error) {
-      if (!signal.aborted) warn(`sendMessage failed: ${messageOf(error)}`)
-      return undefined
-    }
-  }
-
-  /**
-   * Edit one plain-text Telegram message.
-   * @param chatId - target chat.
-   * @param messageId - message to edit.
-   * @param text - new body.
-   * @param signal - request lifetime.
-   * @returns resolves after the attempt.
-   */
-  async function editPlain(chatId, messageId, text, signal, threadId) {
-    try {
-      await call('editMessageText', { chat_id: chatId, message_id: messageId, ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }), text }, signal)
-      return true
-    } catch (error) {
-      const message = messageOf(error)
-      if (!signal.aborted && !/not modified/i.test(message)) warn(`editMessageText failed: ${message}`)
-      return /not modified/i.test(message)
-    }
-  }
-
-  /**
-   * Send one HTML-formatted message.
-   * @param chatId - target chat.
-   * @param text - HTML body.
-   * @param signal - request lifetime.
-   * @param threadId - topic thread.
-   * @returns the Bot API result, or undefined.
-   */
-  async function sendHtml(chatId, text, signal, threadId) {
-    try {
-      return await call('sendMessage', {
-        chat_id: chatId,
-        ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }),
-        text,
-        parse_mode: 'HTML',
-      }, signal)
-    } catch (error) {
-      if (!signal.aborted) warn(`HTML send failed, falling back to plain text: ${messageOf(error)}`)
-      return sendPlain(chatId, htmlToPlain(text), signal, threadId)
-    }
-  }
-
-  /**
-   * Edit one HTML-formatted message.
-   * @param chatId - target chat.
-   * @param messageId - message to edit.
-   * @param text - HTML body.
-   * @param signal - request lifetime.
-   * @param threadId - topic thread.
-   * @returns true when the edit succeeded.
-   */
-  async function editHtml(chatId, messageId, text, signal, threadId) {
-    try {
-      await call('editMessageText', {
-        chat_id: chatId,
-        message_id: messageId,
-        ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }),
-        text,
-        parse_mode: 'HTML',
-      }, signal)
-      return true
-    } catch (error) {
-      const detail = messageOf(error)
-      if (!signal.aborted && !/not modified/i.test(detail)) warn(`HTML edit failed, falling back to plain text: ${detail}`)
-      return editPlain(chatId, messageId, htmlToPlain(text), signal, threadId)
-    }
   }
 
   /**
@@ -2132,6 +2008,7 @@ export function apply(ctx, config) {
     chat.tools = []
     chat.toolLastText = ''
     chat.toolMessageId = null
+    chat.toolExpanded = false
   }
 
   /**
@@ -2193,19 +2070,32 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Build the compact/full toggle keyboard for the tool message.
+   * @param expanded - whether full arguments are shown.
+   * @returns inline keyboard rows.
+   */
+  function toolKeyboard(expanded) {
+    return [[{
+      text: expanded ? tr('▫️ Compact', '▫️ Свернуть') : tr('📄 Full', '📄 Полностью'),
+      callback_data: 't:toggle',
+    }]]
+  }
+
+  /**
    * Publish the rolling tool-call list as the second message.
    * @param chat - chat bridge state.
    */
   async function flushTool(chat) {
     if (chat.tools.length === 0) return
-    const body = chat.tools.slice(-10).map(formatToolCall).join('\n')
+    const body = chat.tools.slice(-10).map((tool) => formatToolCall(tool, chat.toolExpanded)).join('\n')
     if (body === chat.toolLastText) return
     chat.toolLastText = body
+    const keyboard = toolKeyboard(chat.toolExpanded)
     if (chat.toolMessageId === null) {
-      const result = await sendHtml(chat.chatId, body, bridgeAbort.signal, chat.threadId)
+      const result = await sendKeyboard(chat.chatId, chat.threadId, body, keyboard, bridgeAbort.signal)
       chat.toolMessageId = result?.message_id ?? null
     } else {
-      await editHtml(chat.chatId, chat.toolMessageId, body, bridgeAbort.signal, chat.threadId)
+      await editKeyboard(chat.chatId, chat.threadId, chat.toolMessageId, body, keyboard, bridgeAbort.signal)
     }
   }
 
@@ -2991,6 +2881,15 @@ export function apply(ctx, config) {
       }
       if (prefix === 'q') {
         await handleQuestionCallback(ref, chat.id, threadId, signal)
+        return
+      }
+      if (prefix === 't' && ref === 'toggle') {
+        const chatState = await chatFor(chat.id, threadId)
+        if (chatState.toolMessageId === null) return
+        chatState.toolExpanded = !chatState.toolExpanded
+        const body = chatState.tools.slice(-10).map((tool) => formatToolCall(tool, chatState.toolExpanded)).join('\n')
+        chatState.toolLastText = body
+        await editKeyboard(chat.id, threadId, query.message.message_id, body, toolKeyboard(chatState.toolExpanded), signal)
         return
       }
       if (prefix === 'o') {
