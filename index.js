@@ -194,6 +194,39 @@ function toolArg(args, ...names) {
 }
 
 /**
+ * Wrap text into fixed-width visual lines without dropping content.
+ * @param text - source text.
+ * @param width - target line width.
+ * @returns wrapped lines.
+ */
+function wrapVisualLines(text, width = 52) {
+  const lines = []
+  for (const sourceLine of String(text).split('\n')) {
+    const words = sourceLine.replace(/\s+/gu, ' ').trim().split(' ').filter(Boolean)
+    let current = ''
+    for (let word of words) {
+      while (word.length > width) {
+        if (current.length > 0) {
+          lines.push(current)
+          current = ''
+        }
+        lines.push(word.slice(0, width))
+        word = word.slice(width)
+      }
+      if (word.length === 0) continue
+      if (current.length === 0) current = word
+      else if (current.length + 1 + word.length <= width) current += ` ${word}`
+      else {
+        lines.push(current)
+        current = word
+      }
+    }
+    if (current.length > 0) lines.push(current)
+  }
+  return lines
+}
+
+/**
  * Strip HTML tags for the plain-text fallback.
  * @param value - HTML body.
  * @returns readable plain text.
@@ -889,10 +922,10 @@ export function apply(ctx, config) {
     ].includes(name)
     const text = String(detail)
     if (name === 'bash' || name === 'shell') {
-      return `${toolEmoji(name)} ${label}\n<pre><code>${escapeHtml(text.replace(/\s*\n\s*/gu, ' ; '))}</code></pre>`
+      return `${toolEmoji(name)} ${label}\n<blockquote expandable><code>${escapeHtml(text.replace(/\s*\n\s*/gu, ' ; '))}</code></blockquote>`
     }
     if (!known) {
-      return `${toolEmoji(name)} ${label}\n<pre><code>${escapeHtml(text)}</code></pre>`
+      return `${toolEmoji(name)} ${label}\n<blockquote expandable><code>${escapeHtml(text)}</code></blockquote>`
     }
     return `${toolEmoji(name)} ${label} <code>${escapeHtml(compactToolValue(text))}</code>`
   }
@@ -2126,8 +2159,7 @@ export function apply(ctx, config) {
     else chat.thinkingShown = Math.min(full.length, chat.thinkingShown + 40)
     const text = full.slice(0, chat.thinkingShown).trim()
     if (text.length === 0) return
-    const rawLines = text.split('\n').map((line) => line.replace(/\s+/gu, ' ').trim()).filter((line) => line.length > 0)
-    const lines = rawLines.slice(-10)
+    const lines = wrapVisualLines(text, 52).slice(-10)
     const body = `💭 Thinking\n${lines.join('\n')}`
     if (body === chat.thinkingLastText) return
     chat.thinkingLastText = body
