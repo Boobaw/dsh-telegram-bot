@@ -151,6 +151,62 @@ function fitAnswerText(text, limit = ANSWER_MARKDOWN_LIMIT) {
 }
 
 /**
+ * Parse streamed tool arguments when they form complete JSON.
+ * @param raw - raw argument string.
+ * @returns the object, or undefined while the stream is incomplete.
+ */
+function parseToolArguments(raw) {
+  if (typeof raw !== 'string' || raw.trim().length === 0) return undefined
+  try {
+    const value = JSON.parse(raw)
+    return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Convert one tool argument value to a compact single-line label.
+ * @param value - argument value.
+ * @returns display text.
+ */
+function compactToolValue(value) {
+  if (typeof value === 'string') return value.replace(/\s+/gu, ' ').trim()
+  if (Array.isArray(value)) return `${value.length} item${value.length === 1 ? '' : 's'}`
+  if (value !== null && typeof value === 'object') {
+    return Object.entries(value).slice(0, 3).map(([key, item]) => `${key}=${compactToolValue(item)}`).join(' · ')
+  }
+  return String(value)
+}
+
+/**
+ * Pick one argument by its possible names.
+ * @param args - parsed tool arguments.
+ * @param names - candidate keys.
+ * @returns the first present value.
+ */
+function toolArg(args, ...names) {
+  if (args === undefined) return undefined
+  for (const name of names) {
+    if (args[name] !== undefined && args[name] !== null) return args[name]
+  }
+  return undefined
+}
+
+/**
+ * Strip HTML tags for the plain-text fallback.
+ * @param value - HTML body.
+ * @returns readable plain text.
+ */
+function htmlToPlain(value) {
+  return String(value)
+    .replace(/<[^>]*>/gu, '')
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&amp;', '&')
+}
+
+/**
  * Trim a session preview at a line boundary so formatting is not cut mid-construct.
  * @param text - raw assistant Markdown.
  * @param limit - maximum characters.
@@ -439,7 +495,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'preview-format',
+  codeRevision: 'tool-format',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -725,7 +781,104 @@ export function apply(ctx, config) {
     if (tool.includes('skill')) return '🧩'
     if (tool.includes('send_message')) return '✉️'
     if (tool.includes('working_directory')) return '📁'
-    return '🛠️'
+    return '❓'
+  }
+
+  /**
+   * Format one tool call as a compact Telegram HTML line.
+   * @param tool - tool name and streamed JSON arguments.
+   * @returns HTML for the rolling tool message.
+   */
+  function formatToolCall(tool) {
+    const name = String(tool.name || 'tool')
+    const args = parseToolArguments(tool.args)
+    let detail
+    if (args !== undefined) {
+      switch (name) {
+        case 'bash':
+        case 'shell':
+          detail = toolArg(args, 'command', 'cmd', 'input')
+          break
+        case 'read':
+        case 'read_image':
+          detail = toolArg(args, 'path', 'file_path', 'filename')
+          break
+        case 'write': {
+          const path = toolArg(args, 'path', 'file_path')
+          const content = toolArg(args, 'content', 'text')
+          detail = `${path ?? ''}${typeof content === 'string' ? ` · ${content.length} chars` : ''}`
+          break
+        }
+        case 'edit': {
+          const path = toolArg(args, 'path', 'file_path')
+          detail = path === undefined ? undefined : `${path}`
+          break
+        }
+        case 'glob': {
+          const pattern = toolArg(args, 'pattern')
+          const path = toolArg(args, 'path')
+          detail = pattern === undefined ? path : `${pattern}${path === undefined ? '' : ` in ${path}`}`
+          break
+        }
+        case 'grep': {
+          const pattern = toolArg(args, 'pattern')
+          const path = toolArg(args, 'path', 'include')
+          detail = pattern === undefined ? path : `${pattern}${path === undefined ? '' : ` in ${path}`}`
+          break
+        }
+        case 'web_search':
+        case 'free_search':
+          detail = toolArg(args, 'query')
+          break
+        case 'web_fetch':
+          detail = toolArg(args, 'url')
+          break
+        case 'ask_user_question': {
+          const questions = toolArg(args, 'questions')
+          detail = Array.isArray(questions) && questions[0] !== undefined ? questions[0].question : undefined
+          break
+        }
+        case 'subagent':
+          detail = toolArg(args, 'description', 'prompt', 'label')
+          break
+        case 'workflow':
+          detail = toolArg(args, 'name', 'description')
+          break
+        case 'todo_write': {
+          const todos = toolArg(args, 'todos')
+          detail = Array.isArray(todos) ? `${todos.length} item${todos.length === 1 ? '' : 's'}` : undefined
+          break
+        }
+        case 'create_goal':
+        case 'update_goal':
+          detail = toolArg(args, 'objective')
+          break
+        case 'schedule_create':
+        case 'schedule_update':
+          detail = toolArg(args, 'title', 'prompt')
+          break
+        case 'present': {
+          const files = toolArg(args, 'files')
+          detail = Array.isArray(files) ? `${files.length} file${files.length === 1 ? '' : 's'}` : undefined
+          break
+        }
+        case 'send_message':
+          detail = toolArg(args, 'message', 'text')
+          break
+        case 'working_directory':
+          detail = toolArg(args, 'path')
+          break
+        default:
+          detail = Object.entries(args).slice(0, 3).map(([key, value]) => `${key}=${compactToolValue(value)}`).join(' · ')
+      }
+    }
+    if (detail === undefined || detail === null || String(detail).trim().length === 0) {
+      const raw = String(tool.args ?? '').replace(/[{}\[\]"]/gu, '').replace(/\s+/gu, ' ').trim()
+      detail = raw
+    }
+    const label = `<b>${escapeHtml(name)}</b>`
+    if (detail === undefined || String(detail).trim().length === 0) return `${toolEmoji(name)} ${label}`
+    return `${toolEmoji(name)} ${label}: <code>${escapeHtml(shortLabel(compactToolValue(detail), 140))}</code>`
   }
 
   /**
@@ -1072,6 +1225,54 @@ export function apply(ctx, config) {
       const message = messageOf(error)
       if (!signal.aborted && !/not modified/i.test(message)) warn(`editMessageText failed: ${message}`)
       return /not modified/i.test(message)
+    }
+  }
+
+  /**
+   * Send one HTML-formatted message.
+   * @param chatId - target chat.
+   * @param text - HTML body.
+   * @param signal - request lifetime.
+   * @param threadId - topic thread.
+   * @returns the Bot API result, or undefined.
+   */
+  async function sendHtml(chatId, text, signal, threadId) {
+    try {
+      return await call('sendMessage', {
+        chat_id: chatId,
+        ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }),
+        text,
+        parse_mode: 'HTML',
+      }, signal)
+    } catch (error) {
+      if (!signal.aborted) warn(`HTML send failed, falling back to plain text: ${messageOf(error)}`)
+      return sendPlain(chatId, htmlToPlain(text), signal, threadId)
+    }
+  }
+
+  /**
+   * Edit one HTML-formatted message.
+   * @param chatId - target chat.
+   * @param messageId - message to edit.
+   * @param text - HTML body.
+   * @param signal - request lifetime.
+   * @param threadId - topic thread.
+   * @returns true when the edit succeeded.
+   */
+  async function editHtml(chatId, messageId, text, signal, threadId) {
+    try {
+      await call('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }),
+        text,
+        parse_mode: 'HTML',
+      }, signal)
+      return true
+    } catch (error) {
+      const detail = messageOf(error)
+      if (!signal.aborted && !/not modified/i.test(detail)) warn(`HTML edit failed, falling back to plain text: ${detail}`)
+      return editPlain(chatId, messageId, htmlToPlain(text), signal, threadId)
     }
   }
 
@@ -1943,19 +2144,14 @@ export function apply(ctx, config) {
    */
   async function flushTool(chat) {
     if (chat.tools.length === 0) return
-    const lines = chat.tools.slice(-10).map((tool) => {
-      const args = tool.args.replace(/\s+/gu, ' ').trim()
-      const tail = args.length === 0 ? '' : `: ${args.length > 60 ? `${args.slice(0, 59)}…` : args}`
-      return `${toolEmoji(tool.name)} ${tool.name.length > 0 ? tool.name : 'tool'}${tail}`
-    })
-    const body = lines.join('\n').slice(0, MAX_TELEGRAM_TEXT)
+    const body = chat.tools.slice(-10).map(formatToolCall).join('\n')
     if (body === chat.toolLastText) return
     chat.toolLastText = body
     if (chat.toolMessageId === null) {
-      const result = await sendPlain(chat.chatId, body, bridgeAbort.signal, chat.threadId)
+      const result = await sendHtml(chat.chatId, body, bridgeAbort.signal, chat.threadId)
       chat.toolMessageId = result?.message_id ?? null
     } else {
-      await editPlain(chat.chatId, chat.toolMessageId, body, bridgeAbort.signal, chat.threadId)
+      await editHtml(chat.chatId, chat.toolMessageId, body, bridgeAbort.signal, chat.threadId)
     }
   }
 
