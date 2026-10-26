@@ -15,10 +15,12 @@ The video walks through install → bot token → BotFather setup → allowlist 
 ### Enable Threaded mode
 
 <p align="center">
-  <img src="docs/threaded-mode.gif" alt="BotFather: Bot Settings → Threaded mode → Enable" width="720">
+  <a href="docs/threaded-mode.gif">
+    <img src="docs/threaded-mode.gif" alt="BotFather: Bot Settings → Threaded mode → Enable" width="320">
+  </a>
 </p>
 
-This short GIF covers only the BotFather step: **Bot Settings → Threaded mode → Enable**.
+BotFather: **Bot Settings → Threaded mode → Enable**. Click the GIF to open it full size.
 
 ## Features
 
