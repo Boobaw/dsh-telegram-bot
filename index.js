@@ -913,8 +913,10 @@ export function apply(ctx, config) {
     }
     const label = `<b>${escapeHtml(name)}:</b>`
     if (detail === undefined || String(detail).trim().length === 0) return `${toolEmoji(name)} <b>${escapeHtml(name)}</b>`
-    const lines = wrapVisualLines(String(detail), 40).slice(0, 2)
-    return `${toolEmoji(name)} ${label} <code>${escapeHtml(lines[0] ?? '')}</code>${lines[1] === undefined ? '' : `\n<code>${escapeHtml(lines[1])}</code>`}`
+    const compact = String(detail).replace(/\s+/gu, ' ').trim()
+    const first = compact.slice(0, 36)
+    const second = compact.slice(36, 80)
+    return `${toolEmoji(name)} ${label} <code>${escapeHtml(first)}</code>${second.length === 0 ? '' : `\n<code>${escapeHtml(second)}</code>`}`
   }
 
   /**
