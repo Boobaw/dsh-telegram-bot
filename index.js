@@ -766,7 +766,7 @@ export function apply(ctx, config) {
    */
   function toolEmoji(name) {
     const tool = String(name ?? '').toLowerCase()
-    if (tool.includes('bash') || tool.includes('shell') || tool.includes('pwsh')) return '⚡'
+    if (tool.includes('bash') || tool.includes('shell') || tool.includes('pwsh')) return '💻'
     if (tool.includes('read') && !tool.includes('read_image')) return '📖'
     if (tool.includes('write') || tool.includes('edit')) return '✍️'
     if (tool.includes('read_image')) return '🖼️'
@@ -795,6 +795,7 @@ export function apply(ctx, config) {
     const name = String(tool.name || 'tool')
     const args = parseToolArguments(tool.args)
     let detail
+    let known = false
     if (args !== undefined) {
       switch (name) {
         case 'bash':
@@ -878,9 +879,22 @@ export function apply(ctx, config) {
       const raw = String(tool.args ?? '').replace(/[{}\[\]"]/gu, '').replace(/\s+/gu, ' ').trim()
       detail = raw
     }
-    const label = `<b>${escapeHtml(name)}</b>`
-    if (detail === undefined || String(detail).trim().length === 0) return `${toolEmoji(name)} ${label}`
-    return `${toolEmoji(name)} ${label}: <code>${escapeHtml(shortLabel(compactToolValue(detail), 140))}</code>`
+    const label = `<b>${escapeHtml(name)}:</b>`
+    if (detail === undefined || String(detail).trim().length === 0) return `${toolEmoji(name)} <b>${escapeHtml(name)}</b>`
+    known = [
+      'bash', 'shell', 'read', 'read_image', 'write', 'edit', 'glob', 'grep',
+      'web_search', 'free_search', 'web_fetch', 'ask_user_question', 'subagent',
+      'workflow', 'todo_write', 'create_goal', 'update_goal', 'schedule_create',
+      'schedule_update', 'present', 'send_message', 'working_directory',
+    ].includes(name)
+    const text = String(detail)
+    if (name === 'bash' || name === 'shell') {
+      return `${toolEmoji(name)} ${label}\n<pre><code>${escapeHtml(text.replace(/\s*\n\s*/gu, ' ; '))}</code></pre>`
+    }
+    if (!known) {
+      return `${toolEmoji(name)} ${label}\n<pre><code>${escapeHtml(text)}</code></pre>`
+    }
+    return `${toolEmoji(name)} ${label} <code>${escapeHtml(compactToolValue(text))}</code>`
   }
 
   /**
@@ -2114,8 +2128,7 @@ export function apply(ctx, config) {
     if (text.length === 0) return
     const rawLines = text.split('\n').map((line) => line.replace(/\s+/gu, ' ').trim()).filter((line) => line.length > 0)
     const lines = rawLines.slice(-10)
-    const cursor = chat.done ? '' : ' ▍'
-    const body = `💭 Thinking${cursor}\n${lines.map((line) => (line.length > 64 ? `${line.slice(0, 63)}…` : line)).join('\n')}`
+    const body = `💭 Thinking\n${lines.join('\n')}`
     if (body === chat.thinkingLastText) return
     chat.thinkingLastText = body
     if (chat.thinkingMessageId === null) {
