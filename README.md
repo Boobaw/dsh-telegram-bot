@@ -23,7 +23,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Click the GIF to open 
 - One Telegram topic per DSH session; Web and Telegram use the same session.
 - `/sessions` lists workspaces and existing sessions, and can create a new session in a selected workspace.
 - Assistant answers stream into the topic with Telegram Markdown formatting.
-- Reasoning and tool calls are shown as temporary messages and removed after the answer.
+- Reasoning and tool calls are shown as temporary messages and removed after the answer. Each tool-call entry is capped at two lines.
 - Inline controls for model, reasoning effort, permission mode and context usage.
 - Tool approvals with **Deny** / **Allow** buttons.
 - `ask_user_question` support: options, multi-select, custom answers and plan review.
