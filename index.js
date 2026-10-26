@@ -817,7 +817,7 @@ export function apply(ctx, config) {
     if (tool.includes('skill')) return '🧩'
     if (tool.includes('send_message')) return '✉️'
     if (tool.includes('working_directory')) return '📁'
-    return '❓'
+    return '🔧'
   }
 
   /**
