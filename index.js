@@ -495,7 +495,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'tool-format',
+  codeRevision: 'thinking-stream',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -596,6 +596,7 @@ export function apply(ctx, config) {
         messageId: null,
         editTimer: null,
         thinkingText: '',
+        thinkingShown: 0,
         thinkingMessageId: null,
         thinkingTimer: null,
         thinkingLastText: '',
@@ -2076,6 +2077,7 @@ export function apply(ctx, config) {
   function resetAux(chat) {
     clearAuxTimers(chat)
     chat.thinkingText = ''
+    chat.thinkingShown = 0
     chat.thinkingLastText = ''
     chat.thinkingMessageId = null
     chat.tools = []
@@ -2102,12 +2104,16 @@ export function apply(ctx, config) {
    * @param chat - chat bridge state.
    */
   async function flushThinking(chat) {
-    const text = chat.thinkingText.replace(/\r/gu, '').trim()
+    const full = chat.thinkingText.replace(/\r/gu, '')
+    if (full.trim().length === 0) return
+    if (chat.done) chat.thinkingShown = full.length
+    else chat.thinkingShown = Math.min(full.length, chat.thinkingShown + 40)
+    const text = full.slice(0, chat.thinkingShown).trim()
     if (text.length === 0) return
-    const rawLines = text.split('\n').map((line) => line.replace(/\s+/gu, ' ').trim())
+    const rawLines = text.split('\n').map((line) => line.replace(/\s+/gu, ' ').trim()).filter((line) => line.length > 0)
     const lines = rawLines.slice(-10)
-    while (lines.length < 10) lines.unshift('')
-    const body = `💭 Thinking\n${lines.map((line) => (line.length > 64 ? `${line.slice(0, 63)}…` : line)).join('\n')}`
+    const cursor = chat.done ? '' : ' ▍'
+    const body = `💭 Thinking${cursor}\n${lines.map((line) => (line.length > 64 ? `${line.slice(0, 63)}…` : line)).join('\n')}`
     if (body === chat.thinkingLastText) return
     chat.thinkingLastText = body
     if (chat.thinkingMessageId === null) {
@@ -2116,6 +2122,7 @@ export function apply(ctx, config) {
     } else {
       await editPlain(chat.chatId, chat.thinkingMessageId, body, bridgeAbort.signal, chat.threadId)
     }
+    if (!chat.done && chat.thinkingShown < full.length) scheduleThinking(chat)
   }
 
   /**
@@ -2164,7 +2171,7 @@ export function apply(ctx, config) {
     chat.thinkingTimer = setTimeout(() => {
       chat.thinkingTimer = null
       void flushThinking(chat)
-    }, 1200)
+    }, 650)
   }
 
   /**
@@ -2187,8 +2194,7 @@ export function apply(ctx, config) {
   function onFrame(chat, frame) {
     if (frame === undefined || chat.done) return
     if (frame.type === 'chunk' && frame.chunk?.type === 'block-start' && frame.chunk.blockType === 'reasoning') {
-      chat.thinkingText = ''
-      chat.thinkingLastText = ''
+      if (chat.thinkingText.length > 0 && !chat.thinkingText.endsWith('\n')) chat.thinkingText += '\n'
       return
     }
     if (frame.type === 'chunk' && frame.chunk?.type === 'text-delta') {
