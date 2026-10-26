@@ -528,7 +528,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'thinking-stream',
+  codeRevision: 'helpers-restored',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -1199,6 +1199,73 @@ export function apply(ctx, config) {
       request.on('close', () => signal.removeEventListener('abort', abort))
       request.end(body)
     })
+  }
+
+  /**
+   * Publish the command menu so Telegram clients show hints while typing `/`.
+   * @param signal - runtime lifetime.
+   */
+  async function publishCommands(signal) {
+    const language = botLanguage()
+    const commands = language === 'ru' ? BOT_COMMANDS_RU : BOT_COMMANDS
+    try {
+      await call('setMyCommands', { commands, scope: { type: 'default' } }, signal, 15_000)
+      if (language === 'ru') {
+        await call('setMyCommands', { commands, scope: { type: 'default' }, language_code: 'ru' }, signal, 15_000)
+      } else {
+        await call('deleteMyCommands', { scope: { type: 'default' }, language_code: 'ru' }, signal, 15_000).catch(() => {})
+      }
+      await publishStatus({ commands: 'published', commandsLanguage: language })
+    } catch (error) {
+      if (!signal.aborted) warn(`setMyCommands failed: ${messageOf(error)}`)
+      await publishStatus({ commands: 'failed', detail: messageOf(error) })
+    }
+  }
+
+  /**
+   * Send a plain-text message.
+   * @param chatId - target chat.
+   * @param text - body.
+   * @param signal - request lifetime.
+   * @param threadId - topic thread.
+   * @returns the Bot API result, or undefined.
+   */
+  async function sendPlain(chatId, text, signal, threadId) {
+    try {
+      return await call('sendMessage', {
+        chat_id: chatId,
+        ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }),
+        text,
+      }, signal)
+    } catch (error) {
+      if (!signal.aborted) warn(`sendMessage failed: ${messageOf(error)}`)
+      return undefined
+    }
+  }
+
+  /**
+   * Edit one plain-text message.
+   * @param chatId - target chat.
+   * @param messageId - message to edit.
+   * @param text - new body.
+   * @param signal - request lifetime.
+   * @param threadId - topic thread.
+   * @returns true when the edit succeeded.
+   */
+  async function editPlain(chatId, messageId, text, signal, threadId) {
+    try {
+      await call('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }),
+        text,
+      }, signal)
+      return true
+    } catch (error) {
+      const message = messageOf(error)
+      if (!signal.aborted && !/not modified/i.test(message)) warn(`editMessageText failed: ${message}`)
+      return /not modified/i.test(message)
+    }
   }
 
   /**
