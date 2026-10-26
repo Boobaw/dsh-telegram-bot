@@ -8,7 +8,7 @@ The bot connects to Telegram, enforces the allowlists, and bridges DSH agent ses
 
 ## Demo
 
-[![Watch the 2-minute walkthrough](docs/video-thumbnail.png)](https://youtu.be/QEeVucfBsWk)
+▶️ **Video walkthrough:** https://youtu.be/QEeVucfBsWk
 
 The video walks through install → bot token → BotFather setup → allowlist → `/start` → `/sessions` → a test prompt.
 
