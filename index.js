@@ -636,7 +636,6 @@ export function apply(ctx, config) {
         thinkingLastText: '',
         tools: [],
         toolMessageId: null,
-        toolExpanded: false,
         toolTimer: null,
         toolLastText: '',
         boundAgent: undefined,
@@ -825,11 +824,10 @@ export function apply(ctx, config) {
    * @param tool - tool name and streamed JSON arguments.
    * @returns HTML for the rolling tool message.
    */
-  function formatToolCall(tool, expanded = false) {
+  function formatToolCall(tool) {
     const name = String(tool.name || 'tool')
     const args = parseToolArguments(tool.args)
     let detail
-    let known = false
     if (args !== undefined) {
       switch (name) {
         case 'bash':
@@ -915,25 +913,7 @@ export function apply(ctx, config) {
     }
     const label = `<b>${escapeHtml(name)}:</b>`
     if (detail === undefined || String(detail).trim().length === 0) return `${toolEmoji(name)} <b>${escapeHtml(name)}</b>`
-    if (!expanded) {
-      const preview = compactToolValue(detail).replace(/\s+/gu, ' ').trim()
-      const cut = preview.length > 48 ? preview.slice(0, 48) : preview
-      return `${toolEmoji(name)} ${label} <code>${escapeHtml(cut)}</code>`
-    }
-    known = [
-      'bash', 'shell', 'read', 'read_image', 'write', 'edit', 'glob', 'grep',
-      'web_search', 'free_search', 'web_fetch', 'ask_user_question', 'subagent',
-      'workflow', 'todo_write', 'create_goal', 'update_goal', 'schedule_create',
-      'schedule_update', 'present', 'send_message', 'working_directory',
-    ].includes(name)
-    const text = String(detail)
-    if (name === 'bash' || name === 'shell') {
-      return `${toolEmoji(name)} ${label}\n<blockquote expandable><code>${escapeHtml(text.replace(/\s*\n\s*/gu, ' ; '))}</code></blockquote>`
-    }
-    if (!known) {
-      return `${toolEmoji(name)} ${label}\n<blockquote expandable><code>${escapeHtml(text)}</code></blockquote>`
-    }
-    return `${toolEmoji(name)} ${label} <code>${escapeHtml(compactToolValue(text))}</code>`
+    return `${toolEmoji(name)} ${label} <code>${escapeHtml(compactToolValue(detail))}</code>`
   }
 
   /**
@@ -2075,7 +2055,6 @@ export function apply(ctx, config) {
     chat.tools = []
     chat.toolLastText = ''
     chat.toolMessageId = null
-    chat.toolExpanded = false
   }
 
   /**
@@ -2137,32 +2116,19 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Build the compact/full toggle keyboard for the tool message.
-   * @param expanded - whether full arguments are shown.
-   * @returns inline keyboard rows.
-   */
-  function toolKeyboard(expanded) {
-    return [[{
-      text: expanded ? tr('▫️ Compact', '▫️ Свернуть') : tr('📄 Full', '📄 Полностью'),
-      callback_data: 't:toggle',
-    }]]
-  }
-
-  /**
    * Publish the rolling tool-call list as the second message.
    * @param chat - chat bridge state.
    */
   async function flushTool(chat) {
     if (chat.tools.length === 0) return
-    const body = chat.tools.slice(-10).map((tool) => formatToolCall(tool, chat.toolExpanded)).join('\n')
+    const body = chat.tools.slice(-10).map(formatToolCall).join('\n')
     if (body === chat.toolLastText) return
     chat.toolLastText = body
-    const keyboard = toolKeyboard(chat.toolExpanded)
     if (chat.toolMessageId === null) {
-      const result = await sendKeyboard(chat.chatId, chat.threadId, body, keyboard, bridgeAbort.signal)
+      const result = await sendKeyboard(chat.chatId, chat.threadId, body, [], bridgeAbort.signal)
       chat.toolMessageId = result?.message_id ?? null
     } else {
-      await editKeyboard(chat.chatId, chat.threadId, chat.toolMessageId, body, keyboard, bridgeAbort.signal)
+      await editKeyboard(chat.chatId, chat.threadId, chat.toolMessageId, body, [], bridgeAbort.signal)
     }
   }
 
@@ -2948,15 +2914,6 @@ export function apply(ctx, config) {
       }
       if (prefix === 'q') {
         await handleQuestionCallback(ref, chat.id, threadId, signal)
-        return
-      }
-      if (prefix === 't' && ref === 'toggle') {
-        const chatState = await chatFor(chat.id, threadId)
-        if (chatState.toolMessageId === null) return
-        chatState.toolExpanded = !chatState.toolExpanded
-        const body = chatState.tools.slice(-10).map((tool) => formatToolCall(tool, chatState.toolExpanded)).join('\n')
-        chatState.toolLastText = body
-        await editKeyboard(chat.id, threadId, query.message.message_id, body, toolKeyboard(chatState.toolExpanded), signal)
         return
       }
       if (prefix === 'o') {
