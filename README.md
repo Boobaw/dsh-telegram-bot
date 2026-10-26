@@ -99,7 +99,7 @@ cd ~/.dsh/profiles/tg
 {
   "name": "dsh-profile-tg",
   "private": true,
-  "dependencies": { "dsh-telegram-bot": "^0.1.0" },
+  "dependencies": { "dsh-telegram-bot": "latest" },
   "dsh": {
     "profile": {
       "bundles": ["@deepseek-ai/dsh-base", "dsh-telegram-bot"]
