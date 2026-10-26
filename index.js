@@ -592,6 +592,7 @@ export function apply(ctx, config) {
         busy: false,
         done: true,
         text: '',
+        textSeparator: false,
         lastText: '',
         messageId: null,
         editTimer: null,
@@ -2076,6 +2077,7 @@ export function apply(ctx, config) {
   /** Reset the per-turn reasoning and tool display buffers. */
   function resetAux(chat) {
     clearAuxTimers(chat)
+    chat.textSeparator = false
     chat.thinkingText = ''
     chat.thinkingShown = 0
     chat.thinkingLastText = ''
@@ -2197,8 +2199,19 @@ export function apply(ctx, config) {
       if (chat.thinkingText.length > 0 && !chat.thinkingText.endsWith('\n')) chat.thinkingText += '\n'
       return
     }
+    if (frame.type === 'chunk' && frame.chunk?.type === 'block-start' && frame.chunk.blockType === 'text') {
+      chat.textSeparator = chat.text.length > 0
+      return
+    }
     if (frame.type === 'chunk' && frame.chunk?.type === 'text-delta') {
-      chat.text += frame.chunk.text
+      const nextText = frame.chunk.text
+      if (chat.textSeparator && chat.text.length > 0 && !/\s$/u.test(chat.text) && !/^\s/u.test(nextText)) {
+        chat.text += '\n\n'
+      } else if (chat.text.length > 0 && !/\s$/u.test(chat.text) && /[.!?…]$/u.test(chat.text) && /^[A-ZА-ЯЁ]/u.test(nextText)) {
+        chat.text += ' '
+      }
+      chat.textSeparator = false
+      chat.text += nextText
       scheduleFlush(chat)
       return
     }
@@ -2210,12 +2223,14 @@ export function apply(ctx, config) {
     }
     if (frame.type === 'chunk' && frame.chunk?.type === 'tool-call-delta') {
       if (readLive(config.showToolCalls, true) !== true) return
+      chat.textSeparator = chat.text.length > 0
       upsertTool(chat, frame.chunk)
       scheduleTool(chat)
       return
     }
     if (frame.type === 'chunk' && frame.chunk?.type === 'block-end' && frame.chunk.block?.type === 'tool-call') {
       if (readLive(config.showToolCalls, true) !== true) return
+      chat.textSeparator = chat.text.length > 0
       upsertTool(chat, frame.chunk.block)
       scheduleTool(chat)
     }
