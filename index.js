@@ -808,7 +808,7 @@ export function apply(ctx, config) {
     if (tool.includes('grep') || tool.includes('glob') || tool.includes('search')) return '🔎'
     if (tool.includes('subagent') || tool.includes('agent')) return '🤖'
     if (tool.includes('workflow')) return '🔄'
-    if (tool.includes('ask_user') || tool.includes('question')) return '❓'
+    if (tool.includes('ask_user') || tool.includes('question')) return '💬'
     if (tool.includes('todo')) return '📋'
     if (tool.includes('goal')) return '🎯'
     if (tool.includes('schedule')) return '⏰'
