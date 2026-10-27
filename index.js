@@ -624,6 +624,7 @@ export function apply(ctx, config) {
         permission: boundSession === undefined ? undefined : state.sessions[boundSession]?.permission,
         busy: false,
         done: true,
+        turnSource: undefined,
         text: '',
         textSeparator: false,
         lastText: '',
@@ -1815,20 +1816,20 @@ export function apply(ctx, config) {
       onFrame(chat, payload?.frame)
     })
     agent.ctx.on('agent/error', (payload) => {
-      if (chat.boundAgent !== agent) return
+      if (chat.boundAgent !== agent || chat.turnSource !== 'telegram') return
       void failChat(chat, payload?.error)
     })
     if (chat.approvalAgent !== agent) {
       chat.approvalAgent = agent
       agent.ctx.on('approval/request', (req, next) => {
-        if (chat.boundAgent !== agent) return next()
+        if (chat.boundAgent !== agent || chat.turnSource !== 'telegram') return next()
         return requestApproval(agent, chat, req, next)
       }, { prepend: true })
     }
     if (chat.questionAgent !== agent) {
       chat.questionAgent = agent
       agent.ctx.on('user-questions/request', (req, next) => {
-        if (chat.boundAgent !== agent) return next()
+        if (chat.boundAgent !== agent || chat.turnSource !== 'telegram') return next()
         return requestUserQuestions(agent, chat, req, next)
       }, { prepend: true })
     }
@@ -2165,7 +2166,7 @@ export function apply(ctx, config) {
    * @param frame - stream frame.
    */
   function onFrame(chat, frame) {
-    if (frame === undefined || chat.done) return
+    if (frame === undefined || chat.done || chat.turnSource !== 'telegram') return
     if (frame.type === 'chunk' && frame.chunk?.type === 'block-start' && frame.chunk.blockType === 'reasoning') {
       if (chat.thinkingText.length > 0 && !chat.thinkingText.endsWith('\n')) chat.thinkingText += '\n'
       return
@@ -2240,6 +2241,7 @@ export function apply(ctx, config) {
     if (chat.done) return
     chat.done = true
     chat.busy = false
+    chat.turnSource = undefined
     clearEditTimer(chat)
     clearAuxTimers(chat)
     if (chat.answerEdit !== undefined) await chat.answerEdit.catch(() => {})
@@ -2281,6 +2283,7 @@ export function apply(ctx, config) {
     if (chat.done) return
     chat.done = true
     chat.busy = false
+    chat.turnSource = undefined
     clearEditTimer(chat)
     clearAuxTimers(chat)
     if (chat.answerEdit !== undefined) await chat.answerEdit.catch(() => {})
@@ -2313,6 +2316,7 @@ export function apply(ctx, config) {
     }
     chat.busy = true
     chat.done = false
+    chat.turnSource = 'telegram'
     chat.text = ''
     chat.lastText = ''
     chat.messageId = null
@@ -3258,6 +3262,7 @@ export function apply(ctx, config) {
       }
       chatState.busy = false
       chatState.done = true
+      chatState.turnSource = undefined
       clearEditTimer(chatState)
       clearAuxTimers(chatState)
       cancelQuestionsForChat(chatState)

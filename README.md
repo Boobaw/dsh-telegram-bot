@@ -6,9 +6,9 @@ Telegram client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-h
 
 ## Demo
 
-Video walkthrough: https://youtu.be/QEeVucfBsWk
+First setup: https://youtu.be/QEeVucfBsWk
 
-The video covers installation, the bot token, BotFather setup, the allowlist, `/start`, `/sessions` and a test prompt.
+Installation, bot token,  the allowlist, `/start`, `/sessions` and a test prompt.
 
 ### Enable Threaded mode
 
@@ -23,6 +23,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Click the GIF to open 
 ## Features
 
 - One Telegram topic per DSH session; Web and Telegram use the same session.
+- Telegram mirrors only turns initiated from Telegram; turns started in the Web UI stay in Web.
 - `/sessions` lists workspaces and existing sessions, and can create a new session in a selected workspace.
 - Assistant answers stream into the topic with Telegram Markdown formatting.
 - Reasoning and tool calls are shown as temporary messages and removed after the answer. Each tool-call entry is capped at two lines.
