@@ -3092,6 +3092,7 @@ export function apply(ctx, config) {
     await publishStatus({
       lastOutcome: allowedUser && allowedChat ? 'allowed' : 'denied',
     })
+    if (allowedUser && allowedChat) await rememberControlChat(chat.id)
     if (!allowedUser || !allowedChat) {
       // Setup hint: an empty user list is the first-run state. Tell a private
       // caller their ids once, so they can be pasted into Settings. Once the
@@ -3142,6 +3143,7 @@ export function apply(ctx, config) {
       await send(
         chat.id,
         `<b>DeepSeek Harness Telegram bot</b>\n\n` +
+          `✅ <b>${tr('Telegram bot enabled', 'Telegram-бот включён')}</b>\n` +
           `${tr('Connected as', 'Подключён как')} @${me?.username ?? 'unknown'}.\n` +
           `Your user id: <code>${from.id}</code>\n` +
           `This chat id: <code>${chat.id}</code>\n` +
@@ -3347,7 +3349,12 @@ export function apply(ctx, config) {
       info(`connected as @${me.username ?? me.id}`)
       await publishStatus({ state: 'running', detail: '', username: me.username ?? String(me.id) })
       await publishCommands(tokenLifetime.signal)
-      await notifyAll(`🟢 ${tr('Bot online', 'Бот онлайн')}: @${escapeHtml(me.username ?? String(me.id))}`, tokenLifetime.signal)
+      await notifyAll(
+        `🟢 <b>${tr('Telegram bot enabled', 'Telegram-бот включён')}</b>\n` +
+          `@${escapeHtml(me.username ?? String(me.id))}\n` +
+          tr('Polling started. Send /start to open the menu.', 'Polling запущен. Отправь /start, чтобы открыть меню.'),
+        tokenLifetime.signal,
+      )
     } catch (error) {
       if (!tokenLifetime.signal.aborted) {
         warn(`getMe failed: ${messageOf(error)}`)
