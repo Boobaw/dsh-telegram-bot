@@ -528,7 +528,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'helpers-restored',
+  codeRevision: 'stop-preserve',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -3290,9 +3290,9 @@ export function apply(ctx, config) {
           await sendAnswer(chat.id, chunk, bridgeAbort.signal, threadId)
         }
         await send(chat.id, `⏹ ${tr('Stopped.', 'Остановлено.')}`, signal, threadId)
-      } else if (chatState.messageId !== null) {
-        await editPlain(chat.id, chatState.messageId, `⏹ ${tr('Stopped.', 'Остановлено.')}`, signal, threadId)
       } else {
+        // Keep the first message untouched: it may already contain the
+        // generated answer even when the live buffer was cleared by finalize.
         await send(chat.id, `⏹ ${tr('Stopped.', 'Остановлено.')}`, signal, threadId)
       }
       chatState.text = ''
