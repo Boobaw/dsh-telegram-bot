@@ -3257,17 +3257,18 @@ export function apply(ctx, config) {
         await send(chat.id, tr('There is no active session in this topic.', 'В этом topic нет активной сессии.'), signal, threadId)
         return
       }
-      try {
-        ctx.get('agents')?.get(chatState.sessionId)?.cancel({ kind: 'user' })
-      } catch {
-        // Already idle or disposed.
-      }
       chatState.busy = false
       chatState.done = true
       chatState.turnSource = undefined
       clearEditTimer(chatState)
       clearAuxTimers(chatState)
       cancelQuestionsForChat(chatState)
+      try {
+        ctx.get('agents')?.get(chatState.sessionId)?.cancel({ kind: 'user' })
+      } catch {
+        // Already idle or disposed.
+      }
+      if (chatState.answerEdit !== undefined) await chatState.answerEdit.catch(() => {})
       if (chatState.thinkingMessageId !== null) {
         await deleteMessage(chat.id, threadId, chatState.thinkingMessageId)
         chatState.thinkingMessageId = null
@@ -3276,11 +3277,29 @@ export function apply(ctx, config) {
         await deleteMessage(chat.id, threadId, chatState.toolMessageId)
         chatState.toolMessageId = null
       }
-      if (chatState.messageId !== null) {
-        await editPlain(chat.id, chatState.messageId, tr('⏹ Stopped.', '⏹ Остановлено.'), signal, threadId)
-        chatState.messageId = null
+      const partial = chatState.text.trim()
+      if (partial.length > 0) {
+        const chunks = splitAnswerText(partial)
+        if (chatState.messageId !== null) {
+          const edited = await editAnswer(chat.id, chatState.messageId, chunks[0], bridgeAbort.signal, threadId)
+          if (!edited) await sendAnswer(chat.id, chunks[0], bridgeAbort.signal, threadId)
+        } else {
+          await sendAnswer(chat.id, chunks[0], bridgeAbort.signal, threadId)
+        }
+        for (const chunk of chunks.slice(1)) {
+          await sendAnswer(chat.id, chunk, bridgeAbort.signal, threadId)
+        }
+        await send(chat.id, `⏹ ${tr('Stopped.', 'Остановлено.')}`, signal, threadId)
+      } else if (chatState.messageId !== null) {
+        await editPlain(chat.id, chatState.messageId, `⏹ ${tr('Stopped.', 'Остановлено.')}`, signal, threadId)
+      } else {
+        await send(chat.id, `⏹ ${tr('Stopped.', 'Остановлено.')}`, signal, threadId)
       }
-      await send(chat.id, tr('⏹ Current task stopped.', '⏹ Текущая задача остановлена.'), signal, threadId)
+      chatState.text = ''
+      chatState.lastText = ''
+      chatState.messageId = null
+      resetAux(chatState)
+      await publishStatus({ lastOutcome: 'stopped' })
       return
     }
     if (command === '/status') {
