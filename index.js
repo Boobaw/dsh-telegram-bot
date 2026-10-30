@@ -528,7 +528,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'stop-preserve',
+  codeRevision: 'turn-end',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -625,6 +625,8 @@ export function apply(ctx, config) {
         busy: false,
         done: true,
         turnSource: undefined,
+        awaitingTurn: false,
+        activeTurn: undefined,
         text: '',
         textSeparator: false,
         lastText: '',
@@ -1811,6 +1813,18 @@ export function apply(ctx, config) {
   function attachAgent(agent, chat) {
     if (chat.boundAgent === agent) return
     chat.boundAgent = agent
+    agent.ctx.on('session/event', (session, event) => {
+      if (chat.boundAgent !== agent || session?.id !== chat.sessionId) return
+      if (event.type === 'turn/start' && chat.turnSource === 'telegram' && chat.awaitingTurn) {
+        chat.activeTurn = event.data?.turn
+        chat.awaitingTurn = false
+        return
+      }
+      if (event.type === 'turn/end' && chat.turnSource === 'telegram' && event.data?.turn === chat.activeTurn) {
+        chat.activeTurn = undefined
+        void finalizeChat(chat)
+      }
+    })
     agent.ctx.on('agent/assistant-stream', (payload) => {
       if (chat.boundAgent !== agent) return
       onFrame(chat, payload?.frame)
@@ -2242,6 +2256,8 @@ export function apply(ctx, config) {
     chat.done = true
     chat.busy = false
     chat.turnSource = undefined
+    chat.awaitingTurn = false
+    chat.activeTurn = undefined
     clearEditTimer(chat)
     clearAuxTimers(chat)
     if (chat.answerEdit !== undefined) await chat.answerEdit.catch(() => {})
@@ -2284,6 +2300,8 @@ export function apply(ctx, config) {
     chat.done = true
     chat.busy = false
     chat.turnSource = undefined
+    chat.awaitingTurn = false
+    chat.activeTurn = undefined
     clearEditTimer(chat)
     clearAuxTimers(chat)
     if (chat.answerEdit !== undefined) await chat.answerEdit.catch(() => {})
@@ -2317,6 +2335,8 @@ export function apply(ctx, config) {
     chat.busy = true
     chat.done = false
     chat.turnSource = 'telegram'
+    chat.awaitingTurn = true
+    chat.activeTurn = undefined
     chat.text = ''
     chat.lastText = ''
     chat.messageId = null
@@ -2332,7 +2352,11 @@ export function apply(ctx, config) {
     try {
       const agent = await ensureAgent(chat)
       agent.followup({ id: randomUUID(), role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } })
-      void agent.whenIdle().then(() => finalizeChat(chat)).catch((error) => failChat(chat, error))
+      // The turn/end listener finalizes the Telegram turn. Keep whenIdle only
+      // as a fallback for compositions that do not emit turn events.
+      void agent.whenIdle().then(() => {
+        if (chat.turnSource === 'telegram' && chat.awaitingTurn) finalizeChat(chat)
+      }).catch((error) => failChat(chat, error))
     } catch (error) {
       await failChat(chat, error)
     }
@@ -3260,6 +3284,8 @@ export function apply(ctx, config) {
       chatState.busy = false
       chatState.done = true
       chatState.turnSource = undefined
+      chatState.awaitingTurn = false
+      chatState.activeTurn = undefined
       clearEditTimer(chatState)
       clearAuxTimers(chatState)
       cancelQuestionsForChat(chatState)
