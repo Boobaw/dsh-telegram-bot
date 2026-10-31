@@ -539,7 +539,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'fork',
+  codeRevision: 'fork-topic',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -2906,6 +2906,45 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Create a fresh Telegram topic for a forked DSH session.
+   * @param sessionId - forked session id.
+   * @param chatId - control chat.
+   * @param title - topic title.
+   * @param signal - request lifetime.
+   * @returns the new mapping, or undefined.
+   */
+  async function createForkTopic(sessionId, chatId, title, signal) {
+    const threadId = await createTopic(chatId, title, signal)
+    if (threadId === undefined) return undefined
+    const record = {
+      sessionId,
+      chatId,
+      threadId,
+      title,
+      ...(state.sessions[sessionId]?.cwd === undefined ? {} : { cwd: state.sessions[sessionId].cwd }),
+      updatedAt: Date.now(),
+    }
+    state.sessions[sessionId] = record
+    state.threads[`${chatId}:${threadId}`] = sessionId
+    await persistState()
+    await filterExistingChat(chatId, threadId)
+    await notifyAll(`📂 ${tr('Session opened', 'Открыта сессия')} <code>${escapeHtml(sessionId)}</code>`, signal)
+    await deliverSessionTopic(record, chatId, signal)
+    return record
+  }
+
+  /**
+   * Drop any stale in-memory chat state for a newly created topic.
+   * @param chatId - control chat.
+   * @param threadId - new topic thread.
+   */
+  function filterExistingChat(chatId, threadId) {
+    const key = `${chatId}:${threadId}`
+    const previous = chats.get(key)
+    if (previous !== undefined) chats.delete(key)
+  }
+
+  /**
    * Show the workspace picker in the control topic.
    * @param chatId - control chat.
    * @param threadId - control topic thread.
@@ -3402,7 +3441,7 @@ export function apply(ctx, config) {
       const records = await ctx.get('sessionQuery')?.listSessions(signal)
       const branchNumber = (records ?? []).filter((entry) => entry.header?.parentSession === sourceId).length + 1
       const title = requested.length > 0 ? requested : `${sourceTitle} (${branchNumber})`
-      const record = await openTopicForSession(forkId, chat.id, signal, title)
+      const record = await createForkTopic(forkId, chat.id, title, signal)
       if (record === undefined) {
         await send(chat.id, `❌ ${tr('Session was forked but the topic could not be created.', 'Сессия форкнута, но topic создать не удалось.')}`, signal, threadId)
         return
