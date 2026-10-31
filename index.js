@@ -528,7 +528,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'turn-end',
+  codeRevision: 'topic-lock',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -1438,6 +1438,8 @@ export function apply(ctx, config) {
   const pendingApprovals = new Map()
   /** Pending structured user questions keyed by short callback id. */
   const pendingQuestions = new Map()
+  /** In-flight topic opens keyed by chat and DSH session. */
+  const openingTopics = new Map()
 
   /**
    * Resolve one pending approval and update its prompt in place.
@@ -2778,6 +2780,10 @@ export function apply(ctx, config) {
   }
 
   async function openTopicForSession(sessionId, chatId, signal) {
+    const key = `${chatId}:${sessionId}`
+    const inFlight = openingTopics.get(key)
+    if (inFlight !== undefined) return inFlight
+    const opening = (async () => {
     const existing = state.sessions[sessionId]
     if (existing !== undefined && existing.chatId === chatId && typeof existing.threadId === 'number') {
       // Re-open the stored topic and make it visible in Telegram. If the
@@ -2799,6 +2805,13 @@ export function apply(ctx, config) {
     await notifyAll(`📂 ${tr('Session opened', 'Открыта сессия')} <code>${escapeHtml(sessionId)}</code>`, signal)
     await deliverSessionTopic(record, chatId, signal)
     return record
+    })()
+    openingTopics.set(key, opening)
+    try {
+      return await opening
+    } finally {
+      if (openingTopics.get(key) === opening) openingTopics.delete(key)
+    }
   }
 
   /**
