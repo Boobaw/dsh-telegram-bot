@@ -18,7 +18,7 @@ Installation, bot token,  the allowlist, `/start`, `/sessions` and a test prompt
   </a>
 </p>
 
-BotFather: **Bot Settings → Threaded mode → Enable**. Click the GIF to open it full size.
+BotFather: **Bot Settings → Threaded mode → Enable**.
 
 ## Features
 
@@ -30,6 +30,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Click the GIF to open 
 - Inline controls for model, reasoning effort, permission mode and context usage.
 - Tool approvals with **Deny** / **Allow** buttons.
 - `ask_user_question` support: options, multi-select, custom answers and plan review.
+- Documents and photos sent in a session topic are saved as DSH attachments and passed to the agent.
 - `/last`, `/rename`, `/stop`, `/restart`, `/status` and `/menu`.
 - English and Russian bot messages.
 - Bot token stays in the DSH credential store.

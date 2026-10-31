@@ -537,7 +537,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'format-fallback',
+  codeRevision: 'telegram-files',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -1261,6 +1261,82 @@ export function apply(ctx, config) {
       if (!signal.aborted && !/not modified/i.test(message)) warn(`editMessageText failed: ${message}`)
       return /not modified/i.test(message)
     }
+  }
+
+  /**
+   * Download one Telegram file by id.
+   * @param fileId - Telegram file id.
+   * @param signal - request lifetime.
+   * @returns exact bytes.
+   */
+  async function downloadTelegramFile(fileId, signal) {
+    const token = await resolveToken()
+    if (token === undefined) throw new Error('TELEGRAM_BOT_TOKEN is not configured')
+    const info = await call('getFile', { file_id: fileId }, signal)
+    const filePath = info?.file_path
+    if (typeof filePath !== 'string' || filePath.length === 0) throw new Error('Telegram returned no file path')
+    if (typeof info.file_size === 'number' && info.file_size > 20 * 1024 * 1024) {
+      throw new Error('Telegram file is larger than the 20 MB bot download limit')
+    }
+    return new Promise((resolve, reject) => {
+      const request = https.request({
+        host: 'api.telegram.org',
+        port: 443,
+        path: `/file/bot${token}/${filePath}`,
+        method: 'GET',
+        family: 4,
+        timeout: 30_000,
+      }, (response) => {
+        if (response.statusCode !== 200) {
+          response.resume()
+          reject(new Error(`Telegram file download returned HTTP ${response.statusCode}`))
+          return
+        }
+        const chunks = []
+        let size = 0
+        response.on('data', (chunk) => {
+          size += chunk.length
+          if (size > 20 * 1024 * 1024) {
+            request.destroy(new Error('Telegram file is larger than the 20 MB bot download limit'))
+            return
+          }
+          chunks.push(chunk)
+        })
+        response.on('end', () => resolve(Buffer.concat(chunks)))
+      })
+      const abort = () => request.destroy(new Error('Telegram file download aborted'))
+      signal.addEventListener('abort', abort, { once: true })
+      request.on('timeout', () => request.destroy(new Error('Telegram file download timed out')))
+      request.on('error', reject)
+      request.on('close', () => signal.removeEventListener('abort', abort))
+      request.end()
+    })
+  }
+
+  /**
+   * Save one Telegram attachment and return its DSH content block.
+   * @param message - Telegram message carrying a photo or document.
+   * @param signal - request lifetime.
+   * @returns prompt content block and display name.
+   */
+  async function saveTelegramAttachment(message, signal) {
+    const attachments = ctx.get('attachments')
+    if (attachments === undefined) throw new Error('DSH attachment store is unavailable')
+    const photo = Array.isArray(message.photo) ? message.photo.at(-1) : undefined
+    const document = message.document
+    const fileId = photo?.file_id ?? document?.file_id
+    if (typeof fileId !== 'string') throw new Error('Telegram message has no downloadable file')
+    const name = photo !== undefined
+      ? `telegram-photo-${message.message_id ?? Date.now()}.jpg`
+      : String(document?.file_name ?? `telegram-file-${message.message_id ?? Date.now()}`)
+    const mediaType = photo !== undefined ? 'image/jpeg' : String(document?.mime_type ?? '')
+    const bytes = await downloadTelegramFile(fileId, signal)
+    if (mediaType === 'image/jpeg' || mediaType === 'image/png' || mediaType === 'image/webp' || mediaType === 'image/gif') {
+      const attachment = await attachments.saveImage({ data: bytes, mediaType, name })
+      return { block: { type: 'image', attachment }, name }
+    }
+    const attachment = await attachments.saveFile({ data: bytes, name })
+    return { block: { type: 'file', attachment }, name }
   }
 
   /**
@@ -2342,7 +2418,7 @@ export function apply(ctx, config) {
    * @param text - prompt text.
    * @param signal - runtime lifetime.
    */
-  async function runAgent(chat, text, signal) {
+  async function runAgent(chat, text, signal, attachments = []) {
     if (chat.busy) {
       await send(chat.chatId, tr('⏳ Already working on a task. Send /stop to abort.', '⏳ Уже выполняю задачу. Отправь /stop, чтобы прервать.'), signal, chat.threadId)
       return
@@ -2366,7 +2442,7 @@ export function apply(ctx, config) {
     }
     try {
       const agent = await ensureAgent(chat)
-      agent.followup({ id: randomUUID(), role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } })
+      agent.followup({ id: randomUUID(), role: 'user', content: [...(text.trim().length === 0 ? [] : [{ type: 'text', text }]), ...attachments], source: { kind: 'user' } })
       // The turn/end listener finalizes the Telegram turn. Keep whenIdle only
       // as a fallback for compositions that do not emit turn events.
       void agent.whenIdle().then(() => {
@@ -3122,7 +3198,8 @@ export function apply(ctx, config) {
       lastOutcome: 'received',
       detail: '',
     })
-    if (text === undefined || from === undefined || chat === undefined) {
+    const hasAttachment = message.document !== undefined || (Array.isArray(message.photo) && message.photo.length > 0)
+    if (((text === undefined || text.length === 0) && !hasAttachment) || from === undefined || chat === undefined) {
       await publishStatus({ lastOutcome: 'ignored' })
       return
     }
@@ -3162,8 +3239,23 @@ export function apply(ctx, config) {
     }
 
     const chatState = await chatFor(chat.id, threadId)
-    if (await consumeQuestionReply(chatState, text, signal)) return
+    if (await consumeQuestionReply(chatState, text ?? '', signal)) return
     const inSession = typeof chatState.sessionId === 'string'
+    if (hasAttachment) {
+      if (!inSession) {
+        await send(chat.id, tr('Open a session first: /sessions.', 'Сначала открой сессию: /sessions.'), signal, threadId)
+        return
+      }
+      try {
+        const attachment = await saveTelegramAttachment(message, signal)
+        const caption = typeof message.caption === 'string' ? message.caption.trim() : ''
+        const prompt = caption.length > 0 ? caption : tr('Analyze the attached file.', 'Проанализируй приложенный файл.')
+        await runAgent(chatState, prompt, signal, [attachment.block])
+      } catch (error) {
+        await send(chat.id, `❌ ${escapeHtml(messageOf(error))}`, signal, threadId)
+      }
+      return
+    }
     const parts = text.trim().split(/\s+/u)
     const command = parts[0]?.toLowerCase()
 
