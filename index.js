@@ -539,7 +539,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'not-modified',
+  codeRevision: 'error-boundaries',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -564,6 +564,41 @@ async function publishStatus(patch) {
   } catch {
     // Diagnostics must never take the runtime down.
   }
+}
+
+/** Classify a failure for diagnostics without mixing it with formatting errors. */
+function classifyError(error) {
+  const detail = messageOf(error)
+  if (isTelegramParseError(detail)) return 'format'
+  if (error?.telegram === true) return 'telegram'
+  if (/agent|turn|session|approval|question/iu.test(detail)) return 'agent'
+  if (/state|storage|write|read|ENOENT|EACCES|EPERM/iu.test(detail)) return 'storage'
+  return 'runtime'
+}
+
+/**
+ * Record one background failure. Diagnostics must never take the runtime down.
+ * @param scope - short operation label.
+ * @param error - failure.
+ */
+function reportError(scope, error) {
+  const detail = messageOf(error)
+  const kind = classifyError(error)
+  warn(`${scope} [${kind}]: ${detail}`)
+  void publishStatus({
+    lastError: { scope, kind, detail, at: new Date().toISOString() },
+    lastErrorKind: kind,
+    lastErrorScope: scope,
+  })
+}
+
+/**
+ * Run a fire-and-forget task with a rejection boundary.
+ * @param scope - short operation label.
+ * @param task - task factory.
+ */
+function fireAndForget(scope, task) {
+  Promise.resolve().then(task).catch((error) => reportError(scope, error))
 }
 
 /**
@@ -1241,6 +1276,18 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Send one HTML message without a keyboard.
+   * @param chatId - target chat.
+   * @param text - HTML body.
+   * @param signal - request lifetime.
+   * @param threadId - topic thread.
+   * @returns the Bot API result, or undefined.
+   */
+  async function send(chatId, text, signal, threadId) {
+    return sendKeyboard(chatId, threadId, text, [], signal)
+  }
+
+  /**
    * Edit one plain-text message.
    * @param chatId - target chat.
    * @param messageId - message to edit.
@@ -1305,6 +1352,7 @@ export function apply(ctx, config) {
           chunks.push(chunk)
         })
         response.on('end', () => resolve(Buffer.concat(chunks)))
+        response.on('error', reject)
       })
       const abort = () => request.destroy(new Error('Telegram file download aborted'))
       signal.addEventListener('abort', abort, { once: true })
@@ -1697,14 +1745,14 @@ export function apply(ctx, config) {
     if (!pendingQuestions.delete(pending.id)) return
     pending.signal?.removeEventListener('abort', pending.onAbort)
     pending.resolve({ answers: pending.answers })
-    void editKeyboardMarkdown(
+    fireAndForget('question-ui', () => editKeyboardMarkdown(
       pending.chatId,
       pending.threadId,
       pending.messageId,
       `✅ **${tr('Answer recorded', 'Ответ принят')}**`,
       [],
       bridgeAbort.signal,
-    )
+    ))
   }
 
   /**
@@ -1791,14 +1839,14 @@ export function apply(ctx, config) {
       signal.removeEventListener('abort', pending.onAbort)
       rejectPromise(signal.reason ?? new Error('User question cancelled'))
       if (pending.messageId !== undefined) {
-        void editKeyboardMarkdown(
+        fireAndForget('question-ui', () => editKeyboardMarkdown(
           pending.chatId,
           pending.threadId,
           pending.messageId,
           `⏹ **${tr('Question cancelled', 'Вопрос отменён')}**`,
           [],
           bridgeAbort.signal,
-        )
+        ))
       }
     }
     signal.addEventListener('abort', pending.onAbort, { once: true })
@@ -1887,14 +1935,14 @@ export function apply(ctx, config) {
       pending.signal?.removeEventListener('abort', pending.onAbort)
       pending.reject(new Error('Question cancelled by /stop'))
       if (pending.messageId !== undefined) {
-        void editKeyboardMarkdown(
+        fireAndForget('question-ui', () => editKeyboardMarkdown(
           pending.chatId,
           pending.threadId,
           pending.messageId,
           `⏹ **${tr('Question cancelled', 'Вопрос отменён')}**`,
           [],
           bridgeAbort.signal,
-        )
+        ))
       }
     }
   }
@@ -1908,40 +1956,51 @@ export function apply(ctx, config) {
     if (chat.boundAgent === agent) return
     chat.boundAgent = agent
     agent.ctx.on('session/event', (session, event) => {
-      if (chat.boundAgent !== agent || session?.id !== chat.sessionId) return
-      if (event.type === 'turn/start' && chat.turnSource === 'telegram' && chat.awaitingTurn) {
-        chat.activeTurn = event.data?.turn
-        chat.awaitingTurn = false
-        return
-      }
-      if (event.type === 'turn/end' && chat.turnSource === 'telegram' && event.data?.turn === chat.activeTurn) {
-        chat.activeTurn = undefined
-        void finalizeChat(chat).catch((error) => {
-          warn(`finalize failed: ${messageOf(error)}`)
-          void failChat(chat, error).catch(() => {})
-        })
+      try {
+        if (chat.boundAgent !== agent || session?.id !== chat.sessionId) return
+        if (event.type === 'turn/start' && chat.turnSource === 'telegram' && chat.awaitingTurn) {
+          chat.activeTurn = event.data?.turn
+          chat.awaitingTurn = false
+          return
+        }
+        if (event.type === 'turn/end' && chat.turnSource === 'telegram' && event.data?.turn === chat.activeTurn) {
+          chat.activeTurn = undefined
+          fireAndForget('finalize', () => finalizeChat(chat))
+        }
+      } catch (error) {
+        reportError('session-event', error)
       }
     })
     agent.ctx.on('agent/assistant-stream', (payload) => {
-      if (chat.boundAgent !== agent) return
-      onFrame(chat, payload?.frame)
+      try {
+        if (chat.boundAgent !== agent) return
+        onFrame(chat, payload?.frame)
+      } catch (error) {
+        reportError('assistant-stream', error)
+      }
     })
     agent.ctx.on('agent/error', (payload) => {
       if (chat.boundAgent !== agent || chat.turnSource !== 'telegram') return
-      void failChat(chat, payload?.error)
+      fireAndForget('agent-error', () => failChat(chat, payload?.error))
     })
     if (chat.approvalAgent !== agent) {
       chat.approvalAgent = agent
       agent.ctx.on('approval/request', (req, next) => {
         if (chat.boundAgent !== agent || chat.turnSource !== 'telegram') return next()
-        return requestApproval(agent, chat, req, next)
+        return Promise.resolve(requestApproval(agent, chat, req, next)).catch((error) => {
+          reportError('approval', error)
+          return next()
+        })
       }, { prepend: true })
     }
     if (chat.questionAgent !== agent) {
       chat.questionAgent = agent
       agent.ctx.on('user-questions/request', (req, next) => {
         if (chat.boundAgent !== agent || chat.turnSource !== 'telegram') return next()
-        return requestUserQuestions(agent, chat, req, next)
+        return Promise.resolve(requestUserQuestions(agent, chat, req, next)).catch((error) => {
+          reportError('user-questions', error)
+          return next()
+        })
       }, { prepend: true })
     }
   }
@@ -2124,7 +2183,7 @@ export function apply(ctx, config) {
     const delay = Math.max(0, 800 - (Date.now() - (chat.lastEdit ?? 0)))
     chat.editTimer = setTimeout(() => {
       chat.editTimer = null
-      void flushChat(chat)
+      fireAndForget('stream-flush', () => flushChat(chat))
     }, delay)
   }
 
@@ -2143,7 +2202,9 @@ export function apply(ctx, config) {
     chat.answerEdit = (chat.answerEdit ?? Promise.resolve()).then(async () => {
       if (chat.done || chat.messageId === null) return
       await editAnswer(chat.chatId, chat.messageId, raw, bridgeAbort.signal, chat.threadId)
-    }).catch(() => {})
+    }).catch((error) => {
+      if (!bridgeAbort.signal.aborted) reportError('stream-edit', error)
+    })
     await chat.answerEdit
   }
 
@@ -2255,7 +2316,7 @@ export function apply(ctx, config) {
     if (chat.thinkingTimer !== null || chat.done) return
     chat.thinkingTimer = setTimeout(() => {
       chat.thinkingTimer = null
-      void flushThinking(chat)
+      fireAndForget('thinking-flush', () => flushThinking(chat))
     }, 650)
   }
 
@@ -2267,7 +2328,7 @@ export function apply(ctx, config) {
     if (chat.toolTimer !== null || chat.done) return
     chat.toolTimer = setTimeout(() => {
       chat.toolTimer = null
-      void flushTool(chat)
+      fireAndForget('tool-flush', () => flushTool(chat))
     }, 1200)
   }
 
@@ -2383,7 +2444,7 @@ export function apply(ctx, config) {
     chat.lastText = ''
     chat.messageId = null
     resetAux(chat)
-    void refreshTopicTitle(chat)
+    fireAndForget('topic-title', () => refreshTopicTitle(chat))
     await publishStatus({ lastOutcome: 'agent-replied' })
   }
 
@@ -2415,7 +2476,13 @@ export function apply(ctx, config) {
     chat.lastText = ''
     chat.messageId = null
     resetAux(chat)
-    await publishStatus({ lastOutcome: 'agent-error', detail })
+    await publishStatus({
+      lastOutcome: 'agent-error',
+      detail,
+      lastError: { scope: 'agent', kind: classifyError(error), detail, at: new Date().toISOString() },
+      lastErrorKind: classifyError(error),
+      lastErrorScope: 'agent',
+    })
   }
 
   /**
@@ -2453,9 +2520,9 @@ export function apply(ctx, config) {
       // as a fallback for compositions that do not emit turn events.
       void agent.whenIdle().then(() => {
         if (chat.turnSource === 'telegram' && chat.awaitingTurn) return finalizeChat(chat)
-      }).catch((error) => failChat(chat, error).catch(() => {}))
+      }).catch((error) => fireAndForget('agent-idle', () => failChat(chat, error)))
     } catch (error) {
-      await failChat(chat, error)
+      fireAndForget('agent-start', () => failChat(chat, error))
     }
   }
 
@@ -2874,32 +2941,46 @@ export function apply(ctx, config) {
     return true
   }
 
-  async function openTopicForSession(sessionId, chatId, signal, preferredTitle) {
+  /**
+   * Open or reuse one topic for an existing session.
+   * @param sessionId - session id.
+   * @param chatId - control chat.
+   * @param signal - request lifetime.
+   * @returns topic record, or undefined.
+   */
+  async function openTopicForSession(sessionId, chatId, signal) {
     const key = `${chatId}:${sessionId}`
     const inFlight = openingTopics.get(key)
     if (inFlight !== undefined) return inFlight
     const opening = (async () => {
-    const existing = state.sessions[sessionId]
-    if (existing !== undefined && existing.chatId === chatId && typeof existing.threadId === 'number') {
-      // Re-open the stored topic and make it visible in Telegram. If the
-      // thread was deleted, drop the stale mapping and create a fresh one.
-      if (await deliverSessionTopic(existing, chatId, signal)) return existing
-      delete state.sessions[sessionId]
-      delete state.threads[`${chatId}:${existing.threadId}`]
+      const existing = state.sessions[sessionId]
+      if (existing !== undefined && existing.chatId === chatId && typeof existing.threadId === 'number') {
+        // Re-open the stored topic and make it visible in Telegram. If the
+        // thread was deleted, drop the stale mapping and create a fresh one.
+        if (await deliverSessionTopic(existing, chatId, signal)) return existing
+        delete state.sessions[sessionId]
+        delete state.threads[`${chatId}:${existing.threadId}`]
+        await persistState()
+      }
+      const title = await sessionTitle(sessionId)
+      const records = await ctx.get('sessionQuery')?.listSessions(signal)
+      const header = records?.find((entry) => entry.header.id === sessionId)?.header
+      const threadId = await createTopic(chatId, title, signal)
+      if (threadId === undefined) return undefined
+      const record = {
+        sessionId,
+        chatId,
+        threadId,
+        title,
+        ...(header?.cwd === undefined ? {} : { cwd: header.cwd }),
+        updatedAt: Date.now(),
+      }
+      state.sessions[sessionId] = record
+      state.threads[`${chatId}:${threadId}`] = sessionId
       await persistState()
-    }
-    const title = typeof preferredTitle === 'string' && preferredTitle.trim().length > 0 ? preferredTitle.trim() : await sessionTitle(sessionId)
-    const records = await ctx.get('sessionQuery')?.listSessions(signal)
-    const header = records?.find((entry) => entry.header.id === sessionId)?.header
-    const threadId = await createTopic(chatId, title, signal)
-    if (threadId === undefined) return undefined
-    const record = { sessionId, chatId, threadId, title, ...(header?.cwd === undefined ? {} : { cwd: header.cwd }), updatedAt: Date.now() }
-    state.sessions[sessionId] = record
-    state.threads[`${chatId}:${threadId}`] = sessionId
-    await persistState()
-    await notifyAll(`📂 ${tr('Session opened', 'Открыта сессия')} <code>${escapeHtml(sessionId)}</code>`, signal)
-    await deliverSessionTopic(record, chatId, signal)
-    return record
+      await notifyAll(`📂 ${tr('Session opened', 'Открыта сессия')} <code>${escapeHtml(sessionId)}</code>`, signal)
+      await deliverSessionTopic(record, chatId, signal)
+      return record
     })()
     openingTopics.set(key, opening)
     try {
@@ -2918,6 +2999,8 @@ export function apply(ctx, config) {
    * @returns the new mapping, or undefined.
    */
   async function createForkTopic(sessionId, chatId, title, signal) {
+    const records = await ctx.get('sessionQuery')?.listSessions(signal)
+    const header = records?.find((entry) => entry.header.id === sessionId)?.header
     const threadId = await createTopic(chatId, title, signal)
     if (threadId === undefined) return undefined
     const record = {
@@ -2925,13 +3008,13 @@ export function apply(ctx, config) {
       chatId,
       threadId,
       title,
-      ...(state.sessions[sessionId]?.cwd === undefined ? {} : { cwd: state.sessions[sessionId].cwd }),
+      ...(header?.cwd === undefined ? {} : { cwd: header.cwd }),
       updatedAt: Date.now(),
     }
     state.sessions[sessionId] = record
     state.threads[`${chatId}:${threadId}`] = sessionId
     await persistState()
-    await filterExistingChat(chatId, threadId)
+    forgetChatState(chatId, threadId)
     await notifyAll(`📂 ${tr('Session opened', 'Открыта сессия')} <code>${escapeHtml(sessionId)}</code>`, signal)
     await deliverSessionTopic(record, chatId, signal)
     return record
@@ -2942,7 +3025,7 @@ export function apply(ctx, config) {
    * @param chatId - control chat.
    * @param threadId - new topic thread.
    */
-  function filterExistingChat(chatId, threadId) {
+  function forgetChatState(chatId, threadId) {
     const key = `${chatId}:${threadId}`
     const previous = chats.get(key)
     if (previous !== undefined) chats.delete(key)
@@ -3662,7 +3745,7 @@ export function apply(ctx, config) {
         await publishStatus({ lastUpdateKeys: Object.keys(update) })
         if (update.callback_query !== undefined) {
           void handleCallback(update.callback_query, tokenLifetime.signal).catch((error) => {
-            if (!tokenLifetime.signal.aborted) warn(`callback handler failed: ${messageOf(error)}`)
+            if (!tokenLifetime.signal.aborted) reportError('callback-handler', error)
           })
           continue
         }
@@ -3670,7 +3753,7 @@ export function apply(ctx, config) {
         if (message !== undefined) {
           const type = Object.keys(update).find((key) => key !== 'update_id') ?? 'unknown'
           void handleMessage(message, tokenLifetime.signal, type).catch((error) => {
-            if (!tokenLifetime.signal.aborted) warn(`message handler failed: ${messageOf(error)}`)
+            if (!tokenLifetime.signal.aborted) reportError('message-handler', error)
           })
         } else {
           const type = Object.keys(update).find((key) => key !== 'update_id') ?? 'unknown'
@@ -3718,13 +3801,17 @@ export function apply(ctx, config) {
       controller,
       abort: () => controller.abort(),
     }
-    current.settled = poll({ signal: controller.signal }).finally(() => {
-      if (lifetime === current) {
-        lifetime = undefined
-        me = undefined
-        startedAt = 0
-      }
-    })
+    current.settled = poll({ signal: controller.signal })
+      .catch((error) => {
+        if (!controller.signal.aborted) reportError('poll', error)
+      })
+      .finally(() => {
+        if (lifetime === current) {
+          lifetime = undefined
+          me = undefined
+          startedAt = 0
+        }
+      })
     lifetime = current
   }
 
@@ -3761,7 +3848,7 @@ export function apply(ctx, config) {
     if (restartTimer !== undefined) clearTimeout(restartTimer)
     restartTimer = setTimeout(() => {
       restartTimer = undefined
-      void restart(reason)
+      fireAndForget('restart', () => restart(reason))
     }, RESTART_DEBOUNCE_MS)
   }
 
@@ -3774,14 +3861,14 @@ export function apply(ctx, config) {
 
   ctx.effect(
     () => {
-      void start().catch((error) => warn(`start failed: ${messageOf(error)}`))
+      void start().catch((error) => reportError('start', error))
       return () => {
         if (restartTimer !== undefined) {
           clearTimeout(restartTimer)
           restartTimer = undefined
         }
         bridgeAbort.abort()
-        void stop().catch((error) => warn(`stop failed: ${messageOf(error)}`))
+        void stop().catch((error) => reportError('stop', error))
       }
     },
     'dsh-telegram-bot: runtime',
