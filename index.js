@@ -539,7 +539,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'error-boundaries',
+  codeRevision: 'stale-topic',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -2920,25 +2920,36 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Open (or reuse) a topic for one existing session.
-   * @param sessionId - session id.
+   * Deliver a session preview into its topic.
+   * @param record - topic mapping.
    * @param chatId - control chat.
    * @param signal - request lifetime.
-   * @returns topic record, or undefined.
+   * @returns true when the topic is usable.
    */
   async function deliverSessionTopic(record, chatId, signal) {
-    const preview = await lastAssistantText(record.sessionId)
-    const title = record.title || await sessionTitle(record.sessionId)
-    const delivered = await sendKeyboardMarkdown(
-      chatId,
-      record.threadId,
-      `📂 **${title}**\n\n${preview.length > 0 ? clipPreview(preview) : tr('No assistant messages yet.', 'Пока нет ответов ассистента.')}\n\n${tr('Send a message to continue this session.', 'Напиши сообщение, чтобы продолжить эту сессию.')}`,
-      [],
-      signal,
-    )
-    if (delivered === undefined) return false
-    await sendMenu(chatId, record.threadId, await chatFor(chatId, record.threadId), signal)
-    return true
+    try {
+      const preview = await lastAssistantText(record.sessionId)
+      const title = record.title || await sessionTitle(record.sessionId)
+      const delivered = await sendKeyboardMarkdown(
+        chatId,
+        record.threadId,
+        `📂 **${title}**\n\n${preview.length > 0 ? clipPreview(preview) : tr('No assistant messages yet.', 'Пока нет ответов ассистента.')}\n\n${tr('Send a message to continue this session.', 'Напиши сообщение, чтобы продолжить эту сессию.')}`,
+        [],
+        signal,
+      )
+      if (delivered === undefined) return false
+      try {
+        await sendMenu(chatId, record.threadId, await chatFor(chatId, record.threadId), signal)
+      } catch (error) {
+        // The preview already reached the topic; a menu failure is not a
+        // reason to create a second topic.
+        if (!signal.aborted) reportError('topic-menu', error)
+      }
+      return true
+    } catch (error) {
+      if (!signal.aborted) reportError('topic-delivery', error)
+      return false
+    }
   }
 
   /**
@@ -3265,8 +3276,12 @@ export function apply(ctx, config) {
       }
       await send(chat.id, tr('Unknown button. Open /sessions again.', 'Неизвестная кнопка. Открой /sessions заново.'), signal, threadId)
     } catch (error) {
-      await publishStatus({ lastCallbackError: messageOf(error) })
-      await send(chat.id, `❌ ${escapeHtml(messageOf(error))}`, signal, threadId)
+      const detail = messageOf(error)
+      await publishStatus({ lastCallbackError: detail, lastErrorKind: classifyError(error), lastErrorScope: 'callback' })
+      // Replying into a deleted topic only produces a second identical error.
+      if (!/message thread not found|topic.*not found/iu.test(detail)) {
+        await send(chat.id, `❌ ${escapeHtml(detail)}`, signal, threadId)
+      }
     }
   }
 
