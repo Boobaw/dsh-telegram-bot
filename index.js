@@ -240,6 +240,15 @@ function htmlToPlain(value) {
 }
 
 /**
+ * Whether Telegram rejected the entity markup rather than the request itself.
+ * @param detail - Telegram error description.
+ * @returns true when a plain-text retry is appropriate.
+ */
+function isTelegramParseError(detail) {
+  return /can't parse entities|unsupported start tag|can't find end tag|reserved and must be escaped|parse entities/iu.test(String(detail))
+}
+
+/**
  * Trim a session preview at a line boundary so formatting is not cut mid-construct.
  * @param text - raw assistant Markdown.
  * @param limit - maximum characters.
@@ -528,7 +537,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'last-split',
+  codeRevision: 'format-fallback',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -1274,6 +1283,7 @@ export function apply(ctx, config) {
       }, signal)
     } catch (error) {
       const detail = messageOf(error)
+      if (!isTelegramParseError(detail)) throw error
       if (!signal.aborted) warn(`MarkdownV2 send failed, falling back to plain text: ${detail}`)
       await publishStatus({ lastFormatFallback: detail })
       return sendPlain(chatId, text, signal, threadId)
@@ -1302,6 +1312,7 @@ export function apply(ctx, config) {
       return true
     } catch (error) {
       const detail = messageOf(error)
+      if (!isTelegramParseError(detail)) throw error
       if (!signal.aborted && !/not modified/i.test(detail)) {
         warn(`MarkdownV2 edit failed, falling back to plain text: ${detail}`)
         await publishStatus({ lastFormatFallback: detail })
@@ -1331,6 +1342,7 @@ export function apply(ctx, config) {
       }, signal)
     } catch (error) {
       const detail = messageOf(error)
+      if (!isTelegramParseError(detail)) throw error
       if (!signal.aborted) {
         warn(`MarkdownV2 keyboard send failed, falling back: ${detail}`)
         await publishStatus({ lastFormatFallback: detail })
@@ -1369,6 +1381,7 @@ export function apply(ctx, config) {
     } catch (error) {
       const detail = messageOf(error)
       if (/not modified/i.test(detail)) return true
+      if (!isTelegramParseError(detail)) throw error
       if (!signal.aborted) {
         warn(`MarkdownV2 keyboard edit failed, falling back: ${detail}`)
         await publishStatus({ lastFormatFallback: detail })
