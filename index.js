@@ -539,7 +539,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'stale-topic',
+  codeRevision: 'warn-scope',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -574,31 +574,6 @@ function classifyError(error) {
   if (/agent|turn|session|approval|question/iu.test(detail)) return 'agent'
   if (/state|storage|write|read|ENOENT|EACCES|EPERM/iu.test(detail)) return 'storage'
   return 'runtime'
-}
-
-/**
- * Record one background failure. Diagnostics must never take the runtime down.
- * @param scope - short operation label.
- * @param error - failure.
- */
-function reportError(scope, error) {
-  const detail = messageOf(error)
-  const kind = classifyError(error)
-  warn(`${scope} [${kind}]: ${detail}`)
-  void publishStatus({
-    lastError: { scope, kind, detail, at: new Date().toISOString() },
-    lastErrorKind: kind,
-    lastErrorScope: scope,
-  })
-}
-
-/**
- * Run a fire-and-forget task with a rejection boundary.
- * @param scope - short operation label.
- * @param task - task factory.
- */
-function fireAndForget(scope, task) {
-  Promise.resolve().then(task).catch((error) => reportError(scope, error))
 }
 
 /**
@@ -1107,6 +1082,31 @@ export function apply(ctx, config) {
   const logger = ctx.logger
   const info = (message) => logger?.info?.(`[telegram] ${message}`)
   const warn = (message) => logger?.warn?.(`[telegram] ${message}`)
+
+  /**
+   * Record one background failure. Diagnostics must never take the runtime down.
+   * @param scope - short operation label.
+   * @param error - failure.
+   */
+  function reportError(scope, error) {
+    const detail = messageOf(error)
+    const kind = classifyError(error)
+    warn(`${scope} [${kind}]: ${detail}`)
+    void publishStatus({
+      lastError: { scope, kind, detail, at: new Date().toISOString() },
+      lastErrorKind: kind,
+      lastErrorScope: scope,
+    })
+  }
+
+  /**
+   * Run a fire-and-forget task with a rejection boundary.
+   * @param scope - short operation label.
+   * @param task - task factory.
+   */
+  function fireAndForget(scope, task) {
+    Promise.resolve().then(task).catch((error) => reportError(scope, error))
+  }
 
   /** @returns the configured bot language, defaulting to English. */
   function botLanguage() {
