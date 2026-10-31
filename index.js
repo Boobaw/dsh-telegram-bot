@@ -539,7 +539,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'fork-topic',
+  codeRevision: 'not-modified',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -1390,8 +1390,9 @@ export function apply(ctx, config) {
       return true
     } catch (error) {
       const detail = messageOf(error)
+      if (/not modified/i.test(detail)) return true
       if (!isTelegramParseError(detail)) throw error
-      if (!signal.aborted && !/not modified/i.test(detail)) {
+      if (!signal.aborted) {
         warn(`MarkdownV2 edit failed, falling back to plain text: ${detail}`)
         await publishStatus({ lastFormatFallback: detail })
       }
@@ -1915,7 +1916,10 @@ export function apply(ctx, config) {
       }
       if (event.type === 'turn/end' && chat.turnSource === 'telegram' && event.data?.turn === chat.activeTurn) {
         chat.activeTurn = undefined
-        void finalizeChat(chat)
+        void finalizeChat(chat).catch((error) => {
+          warn(`finalize failed: ${messageOf(error)}`)
+          void failChat(chat, error).catch(() => {})
+        })
       }
     })
     agent.ctx.on('agent/assistant-stream', (payload) => {
@@ -2448,8 +2452,8 @@ export function apply(ctx, config) {
       // The turn/end listener finalizes the Telegram turn. Keep whenIdle only
       // as a fallback for compositions that do not emit turn events.
       void agent.whenIdle().then(() => {
-        if (chat.turnSource === 'telegram' && chat.awaitingTurn) finalizeChat(chat)
-      }).catch((error) => failChat(chat, error))
+        if (chat.turnSource === 'telegram' && chat.awaitingTurn) return finalizeChat(chat)
+      }).catch((error) => failChat(chat, error).catch(() => {}))
     } catch (error) {
       await failChat(chat, error)
     }
