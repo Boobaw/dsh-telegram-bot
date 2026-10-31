@@ -31,7 +31,8 @@ BotFather: **Bot Settings → Threaded mode → Enable**.
 - Tool approvals with **Deny** / **Allow** buttons.
 - `ask_user_question` support: options, multi-select, custom answers and plan review.
 - Documents and photos sent in a session topic are saved as DSH attachments and passed to the agent.
-- `/last`, `/rename`, `/stop`, `/restart`, `/status` and `/menu`.
+- `/last`, `/rename`, `/fork`, `/stop`, `/restart`, `/status` and `/menu`.
+- `/fork [name]` creates a DSH session fork in a new Telegram topic; without a name it uses the previous title plus the branch number.
 - English and Russian bot messages.
 - Bot token stays in the DSH credential store.
 

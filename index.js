@@ -316,6 +316,7 @@ const BOT_COMMANDS = [
   { command: 'current', description: 'Show the topic session' },
   { command: 'menu', description: 'Show the model and session controls' },
   { command: 'rename', description: 'Rename this Telegram topic' },
+  { command: 'fork', description: 'Fork this session into a new topic' },
   { command: 'last', description: 'Show the latest assistant messages' },
   { command: 'restart', description: 'Restart the Telegram bot runtime' },
   { command: 'id', description: 'Show user and chat ids' },
@@ -332,6 +333,7 @@ const BOT_COMMANDS_RU = [
   { command: 'current', description: 'Показать сессию этого топика' },
   { command: 'menu', description: 'Показать меню модели и сессии' },
   { command: 'rename', description: 'Переименовать Telegram-топик' },
+  { command: 'fork', description: 'Форкнуть сессию в новый topic' },
   { command: 'last', description: 'Показать последние ответы ассистента' },
   { command: 'restart', description: 'Перезапустить Telegram-бота' },
   { command: 'id', description: 'Показать user id и chat id' },
@@ -537,7 +539,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'last-order',
+  codeRevision: 'fork',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -2868,7 +2870,7 @@ export function apply(ctx, config) {
     return true
   }
 
-  async function openTopicForSession(sessionId, chatId, signal) {
+  async function openTopicForSession(sessionId, chatId, signal, preferredTitle) {
     const key = `${chatId}:${sessionId}`
     const inFlight = openingTopics.get(key)
     if (inFlight !== undefined) return inFlight
@@ -2882,12 +2884,12 @@ export function apply(ctx, config) {
       delete state.threads[`${chatId}:${existing.threadId}`]
       await persistState()
     }
-    const title = await sessionTitle(sessionId)
+    const title = typeof preferredTitle === 'string' && preferredTitle.trim().length > 0 ? preferredTitle.trim() : await sessionTitle(sessionId)
     const records = await ctx.get('sessionQuery')?.listSessions(signal)
     const header = records?.find((entry) => entry.header.id === sessionId)?.header
     const threadId = await createTopic(chatId, title, signal)
     if (threadId === undefined) return undefined
-    const record = { sessionId, chatId, threadId, title: await sessionTitle(sessionId, header), ...(header?.cwd === undefined ? {} : { cwd: header.cwd }), updatedAt: Date.now() }
+    const record = { sessionId, chatId, threadId, title, ...(header?.cwd === undefined ? {} : { cwd: header.cwd }), updatedAt: Date.now() }
     state.sessions[sessionId] = record
     state.threads[`${chatId}:${threadId}`] = sessionId
     await persistState()
@@ -3294,7 +3296,7 @@ export function apply(ctx, config) {
             ? `${tr('Current session', 'Текущая сессия')}: <code>${chatState.sessionId}</code>\n`
             : `${tr('Global topic. Choose a session or create a new one.', 'Глобальный чат. Выбери сессию или создай новую.')}\n`) +
           `\n<b>${tr('First run', 'Первый запуск')}:</b> @BotFather → Bot Settings → <b>Threaded mode</b> → ${tr('Enable', 'Включить')}.\n` +
-          `${tr('Commands', 'Команды')}: /sessions, /current, /menu, /rename, /last, /stop, /restart, /status, /id, /ping.`,
+          `${tr('Commands', 'Команды')}: /sessions, /current, /menu, /rename, /fork, /last, /stop, /restart, /status, /id, /ping.`,
         signal,
         threadId,
       )
@@ -3358,6 +3360,59 @@ export function apply(ctx, config) {
           await sendAnswer(chat.id, body, signal, threadId)
         }
       }
+      return
+    }
+
+    if (command === '/fork') {
+      if (!inSession) {
+        await send(chat.id, tr('Open a session first: /sessions.', 'Сначала открой сессию: /sessions.'), signal, threadId)
+        return
+      }
+      if (chatState.busy) {
+        await send(chat.id, tr('Stop the current task before forking.', 'Останови текущую задачу перед форком.'), signal, threadId)
+        return
+      }
+      const controller = ctx.get('sessionController')
+      if (controller === undefined || typeof controller.fork !== 'function') {
+        await send(chat.id, tr('Session forking is unavailable in this profile.', 'Форк сессий недоступен в этом профиле.'), signal, threadId)
+        return
+      }
+      let requested = text.trim().slice('/fork'.length).trim()
+      if ((requested.startsWith('"') && requested.endsWith('"')) || (requested.startsWith("'") && requested.endsWith("'"))) {
+        requested = requested.slice(1, -1).trim()
+      }
+      if (requested.length > 120) {
+        await send(chat.id, tr('Fork name must be at most 120 characters.', 'Имя форка должно быть не длиннее 120 символов.'), signal, threadId)
+        return
+      }
+      const sourceId = chatState.sessionId
+      let forkId
+      try {
+        const result = await controller.fork({ sessionId: sourceId })
+        forkId = typeof result === 'string' ? result : result?.sessionId
+      } catch (error) {
+        await send(chat.id, `❌ ${escapeHtml(messageOf(error))}`, signal, threadId)
+        return
+      }
+      if (typeof forkId !== 'string' || forkId.length === 0) {
+        await send(chat.id, tr('Fork returned no session id.', 'Форк не вернул id сессии.'), signal, threadId)
+        return
+      }
+      const sourceTitle = state.sessions[sourceId]?.title || await sessionTitle(sourceId)
+      const records = await ctx.get('sessionQuery')?.listSessions(signal)
+      const branchNumber = (records ?? []).filter((entry) => entry.header?.parentSession === sourceId).length + 1
+      const title = requested.length > 0 ? requested : `${sourceTitle} (${branchNumber})`
+      const record = await openTopicForSession(forkId, chat.id, signal, title)
+      if (record === undefined) {
+        await send(chat.id, `❌ ${tr('Session was forked but the topic could not be created.', 'Сессия форкнута, но topic создать не удалось.')}`, signal, threadId)
+        return
+      }
+      await send(
+        chat.id,
+        `🍴 ${tr('Session forked', 'Сессия форкнута')}: <b>${escapeHtml(record.title || title)}</b>`,
+        signal,
+        threadId,
+      )
       return
     }
 
