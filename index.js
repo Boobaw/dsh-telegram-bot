@@ -537,7 +537,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'telegram-files',
+  codeRevision: 'last-order',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -3347,7 +3347,7 @@ export function apply(ctx, config) {
         return
       }
       const title = await sessionTitle(chatState.sessionId)
-      for (const [index, text] of texts.entries()) {
+      for (const [index, text] of [...texts].reverse().entries()) {
         const chunks = splitAnswerText(text.trim())
         if (chunks.length === 0) continue
         const label = limit === 1
