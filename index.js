@@ -528,7 +528,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'topic-lock',
+  codeRevision: 'last-split',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -3242,12 +3242,16 @@ export function apply(ctx, config) {
         return
       }
       const title = await sessionTitle(chatState.sessionId)
-      const body = texts
-        .map((text, index) => `${limit === 1 ? '' : `**${index + 1}.** `}${text.slice(0, 3500)}`)
-        .join('\n\n')
-      const header = limit === 1 ? `**${tr('Latest assistant answer', 'Последний ответ ассистента')}**` : `**${tr('Latest', 'Последние')} ${texts.length} ${tr('answers', 'ответа')}**`
-      for (const chunk of splitAnswerText(`${header} · ${title}\n\n${body}`)) {
-        await sendAnswer(chat.id, chunk, signal, threadId)
+      for (const [index, text] of texts.entries()) {
+        const chunks = splitAnswerText(text.trim())
+        if (chunks.length === 0) continue
+        const label = limit === 1
+          ? tr('Latest assistant answer', 'Последний ответ ассистента')
+          : `${tr('Answer', 'Ответ')} ${index + 1}/${texts.length}`
+        for (const [chunkIndex, chunk] of chunks.entries()) {
+          const body = chunkIndex === 0 ? `**${label}** · ${title}\n\n${chunk}` : chunk
+          await sendAnswer(chat.id, body, signal, threadId)
+        }
       }
       return
     }
