@@ -33,6 +33,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**.
 - Documents and photos sent in a session topic are saved as DSH attachments and passed to the agent.
 - `/last`, `/rename`, `/fork`, `/stop`, `/restart`, `/status` and `/menu`.
 - `/fork [name]` creates a DSH session fork in a new Telegram topic; without a name it uses the previous title plus the branch number.
+- The session picker also has **🔀 Continue in Telegram fork**; automatic fork topics end with `(N)`.
 - English and Russian bot messages.
 - Bot token stays in the DSH credential store.
 
@@ -83,9 +84,9 @@ The token field only reports whether a token is configured. A token supplied thr
 4. Send `/start` in **All**. With an empty allowlist the bot replies with your user and chat ids.
 5. Add your user id to **Allowed users** and press **Save**.
 6. Send `/sessions` in **All**, choose a workspace and open or create a session.
+7. Send a test message in the new topic.
 
 An ordinary message in **All** creates a new session topic in the default workspace. Commands such as `/sessions`, `/fork` and `/last` still work in All.
-7. Send a test message in the new topic.
 
 ## Plugins page
 
@@ -153,6 +154,7 @@ No build step is needed.
 npm install
 node --check index.js
 node --check client.js
+npm test
 ```
 
 `index.js` is the Host half: Telegram polling, topic routing and the session bridge. `client.js` registers the Settings page and the Plugins-page note. The plugin adds no model-facing tools or system-prompt text; it connects Telegram to the existing DSH agent.

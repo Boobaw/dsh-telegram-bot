@@ -555,7 +555,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'testbench',
+  codeRevision: 'fork-number',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -612,6 +612,8 @@ export function apply(ctx, config) {
   let restartQueued = false
   /** Retry timer for a missing or not-yet-ready credential. */
   let startRetryTimer
+  /** Coalesces concurrent start requests into one poller. */
+  let startInFlight
   /** Durable chat → session mapping. */
   let state = { version: 2, sessions: {}, threads: {} }
   /** Serializes state-file writes. */
@@ -1997,6 +1999,9 @@ export function apply(ctx, config) {
           chat.activeTurn = undefined
           fireAndForget('finalize', () => finalizeChat(chat))
         }
+        if (event.type === 'session/title' && typeof event.data?.title === 'string') {
+          fireAndForget('title-event', () => applyTopicTitle(chat, event.data.title))
+        }
       } catch (error) {
         reportError('session-event', error)
       }
@@ -2414,34 +2419,35 @@ export function apply(ctx, config) {
    * Rename the session topic to the latest DSH session title.
    * @param chat - chat bridge state.
    */
-  async function refreshTopicTitle(chat, attempt = 0) {
+  async function applyTopicTitle(chat, title) {
+    if (typeof title !== 'string' || title.trim().length === 0) return
     if (typeof chat.sessionId !== 'string' || chat.threadId === undefined) return
     const record = state.sessions[chat.sessionId]
     if (record?.titleLocked === true) return
-    const title = await sessionTitle(chat.sessionId)
-    if (record === undefined || record.title !== title) {
-      try {
-        await call('editForumTopic', {
-          chat_id: chat.chatId,
-          message_thread_id: chat.threadId,
-          name: shortLabel(title, 120),
-        }, bridgeAbort.signal)
-        if (record !== undefined) {
-          record.title = title
-          await persistState()
-        }
-      } catch (error) {
-        if (!bridgeAbort.signal.aborted) warn(`editForumTopic failed: ${messageOf(error)}`)
+    const clean = title.trim()
+    if (record !== undefined && record.title === clean) return
+    try {
+      await call('editForumTopic', {
+        chat_id: chat.chatId,
+        message_thread_id: chat.threadId,
+        name: shortLabel(clean, 120),
+      }, bridgeAbort.signal)
+      if (record !== undefined) {
+        record.title = clean
+        await persistState()
       }
+    } catch (error) {
+      if (!bridgeAbort.signal.aborted) warn(`editForumTopic failed: ${messageOf(error)}`)
     }
-    // DSH may write its generated title just after the turn settles. Retry a
-    // few times so the topic does not stay on the fallback/New session name.
-    if (attempt < 4 && !bridgeAbort.signal.aborted && record?.titleLocked !== true) {
-      const timer = setTimeout(() => {
-        fireAndForget('topic-title', () => refreshTopicTitle(chat, attempt + 1))
-      }, 1500 * (attempt + 1))
-      timer.unref?.()
-    }
+  }
+
+  async function refreshTopicTitle(chat) {
+    if (typeof chat.sessionId !== 'string' || chat.threadId === undefined) return
+    const record = state.sessions[chat.sessionId]
+    if (record?.titleLocked === true) return
+    // Read the current title once. The title provider's later session/title
+    // event updates the topic without timers or retry loops.
+    await applyTopicTitle(chat, await sessionTitle(chat.sessionId))
   }
 
   /**
@@ -3083,6 +3089,37 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Build the next automatic fork title: "<source title> (N)".
+   * @param sourceId - source session id.
+   * @returns topic title.
+   */
+  async function nextForkTitle(sourceId) {
+    const sourceTitle = state.sessions[sourceId]?.title || await sessionTitle(sourceId)
+    const records = await ctx.get('sessionQuery')?.listSessions(bridgeAbort.signal)
+    const branch = (records ?? []).filter((entry) => entry.header?.parentSession === sourceId).length + 1
+    return shortLabel(`${sourceTitle} (${branch})`, 120)
+  }
+
+  /**
+   * Fork one session from the /sessions picker into a fresh topic.
+   * @param sourceId - source session id.
+   * @param chatId - control chat.
+   * @param controlThreadId - topic that owns the picker.
+   * @param signal - request lifetime.
+   * @returns the new topic mapping, or undefined.
+   */
+  async function forkSessionFromMenu(sourceId, chatId, signal) {
+    const controller = ctx.get('sessionController')
+    if (controller === undefined || typeof controller.fork !== 'function') {
+      throw new Error(tr('Session forking is unavailable in this profile.', 'Форк сессий недоступен в этом профиле.'))
+    }
+    const result = await controller.fork({ sessionId: sourceId })
+    const forkId = typeof result === 'string' ? result : result?.sessionId
+    if (typeof forkId !== 'string' || forkId.length === 0) throw new Error(tr('Fork returned no session id.', 'Форк не вернул id сессии.'))
+    return createForkTopic(forkId, chatId, await nextForkTitle(sourceId), signal)
+  }
+
+  /**
    * Show the workspace picker in the control topic.
    * @param chatId - control chat.
    * @param threadId - control topic thread.
@@ -3181,6 +3218,10 @@ export function apply(ctx, config) {
     rows.push([{
       text: tr('▶️ Continue in Telegram', '▶️ Продолжить в Telegram'),
       callback_data: `c:${sessionId}`,
+    }])
+    rows.push([{
+      text: tr('🔀 Continue in Telegram fork', '🔀 Продолжить в Telegram fork'),
+      callback_data: `f:${sessionId}`,
     }])
     rows.push([{
       text: tr('⬅️ Back', '⬅️ Назад'),
@@ -3296,6 +3337,22 @@ export function apply(ctx, config) {
           return
         }
         await createNewSessionTopic(chat.id, threadId, signal, target)
+        return
+      }
+      if (prefix === 'f') {
+        const record = await forkSessionFromMenu(ref, chat.id, signal)
+        if (record === undefined) {
+          await send(chat.id, tr('Failed to create a fork topic. Check Topics in chat settings.', 'Не удалось создать fork-topic. Проверь Topics в настройках чата.'), signal, threadId)
+          return
+        }
+        await editKeyboard(
+          chat.id,
+          threadId,
+          query.message.message_id,
+          `✅ ${tr('Session forked in topic', 'Сессия форкнута в topic')} «${escapeHtml(record.title)}».`,
+          [],
+          signal,
+        )
         return
       }
       if (prefix === 'c') {
@@ -3597,10 +3654,7 @@ export function apply(ctx, config) {
         await send(chat.id, tr('Fork returned no session id.', 'Форк не вернул id сессии.'), signal, threadId)
         return
       }
-      const sourceTitle = state.sessions[sourceId]?.title || await sessionTitle(sourceId)
-      const records = await ctx.get('sessionQuery')?.listSessions(signal)
-      const branchNumber = (records ?? []).filter((entry) => entry.header?.parentSession === sourceId).length + 1
-      const title = requested.length > 0 ? requested : `${sourceTitle} (${branchNumber})`
+      const title = requested.length > 0 ? requested : await nextForkTitle(sourceId)
       const record = await createForkTopic(forkId, chat.id, title, signal)
       if (record === undefined) {
         await send(chat.id, `❌ ${tr('Session was forked but the topic could not be created.', 'Сессия форкнута, но topic создать не удалось.')}`, signal, threadId)
@@ -3866,8 +3920,21 @@ export function apply(ctx, config) {
     await publishStatus({ state: 'stopped', detail: '', username: '' })
   }
 
-  /** Start the runtime if enabled and a token is available. */
+  /** Coalesce concurrent runtime starts. */
   async function start() {
+    if (lifetime !== undefined) return
+    if (startInFlight !== undefined) return startInFlight
+    const task = startInternal()
+    startInFlight = task
+    try {
+      return await task
+    } finally {
+      if (startInFlight === task) startInFlight = undefined
+    }
+  }
+
+  /** Start the runtime if enabled and a token is available. */
+  async function startInternal() {
     if (startRetryTimer !== undefined) {
       clearTimeout(startRetryTimer)
       startRetryTimer = undefined
