@@ -539,7 +539,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'all-new-topic',
+  codeRevision: 'all-general',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -3402,7 +3402,7 @@ export function apply(ctx, config) {
     if (hasAttachment) {
       // All is a first-class chat: a file there starts a session in All
       // instead of opening or creating a separate topic.
-      if (!inSession && threadId !== undefined && threadId !== 0) {
+      if (!inSession && threadId !== undefined && threadId !== 0 && threadId !== 1) {
         await send(chat.id, tr('Open a session first: /sessions.', 'Сначала открой сессию: /sessions.'), signal, threadId)
         return
       }
@@ -3694,7 +3694,7 @@ export function apply(ctx, config) {
 
     // Ordinary text in All starts a fresh session topic in the default
     // Workspace. Commands above still operate on All itself.
-    if (threadId === undefined || threadId === 0) {
+    if (threadId === undefined || threadId === 0 || threadId === 1) {
       await createNewSessionTopic(chat.id, threadId, signal, defaultWorkspaceCwd(), text)
       return
     }
