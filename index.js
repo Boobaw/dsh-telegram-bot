@@ -539,7 +539,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'warn-scope',
+  codeRevision: 'startup-retry',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -594,6 +594,8 @@ export function apply(ctx, config) {
   let restarting = false
   /** A restart requested while another was in flight. */
   let restartQueued = false
+  /** Retry timer for a missing or not-yet-ready credential. */
+  let startRetryTimer
   /** Durable chat → session mapping. */
   let state = { version: 2, sessions: {}, threads: {} }
   /** Serializes state-file writes. */
@@ -3697,34 +3699,39 @@ export function apply(ctx, config) {
   async function poll(tokenLifetime) {
     let offset = 0
     let healthy = false
-    try {
-      // A webhook left by another deployment silently disables getUpdates.
-      // Hermes deletes it before starting polling; do the same, without
-      // dropping updates that were queued while the bot was down.
+    let connected = false
+    while (!tokenLifetime.signal.aborted) {
       try {
-        await call('deleteWebhook', { drop_pending_updates: false }, tokenLifetime.signal, 10_000)
+        // A webhook left by another deployment silently disables getUpdates.
+        // Hermes deletes it before starting polling; do the same, without
+        // dropping updates that were queued while the bot was down.
+        try {
+          await call('deleteWebhook', { drop_pending_updates: false }, tokenLifetime.signal, 10_000)
+        } catch (error) {
+          if (!tokenLifetime.signal.aborted) warn(`deleteWebhook failed: ${messageOf(error)}`)
+        }
+        me = await call('getMe', {}, tokenLifetime.signal)
+        startedAt = Date.now()
+        healthy = true
+        connected = true
+        info(`connected as @${me.username ?? me.id}`)
+        await publishStatus({ state: 'running', detail: '', username: me.username ?? String(me.id) })
+        await publishCommands(tokenLifetime.signal)
+        await notifyAll(
+          `🟢 <b>${tr('Telegram bot enabled', 'Telegram-бот включён')}</b>\n` +
+            `@${escapeHtml(me.username ?? String(me.id))}\n` +
+            tr('Polling started. Send /start to open the menu.', 'Polling запущен. Отправь /start, чтобы открыть меню.'),
+          tokenLifetime.signal,
+        )
+        break
       } catch (error) {
-        if (!tokenLifetime.signal.aborted) warn(`deleteWebhook failed: ${messageOf(error)}`)
-      }
-      me = await call('getMe', {}, tokenLifetime.signal)
-      startedAt = Date.now()
-      healthy = true
-      info(`connected as @${me.username ?? me.id}`)
-      await publishStatus({ state: 'running', detail: '', username: me.username ?? String(me.id) })
-      await publishCommands(tokenLifetime.signal)
-      await notifyAll(
-        `🟢 <b>${tr('Telegram bot enabled', 'Telegram-бот включён')}</b>\n` +
-          `@${escapeHtml(me.username ?? String(me.id))}\n` +
-          tr('Polling started. Send /start to open the menu.', 'Polling запущен. Отправь /start, чтобы открыть меню.'),
-        tokenLifetime.signal,
-      )
-    } catch (error) {
-      if (!tokenLifetime.signal.aborted) {
+        if (tokenLifetime.signal.aborted) return
         warn(`getMe failed: ${messageOf(error)}`)
         await publishStatus({ state: 'error', detail: messageOf(error) })
+        await sleep(RETRY_DELAY_MS, tokenLifetime.signal)
       }
-      return
     }
+    if (!connected || tokenLifetime.signal.aborted) return
 
     while (!tokenLifetime.signal.aborted) {
       let updates
@@ -3778,8 +3785,21 @@ export function apply(ctx, config) {
     }
   }
 
+  /** Retry startup after the credential store becomes ready. */
+  function scheduleStartRetry() {
+    if (startRetryTimer !== undefined || !isEnabled(config)) return
+    startRetryTimer = setTimeout(() => {
+      startRetryTimer = undefined
+      fireAndForget('start-retry', () => start())
+    }, 5000)
+  }
+
   /** Stop the active runtime and wait for its loop to settle. */
   async function stop() {
+    if (startRetryTimer !== undefined) {
+      clearTimeout(startRetryTimer)
+      startRetryTimer = undefined
+    }
     const current = lifetime
     lifetime = undefined
     me = undefined
@@ -3792,6 +3812,10 @@ export function apply(ctx, config) {
 
   /** Start the runtime if enabled and a token is available. */
   async function start() {
+    if (startRetryTimer !== undefined) {
+      clearTimeout(startRetryTimer)
+      startRetryTimer = undefined
+    }
     await publishStatus({
       state: 'starting',
       detail: '',
@@ -3805,10 +3829,18 @@ export function apply(ctx, config) {
       await publishStatus({ state: 'disabled', detail: 'Enable bot is off' })
       return
     }
-    const token = await resolveToken()
+    let token
+    try {
+      token = await resolveToken()
+    } catch (error) {
+      reportError('token', error)
+      await publishStatus({ state: 'error', detail: messageOf(error) })
+      scheduleStartRetry()
+      return
+    }
     if (token === undefined) {
-      info('runtime idle: TELEGRAM_BOT_TOKEN is not configured')
       await publishStatus({ state: 'idle', detail: 'TELEGRAM_BOT_TOKEN is not configured' })
+      scheduleStartRetry()
       return
     }
     const controller = new AbortController()
@@ -3881,6 +3913,10 @@ export function apply(ctx, config) {
         if (restartTimer !== undefined) {
           clearTimeout(restartTimer)
           restartTimer = undefined
+        }
+        if (startRetryTimer !== undefined) {
+          clearTimeout(startRetryTimer)
+          startRetryTimer = undefined
         }
         bridgeAbort.abort()
         void stop().catch((error) => reportError('stop', error))
