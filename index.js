@@ -539,7 +539,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'startup-retry',
+  codeRevision: 'all-session',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -3387,7 +3387,9 @@ export function apply(ctx, config) {
     if (await consumeQuestionReply(chatState, text ?? '', signal)) return
     const inSession = typeof chatState.sessionId === 'string'
     if (hasAttachment) {
-      if (!inSession) {
+      // All is a first-class chat: a file there starts a session in All
+      // instead of opening or creating a separate topic.
+      if (!inSession && threadId !== undefined && threadId !== 0) {
         await send(chat.id, tr('Open a session first: /sessions.', 'Сначала открой сессию: /sessions.'), signal, threadId)
         return
       }
@@ -3677,17 +3679,8 @@ export function apply(ctx, config) {
       return
     }
 
-    if (!inSession) {
-      await send(
-        chat.id,
-        tr('This is a global topic. Open /sessions to choose or create a session.', 'Это глобальный topic. Открой /sessions, чтобы выбрать или создать сессию.'),
-        signal,
-        threadId,
-      )
-      return
-    }
-
-    // Ordinary text in a session topic becomes a DSH agent turn.
+    // All is also a chat: keep the conversation there instead of creating a
+    // topic. /sessions remains available for explicit topic-based sessions.
     await runAgent(chatState, text, signal)
   }
 
