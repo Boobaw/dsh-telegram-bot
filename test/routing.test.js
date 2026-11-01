@@ -1,0 +1,49 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import { __testing } from '../index.js'
+
+const { classifyError, isAllThread, isTelegramParseError, routeMessage } = __testing
+
+test('General and All thread ids route to a new topic', () => {
+  for (const threadId of [undefined, null, 0, 1]) {
+    assert.equal(isAllThread(threadId), true, `thread ${threadId}`)
+    assert.equal(routeMessage({ threadId, inSession: false }), 'new-topic')
+    assert.equal(routeMessage({ threadId, inSession: true }), 'new-topic')
+  }
+})
+
+test('an existing session topic never creates another topic', () => {
+  assert.equal(routeMessage({ threadId: 53193, inSession: true }), 'continue')
+  assert.equal(routeMessage({ threadId: 53193, inSession: true, hasAttachment: true }), 'continue')
+})
+
+test('a sessionless non-All topic is adopted instead of duplicated', () => {
+  assert.equal(routeMessage({ threadId: 53193, inSession: false }), 'current-topic')
+  assert.equal(routeMessage({ threadId: 53193, inSession: false, hasAttachment: true }), 'current-topic')
+})
+
+test('one All message creates exactly one topic, then the topic continues', () => {
+  const first = routeMessage({ threadId: 1, inSession: false })
+  assert.equal(first, 'new-topic')
+
+  // After creating/binding the topic, subsequent messages are in a session.
+  const second = routeMessage({ threadId: 53193, inSession: true })
+  assert.equal(second, 'continue')
+  assert.notEqual(second, 'new-topic')
+})
+
+test('Telegram parse errors are the only formatting fallback', () => {
+  assert.equal(isTelegramParseError("Bad Request: can't parse entities: Character '.' is reserved"), true)
+  assert.equal(isTelegramParseError('Bad Request: unsupported start tag'), true)
+  assert.equal(isTelegramParseError('Bad Request: message thread not found'), false)
+  assert.equal(isTelegramParseError('Bad Request: message is not modified'), false)
+  assert.equal(isTelegramParseError('fetch failed'), false)
+})
+
+test('operational failures are not classified as formatting failures', () => {
+  assert.equal(classifyError(Object.assign(new Error("can't parse entities"), { telegram: true })), 'format')
+  assert.equal(classifyError(Object.assign(new Error('message thread not found'), { telegram: true })), 'telegram')
+  assert.equal(classifyError(new Error('agent turn failed')), 'agent')
+  assert.equal(classifyError(Object.assign(new Error('ENOENT: state.json'), { code: 'ENOENT' })), 'storage')
+  assert.equal(classifyError(new Error('unexpected')), 'runtime')
+})
