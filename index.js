@@ -539,7 +539,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'all-general',
+  codeRevision: 'all-force-topic',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -3353,6 +3353,7 @@ export function apply(ctx, config) {
       lastChatId: chat?.id ?? null,
       lastFromId: from?.id ?? null,
       lastUpdateType: type,
+      lastThreadId: message.message_thread_id ?? null,
       lastOutcome: 'received',
       detail: '',
     })
@@ -3692,20 +3693,11 @@ export function apply(ctx, config) {
       return
     }
 
-    // Ordinary text in All starts a fresh session topic in the default
-    // Workspace. Commands above still operate on All itself.
-    if (threadId === undefined || threadId === 0 || threadId === 1) {
+    // Any ordinary message without a session starts a fresh session topic in
+    // the default Workspace. This includes All regardless of whether Telegram
+    // reports its thread id as absent, 0 or 1.
+    if (!inSession || threadId === 0 || threadId === 1) {
       await createNewSessionTopic(chat.id, threadId, signal, defaultWorkspaceCwd(), text)
-      return
-    }
-
-    if (!inSession) {
-      await send(
-        chat.id,
-        tr('This is a global topic. Open /sessions to choose or create a session.', 'Это глобальный topic. Открой /sessions, чтобы выбрать или создать сессию.'),
-        signal,
-        threadId,
-      )
       return
     }
 
