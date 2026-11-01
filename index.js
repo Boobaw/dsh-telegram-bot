@@ -539,7 +539,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'topic-continue',
+  codeRevision: 'topic-title-retry',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -2398,24 +2398,33 @@ export function apply(ctx, config) {
    * Rename the session topic to the latest DSH session title.
    * @param chat - chat bridge state.
    */
-  async function refreshTopicTitle(chat) {
+  async function refreshTopicTitle(chat, attempt = 0) {
     if (typeof chat.sessionId !== 'string' || chat.threadId === undefined) return
-    const title = await sessionTitle(chat.sessionId)
     const record = state.sessions[chat.sessionId]
     if (record?.titleLocked === true) return
-    if (record !== undefined && record.title === title) return
-    try {
-      await call('editForumTopic', {
-        chat_id: chat.chatId,
-        message_thread_id: chat.threadId,
-        name: shortLabel(title, 120),
-      }, bridgeAbort.signal)
-      if (record !== undefined) {
-        record.title = title
-        await persistState()
+    const title = await sessionTitle(chat.sessionId)
+    if (record === undefined || record.title !== title) {
+      try {
+        await call('editForumTopic', {
+          chat_id: chat.chatId,
+          message_thread_id: chat.threadId,
+          name: shortLabel(title, 120),
+        }, bridgeAbort.signal)
+        if (record !== undefined) {
+          record.title = title
+          await persistState()
+        }
+      } catch (error) {
+        if (!bridgeAbort.signal.aborted) warn(`editForumTopic failed: ${messageOf(error)}`)
       }
-    } catch (error) {
-      if (!bridgeAbort.signal.aborted) warn(`editForumTopic failed: ${messageOf(error)}`)
+    }
+    // DSH may write its generated title just after the turn settles. Retry a
+    // few times so the topic does not stay on the fallback/New session name.
+    if (attempt < 4 && !bridgeAbort.signal.aborted && record?.titleLocked !== true) {
+      const timer = setTimeout(() => {
+        fireAndForget('topic-title', () => refreshTopicTitle(chat, attempt + 1))
+      }, 1500 * (attempt + 1))
+      timer.unref?.()
     }
   }
 
