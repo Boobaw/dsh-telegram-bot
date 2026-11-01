@@ -248,6 +248,22 @@ function isTelegramParseError(detail) {
   return /can't parse entities|unsupported start tag|can't find end tag|reserved and must be escaped|parse entities/iu.test(String(detail))
 }
 
+/** Whether a Telegram thread id denotes the General / All topic. */
+function isAllThread(threadId) {
+  return threadId === undefined || threadId === null || threadId === 0 || threadId === 1
+}
+
+/**
+ * Decide where an ordinary (non-command) message belongs.
+ * @param {{ threadId?: number|null, inSession: boolean, hasAttachment?: boolean }} input
+ * @returns {'new-topic'|'current-topic'|'continue'|'command'}
+ */
+function routeMessage({ threadId, inSession, hasAttachment = false }) {
+  if (isAllThread(threadId)) return 'new-topic'
+  if (hasAttachment) return inSession ? 'continue' : 'current-topic'
+  return inSession ? 'continue' : 'current-topic'
+}
+
 /**
  * Trim a session preview at a line boundary so formatting is not cut mid-construct.
  * @param text - raw assistant Markdown.
@@ -3427,7 +3443,7 @@ export function apply(ctx, config) {
     if (hasAttachment) {
       // All is a first-class chat: a file there starts a session in All
       // instead of opening or creating a separate topic.
-      if (!inSession && threadId !== undefined && threadId !== 0 && threadId !== 1) {
+      if (!inSession && !isAllThread(threadId)) {
         await send(chat.id, tr('Open a session first: /sessions.', 'Сначала открой сессию: /sessions.'), signal, threadId)
         return
       }
@@ -3717,16 +3733,12 @@ export function apply(ctx, config) {
       return
     }
 
-    // General/All is a control topic: a message there starts a fresh session
-    // topic in the default Workspace.
-    if (threadId === undefined || threadId === 0 || threadId === 1) {
+    const route = routeMessage({ threadId, inSession })
+    if (route === 'new-topic') {
       await createNewSessionTopic(chat.id, threadId, signal, defaultWorkspaceCwd(), text)
       return
     }
-
-    // A message in any other existing topic continues in that same topic.
-    // Only the session is new; no second Telegram topic is created.
-    if (!inSession) {
+    if (route === 'current-topic') {
       await createSessionInCurrentTopic(chatState, defaultWorkspaceCwd(), text, signal)
       return
     }
@@ -3968,4 +3980,13 @@ export function apply(ctx, config) {
     },
     'dsh-telegram-bot: runtime',
   )
+}
+
+/** Pure helpers exposed for the local regression suite. */
+export const __testing = {
+  classifyError,
+  isAllThread,
+  isTelegramParseError,
+  routeMessage,
+  splitAnswerText,
 }
