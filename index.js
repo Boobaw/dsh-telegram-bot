@@ -3042,6 +3042,7 @@ export function apply(ctx, config) {
       chatId,
       threadId,
       title,
+      titleLocked: true,
       ...(header?.cwd === undefined ? {} : { cwd: header.cwd }),
       updatedAt: Date.now(),
     }
