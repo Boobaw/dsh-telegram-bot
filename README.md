@@ -83,6 +83,8 @@ The token field only reports whether a token is configured. A token supplied thr
 4. Send `/start` in **All**. With an empty allowlist the bot replies with your user and chat ids.
 5. Add your user id to **Allowed users** and press **Save**.
 6. Send `/sessions` in **All**, choose a workspace and open or create a session.
+
+Messages sent directly in **All** stay in All and use a session bound to All. `/sessions` is only needed for topic-based sessions.
 7. Send a test message in the new topic.
 
 ## Plugins page
