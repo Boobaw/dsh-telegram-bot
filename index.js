@@ -539,7 +539,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'all-force-topic',
+  codeRevision: 'topic-continue',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -3336,6 +3336,20 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Bind a new DSH session to the current topic without creating another topic.
+   * @param chatState - current topic state.
+   * @param cwd - workspace path.
+   * @param initialText - first prompt, if any.
+   * @param signal - request lifetime.
+   */
+  async function createSessionInCurrentTopic(chatState, cwd, initialText, signal) {
+    if (typeof cwd === 'string' && cwd.length > 0) chatState.cwd = cwd
+    await ensureAgent(chatState)
+    await sendMenu(chatState.chatId, chatState.threadId, chatState, signal)
+    if (initialText.trim().length > 0) await runAgent(chatState, initialText, signal)
+  }
+
+  /**
    * Handle one authorized Telegram message and dispatch its command or prompt.
    * @param message - Telegram message.
    * @param signal - runtime lifetime.
@@ -3693,11 +3707,17 @@ export function apply(ctx, config) {
       return
     }
 
-    // Any ordinary message without a session starts a fresh session topic in
-    // the default Workspace. This includes All regardless of whether Telegram
-    // reports its thread id as absent, 0 or 1.
-    if (!inSession || threadId === 0 || threadId === 1) {
+    // General/All is a control topic: a message there starts a fresh session
+    // topic in the default Workspace.
+    if (threadId === undefined || threadId === 0 || threadId === 1) {
       await createNewSessionTopic(chat.id, threadId, signal, defaultWorkspaceCwd(), text)
+      return
+    }
+
+    // A message in any other existing topic continues in that same topic.
+    // Only the session is new; no second Telegram topic is created.
+    if (!inSession) {
+      await createSessionInCurrentTopic(chatState, defaultWorkspaceCwd(), text, signal)
       return
     }
 
