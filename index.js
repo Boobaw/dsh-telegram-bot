@@ -539,7 +539,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'all-session',
+  codeRevision: 'all-new-topic',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -701,6 +701,18 @@ export function apply(ctx, config) {
   function cwdOf() {
     const configured = readLive(config.cwd, process.cwd())
     return typeof configured === 'string' && configured.length > 0 ? resolve(configured) : process.cwd()
+  }
+
+  /** @returns the default Workspace path, or the configured fallback cwd. */
+  function defaultWorkspaceCwd() {
+    try {
+      const workspaces = ctx.get('workspaceRegistry')?.list() ?? []
+      const preferred = workspaces.find((entry) => basename(entry.path) === 'default-workspace') ?? workspaces[0]
+      if (typeof preferred?.path === 'string' && preferred.path.length > 0) return preferred.path
+    } catch {
+      // Fall through to the agent default.
+    }
+    return cwdOf()
   }
 
   /** @returns the configured preset name, or undefined. */
@@ -3293,7 +3305,7 @@ export function apply(ctx, config) {
    * @param controlThreadId - thread that requested creation.
    * @param signal - request lifetime.
    */
-  async function createNewSessionTopic(chatId, controlThreadId, signal, cwd) {
+  async function createNewSessionTopic(chatId, controlThreadId, signal, cwd, initialText = '') {
     let threadId
     try {
       threadId = await createTopic(chatId, 'New session', signal)
@@ -3317,6 +3329,7 @@ export function apply(ctx, config) {
         signal,
       )
       await sendMenu(chatId, threadId, chatState, signal)
+      if (initialText.trim().length > 0) await runAgent(chatState, initialText, signal)
     } catch (error) {
       await send(chatId, `❌ ${escapeHtml(messageOf(error))}`, signal, controlThreadId)
     }
@@ -3679,8 +3692,24 @@ export function apply(ctx, config) {
       return
     }
 
-    // All is also a chat: keep the conversation there instead of creating a
-    // topic. /sessions remains available for explicit topic-based sessions.
+    // Ordinary text in All starts a fresh session topic in the default
+    // Workspace. Commands above still operate on All itself.
+    if (threadId === undefined || threadId === 0) {
+      await createNewSessionTopic(chat.id, threadId, signal, defaultWorkspaceCwd(), text)
+      return
+    }
+
+    if (!inSession) {
+      await send(
+        chat.id,
+        tr('This is a global topic. Open /sessions to choose or create a session.', 'Это глобальный topic. Открой /sessions, чтобы выбрать или создать сессию.'),
+        signal,
+        threadId,
+      )
+      return
+    }
+
+    // Ordinary text in a session topic becomes a DSH agent turn.
     await runAgent(chatState, text, signal)
   }
 

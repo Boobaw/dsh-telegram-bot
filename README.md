@@ -84,7 +84,7 @@ The token field only reports whether a token is configured. A token supplied thr
 5. Add your user id to **Allowed users** and press **Save**.
 6. Send `/sessions` in **All**, choose a workspace and open or create a session.
 
-Messages sent directly in **All** stay in All and use a session bound to All. `/sessions` is only needed for topic-based sessions.
+An ordinary message in **All** creates a new session topic in the default workspace. Commands such as `/sessions`, `/fork` and `/last` still work in All.
 7. Send a test message in the new topic.
 
 ## Plugins page
