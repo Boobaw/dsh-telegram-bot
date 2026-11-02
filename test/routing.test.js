@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { __testing } from '../index.js'
 
-const { classifyError, isAllThread, isTelegramParseError, routeMessage } = __testing
+const { classifyError, isAllThread, isTelegramParseError, normalizeCommand, routeMessage, splitAnswerText } = __testing
 
 test('General and All thread ids route to a new topic', () => {
   for (const threadId of [undefined, null, 0, 1]) {
@@ -46,4 +46,23 @@ test('operational failures are not classified as formatting failures', () => {
   assert.equal(classifyError(new Error('agent turn failed')), 'agent')
   assert.equal(classifyError(Object.assign(new Error('ENOENT: state.json'), { code: 'ENOENT' })), 'storage')
   assert.equal(classifyError(new Error('unexpected')), 'runtime')
+})
+
+
+test('commands from mobile may include @botname', () => {
+  assert.equal(normalizeCommand('/last@boobawnebot'), '/last')
+  assert.equal(normalizeCommand('/FORK@boobawnebot'), '/fork')
+  assert.equal(normalizeCommand('/last'), '/last')
+  assert.equal(normalizeCommand('hello'), 'hello')
+})
+
+
+test('long fenced code stays balanced across answer messages', () => {
+  const text = 'intro\n```js\n' + 'const value = 1\n'.repeat(600) + '```\noutro'
+  const chunks = splitAnswerText(text)
+  assert.equal(chunks.length > 1, true)
+  for (const chunk of chunks) {
+    const fences = chunk.match(/^ {0,3}(?:`{3,}|~{3,})/gmu) ?? []
+    assert.equal(fences.length % 2, 0, chunk.slice(0, 80))
+  }
 })

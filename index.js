@@ -253,6 +253,11 @@ function isAllThread(threadId) {
   return threadId === undefined || threadId === null || threadId === 0 || threadId === 1
 }
 
+/** Normalize a Telegram command token, dropping an optional @botname suffix. */
+function normalizeCommand(token) {
+  return String(token ?? '').toLowerCase().split('@')[0]
+}
+
 /**
  * Decide where an ordinary (non-command) message belongs.
  * @param {{ threadId?: number|null, inSession: boolean, hasAttachment?: boolean }} input
@@ -283,6 +288,21 @@ function clipPreview(text, limit = 2500) {
  * @param limit - converted character budget.
  * @returns chunks in reading order.
  */
+/** Return the last unclosed fenced code block in a Markdown chunk. */
+function openFenceAtEnd(text) {
+  let open
+  for (const line of text.split('\n')) {
+    const match = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(line)
+    if (match === null) continue
+    if (open === undefined) {
+      open = { marker: match[1], info: match[2].trim() }
+    } else if (match[1][0] === open.marker[0] && match[1].length >= open.marker.length && match[2].trim().length === 0) {
+      open = undefined
+    }
+  }
+  return open
+}
+
 function splitAnswerText(text, limit = ANSWER_MARKDOWN_LIMIT) {
   const chunks = []
   let rest = text.trim()
@@ -300,10 +320,16 @@ function splitAnswerText(text, limit = ANSWER_MARKDOWN_LIMIT) {
       if (nextBoundary > cut / 2) cut = nextBoundary
     }
     if (cut < 1) cut = Math.min(rest.length, 500)
-    const chunk = rest.slice(0, cut).trimEnd()
+    let chunk = rest.slice(0, cut).trimEnd()
     if (chunk.length === 0) break
+    let tail = rest.slice(cut).trimStart()
+    const fence = openFenceAtEnd(chunk)
+    if (fence !== undefined) {
+      chunk += `\n${fence.marker}`
+      tail = `${fence.marker}${fence.info}\n${tail}`
+    }
     chunks.push(chunk)
-    rest = rest.slice(cut).trimStart()
+    rest = tail
   }
   return chunks
 }
@@ -555,7 +581,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'fork-number',
+  codeRevision: 'rate-limit-recover',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -1188,14 +1214,24 @@ export function apply(ctx, config) {
     // while short requests still succeed.
     const targets = [undefined, '149.154.166.110', '149.154.167.220']
     let lastError
-    for (const target of targets) {
+    let rateLimitRetries = 0
+    for (let attempt = 0; attempt < targets.length + 4; attempt += 1) {
+      const target = targets[attempt % targets.length]
       try {
         return await requestOnce(target, token, method, body, signal, timeoutMs)
       } catch (error) {
         lastError = error
         if (signal.aborted) throw error
-        // An API-level refusal is final (not a network path problem).
-        if (error?.telegram === true) throw error
+        if (error?.telegram === true) {
+          // Telegram asks the caller to back off explicitly. Retrying a few
+          // times keeps a final answer from being lost during bursts of edits.
+          if (Number.isFinite(error.retryAfter) && rateLimitRetries < 3) {
+            rateLimitRetries += 1
+            await sleep((Math.max(1, error.retryAfter) + 1) * 1000, signal)
+            continue
+          }
+          throw error
+        }
       }
     }
     throw lastError ?? new Error(`Telegram ${method} failed`)
@@ -1246,6 +1282,9 @@ export function apply(ctx, config) {
           if (parsed?.ok !== true) {
             const error = new Error(parsed?.description ?? `Telegram API HTTP ${response.statusCode}`)
             error.telegram = true
+            if (typeof parsed?.parameters?.retry_after === 'number') {
+              error.retryAfter = parsed.parameters.retry_after
+            }
             reject(error)
             return
           }
@@ -1946,7 +1985,7 @@ export function apply(ctx, config) {
    * @returns true when the message was an answer.
    */
   async function consumeQuestionReply(chat, text, signal) {
-    const command = text.trim().split(/\s+/u)[0]?.toLowerCase()
+    const command = normalizeCommand(text.trim().split(/\s+/u)[0])
     if (BOT_COMMANDS.some((entry) => `/${entry.command}` === command)) return false
     const pending = pendingQuestionFor(chat.chatId, chat.threadId)
     if (pending === undefined || !pending.awaitingCustom) return false
@@ -1997,7 +2036,7 @@ export function apply(ctx, config) {
         }
         if (event.type === 'turn/end' && chat.turnSource === 'telegram' && event.data?.turn === chat.activeTurn) {
           chat.activeTurn = undefined
-          fireAndForget('finalize', () => finalizeChat(chat))
+          finalizeSafely(chat)
         }
         if (event.type === 'session/title' && typeof event.data?.title === 'string') {
           fireAndForget('title-event', () => applyTopicTitle(chat, event.data.title))
@@ -2450,6 +2489,18 @@ export function apply(ctx, config) {
     await applyTopicTitle(chat, await sessionTitle(chat.sessionId))
   }
 
+  /** Finalize one turn and surface a finalization failure instead of hanging. */
+  function finalizeSafely(chat) {
+    fireAndForget('finalize', async () => {
+      try {
+        await finalizeChat(chat)
+      } catch (error) {
+        reportError('finalize', error)
+        await failChat(chat, error, true)
+      }
+    })
+  }
+
   /**
    * Flush the final assistant text into the first answer message and split it.
    * @param chat - chat bridge state.
@@ -2498,8 +2549,8 @@ export function apply(ctx, config) {
    * @param chat - chat bridge state.
    * @param error - failure.
    */
-  async function failChat(chat, error) {
-    if (chat.done) return
+  async function failChat(chat, error, force = false) {
+    if (chat.done && !force) return
     chat.done = true
     chat.busy = false
     chat.turnSource = undefined
@@ -2565,7 +2616,7 @@ export function apply(ctx, config) {
       // as a fallback for compositions that do not emit turn events.
       void agent.whenIdle().then(() => {
         if (chat.turnSource === 'telegram' && chat.awaitingTurn) return finalizeChat(chat)
-      }).catch((error) => fireAndForget('agent-idle', () => failChat(chat, error)))
+      }).catch((error) => fireAndForget('agent-idle', () => failChat(chat, error, true)))
     } catch (error) {
       fireAndForget('agent-start', () => failChat(chat, error))
     }
@@ -3515,7 +3566,7 @@ export function apply(ctx, config) {
       return
     }
     const parts = text.trim().split(/\s+/u)
-    const command = parts[0]?.toLowerCase()
+    const command = normalizeCommand(parts[0])
 
     if (text.startsWith('🤖 Model:')) {
       if (!inSession) await send(chat.id, tr('Open a session first: /sessions.', 'Сначала открой сессию: /sessions.'), signal, threadId)
@@ -3633,7 +3684,7 @@ export function apply(ctx, config) {
         await send(chat.id, tr('Session forking is unavailable in this profile.', 'Форк сессий недоступен в этом профиле.'), signal, threadId)
         return
       }
-      let requested = text.trim().slice('/fork'.length).trim()
+      let requested = parts.slice(1).join(' ').trim()
       if ((requested.startsWith('"') && requested.endsWith('"')) || (requested.startsWith("'") && requested.endsWith("'"))) {
         requested = requested.slice(1, -1).trim()
       }
@@ -3674,7 +3725,7 @@ export function apply(ctx, config) {
         await send(chat.id, tr('Only a session topic can be renamed.', 'Переименовать можно только topic сессии.'), signal, threadId)
         return
       }
-      const name = text.trim().slice('/rename'.length).trim()
+      const name = parts.slice(1).join(' ').trim()
       if (name.length === 0) {
         await send(chat.id, tr('Usage: <code>/rename New topic name</code>', 'Использование: <code>/rename Новое имя топика</code>'), signal, threadId)
         return
@@ -4054,6 +4105,7 @@ export const __testing = {
   classifyError,
   isAllThread,
   isTelegramParseError,
+  normalizeCommand,
   routeMessage,
   splitAnswerText,
 }
