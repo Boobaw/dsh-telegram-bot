@@ -186,6 +186,16 @@ const topicFile = (threadId, delay = 100) => ({
   },
 })
 
+test('/restart in All never creates a session topic', async () => {
+  const result = await runScenario([all('/restart@boobawnebot')], 20, 500)
+  try {
+    const topics = result.calls.filter((call) => call.method === 'createForumTopic')
+    assert.equal(topics.length, 0)
+  } finally {
+    result.cleanup()
+  }
+})
+
 test('fork creates one new topic with the requested name', async () => {
   const result = await runScenario([all('hello'), topic(7001, '/fork branch', 400)], 20, 900)
   try {

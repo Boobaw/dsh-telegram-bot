@@ -255,7 +255,11 @@ function isAllThread(threadId) {
 
 /** Normalize a Telegram command token, dropping an optional @botname suffix. */
 function normalizeCommand(token) {
-  return String(token ?? '').toLowerCase().split('@')[0]
+  return String(token ?? '')
+    .replace(/[\u200B-\u200D\uFEFF]/gu, '')
+    .trim()
+    .toLowerCase()
+    .split('@')[0]
 }
 
 /**
@@ -581,7 +585,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'bucket-10-200',
+  codeRevision: 'forum-check',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -2524,6 +2528,7 @@ export function apply(ctx, config) {
     const clean = title.trim()
     if (record !== undefined && record.title === clean) return
     try {
+      await publishStatus({ lastTopicRename: { threadId: chat.threadId, name: shortLabel(clean, 120), source: 'title' } })
       await call('editForumTopic', {
         chat_id: chat.chatId,
         message_thread_id: chat.threadId,
@@ -2988,6 +2993,7 @@ export function apply(ctx, config) {
    * @returns thread id, or undefined.
    */
   async function createTopic(chatId, name, signal) {
+    await publishStatus({ lastCreateTopicCall: { chatId, name } })
     const clean = shortLabel(name, 120) || 'DSH session'
     for (const candidate of [clean, `${clean} · ${randomUUID().slice(0, 4)}`]) {
       try {
@@ -3498,6 +3504,12 @@ export function apply(ctx, config) {
    * @param signal - request lifetime.
    */
   async function createNewSessionTopic(chatId, controlThreadId, signal, cwd, initialText = '') {
+    await publishStatus({ lastCreateTopic: { initialText: initialText.slice(0, 160), controlThreadId } })
+    // A command must never be forwarded into a new session as a prompt.
+    if (initialText.trim().startsWith('/')) {
+      await send(chatId, tr('Unknown command. /help lists commands.', 'Неизвестная команда. /help — список.'), signal, controlThreadId)
+      return
+    }
     let threadId
     try {
       threadId = await createTopic(chatId, 'New session', signal)
@@ -3625,6 +3637,12 @@ export function apply(ctx, config) {
     }
     const parts = text.trim().split(/\s+/u)
     const command = normalizeCommand(parts[0])
+    await publishStatus({
+      lastCommand: command,
+      lastMessageText: text.slice(0, 160),
+      lastInSession: inSession,
+      lastThreadId: threadId ?? null,
+    })
 
     if (text.startsWith('🤖 Model:')) {
       if (!inSession) await send(chat.id, tr('Open a session first: /sessions.', 'Сначала открой сессию: /sessions.'), signal, threadId)
@@ -3803,6 +3821,7 @@ export function apply(ctx, config) {
         return
       }
       try {
+        await publishStatus({ lastTopicRename: { threadId, name, source: 'rename' } })
         await call('editForumTopic', {
           chat_id: chat.id,
           message_thread_id: threadId,
@@ -3921,6 +3940,39 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Warn when BotFather forum settings would make Telegram create topics for
+   * ordinary messages in All.
+   * @param bot - getMe result.
+   * @param signal - runtime lifetime.
+   */
+  async function checkForumConfiguration(bot, signal) {
+    const topicsEnabled = bot?.has_topics_enabled
+    const usersCanCreate = bot?.allows_users_to_create_topics
+    await publishStatus({
+      threadedMode: typeof topicsEnabled === 'boolean' ? topicsEnabled : null,
+      usersCanCreateTopics: typeof usersCanCreate === 'boolean' ? usersCanCreate : null,
+    })
+    if (topicsEnabled === false) {
+      await notifyAll(
+        `⚠️ <b>${tr('Threaded mode is disabled', 'Threaded mode выключен')}</b>\n` +
+          tr('Enable it in @BotFather → Bot Settings → Threaded mode.', 'Включи его в @BotFather → Bot Settings → Threaded mode.'),
+        signal,
+      )
+      return
+    }
+    if (usersCanCreate === true) {
+      await notifyAll(
+        `⚠️ <b>${tr('Users can create new topics', 'Пользователи могут создавать новые топики')}</b>\n` +
+          tr(
+            'Every message in All creates a new topic. In @BotFather → Bot Settings → Threaded mode, enable “Disallow users to create new threads”.',
+            'Каждое сообщение в All создаёт новый топик. В @BotFather → Bot Settings → Threaded mode включи «Disallow users to create new threads».',
+          ),
+        signal,
+      )
+    }
+  }
+
+  /**
    * Poll getUpdates until the runtime is stopped.
    * @param tokenLifetime - this runtime's lifetime.
    * @returns resolves when polling stops.
@@ -3948,6 +4000,7 @@ export function apply(ctx, config) {
         // Menu publication and the startup notice must never delay getUpdates.
         // Either request can be rate-limited or time out independently.
         void publishCommands(tokenLifetime.signal)
+        void checkForumConfiguration(me, tokenLifetime.signal)
         void notifyAll(
           `🟢 <b>${tr('Telegram bot enabled', 'Telegram-бот включён')}</b>\n` +
             `@${escapeHtml(me.username ?? String(me.id))}\n` +

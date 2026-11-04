@@ -8,7 +8,7 @@ Telegram client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-h
 
 First setup: https://youtu.be/QEeVucfBsWk
 
-Installation, bot token,  the allowlist, `/start`, `/sessions` and a test prompt.
+Installation, bot token, the allowlist, `/start`, `/sessions` and a test prompt.
 
 ### Enable Threaded mode
 
@@ -18,7 +18,7 @@ Installation, bot token,  the allowlist, `/start`, `/sessions` and a test prompt
   </a>
 </p>
 
-BotFather: **Bot Settings → Threaded mode → Enable**.
+BotFather: **Bot Settings → Threaded mode → Enable**. Then enable **Disallow users to create new threads**, so Telegram does not create a topic for every message sent in All.
 
 ## Features
 
@@ -41,7 +41,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**.
 
 - DSH `0.2.1-rc.2` or newer, Node.js 22+.
 - A Telegram bot token from [@BotFather](https://t.me/BotFather).
-- **Threaded mode** enabled in BotFather and **Topics** enabled in the bot chat.
+- **Threaded mode** enabled in BotFather, **Topics** enabled in the bot chat, and **Disallow users to create new threads** enabled.
 
 ## Install
 
@@ -79,7 +79,7 @@ The token field only reports whether a token is configured. A token supplied thr
 ## First run
 
 1. Create a bot with @BotFather and save its token in **Settings → Telegram**.
-2. In @BotFather open **Bot Settings → Threaded mode** and enable it.
+2. In @BotFather open **Bot Settings → Threaded mode**, enable it, and enable **Disallow users to create new threads**.
 3. Open the bot chat, tap the bot name and enable **Topics**.
 4. Send `/start` in **All**. With an empty allowlist the bot replies with your user and chat ids.
 5. Add your user id to **Allowed users** and press **Save**.
@@ -87,6 +87,23 @@ The token field only reports whether a token is configured. A token supplied thr
 7. Send a test message in the new topic.
 
 An ordinary message in **All** creates a new session topic in the default workspace. Commands such as `/sessions`, `/fork` and `/last` still work in All.
+
+If users are allowed to create threads, Telegram creates a topic before the bot receives the message; the bot then warns about the BotFather setting on startup.
+
+## Troubleshooting topics
+
+If every message in **All** creates a new topic, enable this BotFather option:
+
+**Bot Settings → Threaded mode → Disallow users to create new threads**
+
+The bot checks `has_topics_enabled` and `allows_users_to_create_topics` on startup, writes them to `~/.dsh/telegram/status.json`, and posts a warning in the control chat when either setting is wrong.
+
+A correct configuration contains:
+
+```json
+"threadedMode": true,
+"usersCanCreateTopics": false
+```
 
 ## Plugins page
 

@@ -66,3 +66,9 @@ test('long fenced code stays balanced across answer messages', () => {
     assert.equal(fences.length % 2, 0, chunk.slice(0, 80))
   }
 })
+
+
+test('invisible characters do not turn commands into prompts', () => {
+  assert.equal(normalizeCommand('/restart\u200b'), '/restart')
+  assert.equal(normalizeCommand('/last\ufeff@boobawnebot'), '/last')
+})
