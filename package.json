@@ -60,6 +60,6 @@
     "url": "https://github.com/Boobaw/dsh-telegram-bot/issues"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "NODE_ENV=test node --test"
   }
 }

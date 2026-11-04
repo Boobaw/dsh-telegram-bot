@@ -215,11 +215,18 @@ test('a provider title event renames the existing topic', async () => {
   }
 })
 
-test('stop settles a running Telegram turn without a crash', async () => {
-  const result = await runScenario([all('slow task'), topic(7001, '/stop', 120)], 1000, 350)
+test('stop settles a running Telegram turn without duplicates', async () => {
+  const result = await runScenario([
+    all('slow task'),
+    topic(7001, '/stop', 120),
+    topic(7001, '/stop', 160),
+  ], 1000, 500)
   try {
     assert.equal(result.logs.some((line) => line.includes('warn is not defined')), false)
-    assert.equal(result.calls.length > 0, true)
+    const stopped = result.calls.filter((call) =>
+      call.method === 'sendMessage' && typeof call.body?.text === 'string' && call.body.text.includes('Stopped.'),
+    )
+    assert.equal(stopped.length, 1)
   } finally {
     result.cleanup()
   }

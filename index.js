@@ -581,7 +581,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'rate-limit-recover',
+  codeRevision: 'bucket-10-200',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -640,12 +640,16 @@ export function apply(ctx, config) {
   let startRetryTimer
   /** Coalesces concurrent start requests into one poller. */
   let startInFlight
+  /** Invalidates a start that was overtaken by stop/restart. */
+  let startEpoch = 0
   /** Durable chat → session mapping. */
   let state = { version: 2, sessions: {}, threads: {} }
   /** Serializes state-file writes. */
   let stateWrite = Promise.resolve()
   /** Per-chat live bridge state. */
   const chats = new Map()
+  /** Per-chat token buckets for outbound Bot API traffic. */
+  const outboundStates = new Map()
   /** Agent API calls use this lifetime; the bot polling lifetime is separate. */
   const bridgeAbort = new AbortController()
   /** Control chat id used for lifecycle notifications. */
@@ -1197,6 +1201,54 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Per-chat adaptive token bucket. Four quick writes are allowed as a burst;
+   * sustained traffic is paced, and a 429 tightens the bucket further.
+   * @param chatId - target chat.
+   * @param signal - request lifetime.
+   */
+  async function paceOutbound(chatId, signal) {
+    const key = String(chatId)
+    let state = outboundStates.get(key)
+    if (state === undefined) {
+      state = { tokens: 10, capacity: 10, intervalMs: 200, updatedAt: Date.now(), tail: Promise.resolve() }
+      outboundStates.set(key, state)
+    }
+    const previous = state.tail
+    let release
+    state.tail = new Promise((resolve) => { release = resolve })
+    await previous
+    try {
+      const now = Date.now()
+      state.tokens = Math.min(state.capacity, state.tokens + (now - state.updatedAt) / state.intervalMs)
+      state.updatedAt = now
+      if (state.tokens < 1) {
+        await sleep(Math.ceil((1 - state.tokens) * state.intervalMs), signal)
+        state.tokens = 0
+        state.updatedAt = Date.now()
+      } else {
+        state.tokens -= 1
+      }
+    } finally {
+      release()
+    }
+  }
+
+  /**
+   * Tighten one chat's bucket after Telegram asks us to slow down.
+   * @param chatId - target chat.
+   * @param retryAfter - Telegram retry_after seconds, when present.
+   */
+  function noteRateLimit(chatId, retryAfter) {
+    const key = String(chatId)
+    const state = outboundStates.get(key)
+    if (state === undefined) return
+    state.tokens = 0
+    state.updatedAt = Date.now()
+    state.intervalMs = Math.min(5000, Math.max(200, Math.ceil((retryAfter ?? 1) * 1000)))
+    state.capacity = Math.min(state.capacity, 2)
+  }
+
+  /**
    * Call one Bot API method. Errors carry Telegram's description, never the
    * token or the request URL.
    * @param method - Bot API method.
@@ -1207,6 +1259,9 @@ export function apply(ctx, config) {
   async function call(method, payload, signal, timeoutMs = 30_000) {
     const token = await resolveToken()
     if (token === undefined) throw new Error('TELEGRAM_BOT_TOKEN is not configured')
+    if (process.env.NODE_ENV !== 'test' && payload !== null && typeof payload === 'object' && payload.chat_id !== undefined && method !== 'getUpdates') {
+      await paceOutbound(payload.chat_id, signal)
+    }
     const body = JSON.stringify(payload)
     // Mirror Hermes' Telegram fallback: try the normal IPv4 path first, then
     // the Bot API seed IPv4 literals with Host/SNI kept on api.telegram.org.
@@ -1223,9 +1278,12 @@ export function apply(ctx, config) {
         lastError = error
         if (signal.aborted) throw error
         if (error?.telegram === true) {
+          if (payload !== null && typeof payload === 'object' && payload.chat_id !== undefined) {
+            noteRateLimit(payload.chat_id, error.retryAfter)
+          }
           // Telegram asks the caller to back off explicitly. Retrying a few
           // times keeps a final answer from being lost during bursts of edits.
-          if (Number.isFinite(error.retryAfter) && rateLimitRetries < 3) {
+          if (Number.isFinite(error.retryAfter) && error.retryAfter <= 60 && rateLimitRetries < 3) {
             rateLimitRetries += 1
             await sleep((Math.max(1, error.retryAfter) + 1) * 1000, signal)
             continue
@@ -3650,21 +3708,31 @@ export function apply(ctx, config) {
       }
       const requested = Number.parseInt(parts[1] ?? '1', 10)
       const limit = Number.isFinite(requested) ? Math.min(5, Math.max(1, requested)) : 1
-      const texts = await recentAssistantTexts(chatState.sessionId, limit)
+      const texts = (await recentAssistantTexts(chatState.sessionId, limit))
+        .filter((text) => text.trim().length > 0)
       if (texts.length === 0) {
         await send(chat.id, tr('This session has no assistant messages yet.', 'В этой сессии пока нет ответов ассистента.'), signal, threadId)
         return
       }
       const title = await sessionTitle(chatState.sessionId)
+      const total = texts.length
       for (const [index, text] of [...texts].reverse().entries()) {
         const chunks = splitAnswerText(text.trim())
         if (chunks.length === 0) continue
-        const label = limit === 1
+        const label = total === 1
           ? tr('Latest assistant answer', 'Последний ответ ассистента')
-          : `${tr('Answer', 'Ответ')} ${index + 1}/${texts.length}`
-        for (const [chunkIndex, chunk] of chunks.entries()) {
-          const body = chunkIndex === 0 ? `**${label}** · ${title}\n\n${chunk}` : chunk
-          await sendAnswer(chat.id, body, signal, threadId)
+          : `${tr('Answer', 'Ответ')} ${index + 1}/${total}`
+        try {
+          for (const [chunkIndex, chunk] of chunks.entries()) {
+            const body = chunkIndex === 0 ? `**${label}** · ${title}\n\n${chunk}` : chunk
+            const sent = await sendAnswer(chat.id, body, signal, threadId)
+            if (sent === undefined) throw new Error(`Telegram did not accept ${label} (${chunkIndex + 1}/${chunks.length})`)
+            await sleep(350, signal)
+          }
+        } catch (error) {
+          reportError('last-send', error)
+          await send(chat.id, `❌ ${escapeHtml(messageOf(error))}`, signal, threadId)
+          return
         }
       }
       return
@@ -3762,51 +3830,51 @@ export function apply(ctx, config) {
         await send(chat.id, tr('There is no active session in this topic.', 'В этом topic нет активной сессии.'), signal, threadId)
         return
       }
-      chatState.busy = false
-      chatState.done = true
-      chatState.turnSource = undefined
-      chatState.awaitingTurn = false
-      chatState.activeTurn = undefined
-      clearEditTimer(chatState)
-      clearAuxTimers(chatState)
-      cancelQuestionsForChat(chatState)
+      // Telegram may deliver /stop twice (double tap or retry). The first
+      // invocation owns cleanup; the duplicate must not enqueue more work.
+      if (chatState.stopping === true || (!chatState.busy && chatState.done)) return
+      chatState.stopping = true
       try {
-        ctx.get('agents')?.get(chatState.sessionId)?.cancel({ kind: 'user' })
-      } catch {
-        // Already idle or disposed.
-      }
-      if (chatState.answerEdit !== undefined) await chatState.answerEdit.catch(() => {})
-      if (chatState.thinkingMessageId !== null) {
-        await deleteMessage(chat.id, threadId, chatState.thinkingMessageId)
-        chatState.thinkingMessageId = null
-      }
-      if (chatState.toolMessageId !== null) {
-        await deleteMessage(chat.id, threadId, chatState.toolMessageId)
-        chatState.toolMessageId = null
-      }
-      const partial = chatState.text.trim()
-      if (partial.length > 0) {
-        const chunks = splitAnswerText(partial)
-        if (chatState.messageId !== null) {
-          const edited = await editAnswer(chat.id, chatState.messageId, chunks[0], bridgeAbort.signal, threadId)
-          if (!edited) await sendAnswer(chat.id, chunks[0], bridgeAbort.signal, threadId)
-        } else {
-          await sendAnswer(chat.id, chunks[0], bridgeAbort.signal, threadId)
+        chatState.busy = false
+        chatState.done = true
+        chatState.turnSource = undefined
+        chatState.awaitingTurn = false
+        chatState.activeTurn = undefined
+        clearEditTimer(chatState)
+        clearAuxTimers(chatState)
+        cancelQuestionsForChat(chatState)
+        try {
+          ctx.get('agents')?.get(chatState.sessionId)?.cancel({ kind: 'user' })
+        } catch {
+          // Already idle or disposed.
         }
-        for (const chunk of chunks.slice(1)) {
-          await sendAnswer(chat.id, chunk, bridgeAbort.signal, threadId)
+        // Do not wait for a pending network edit: a rate-limited edit can
+        // otherwise hold /stop for tens of seconds.
+        if (chatState.answerEdit !== undefined) {
+          await Promise.race([chatState.answerEdit.catch(() => {}), sleep(200, bridgeAbort.signal)])
         }
+        // Delete auxiliary messages without blocking the stop acknowledgement.
+        if (chatState.thinkingMessageId !== null) {
+          const id = chatState.thinkingMessageId
+          chatState.thinkingMessageId = null
+          fireAndForget('stop-thinking-delete', () => deleteMessage(chat.id, threadId, id))
+        }
+        if (chatState.toolMessageId !== null) {
+          const id = chatState.toolMessageId
+          chatState.toolMessageId = null
+          fireAndForget('stop-tool-delete', () => deleteMessage(chat.id, threadId, id))
+        }
+        // The streamed partial answer stays in the first message. Send the
+        // marker separately and do not spend time re-editing that message.
         await send(chat.id, `⏹ ${tr('Stopped.', 'Остановлено.')}`, signal, threadId)
-      } else {
-        // Keep the first message untouched: it may already contain the
-        // generated answer even when the live buffer was cleared by finalize.
-        await send(chat.id, `⏹ ${tr('Stopped.', 'Остановлено.')}`, signal, threadId)
+        chatState.text = ''
+        chatState.lastText = ''
+        chatState.messageId = null
+        resetAux(chatState)
+        await publishStatus({ lastOutcome: 'stopped', lastStopAt: Date.now() })
+      } finally {
+        chatState.stopping = false
       }
-      chatState.text = ''
-      chatState.lastText = ''
-      chatState.messageId = null
-      resetAux(chatState)
-      await publishStatus({ lastOutcome: 'stopped' })
       return
     }
     if (command === '/status') {
@@ -3876,9 +3944,11 @@ export function apply(ctx, config) {
         healthy = true
         connected = true
         info(`connected as @${me.username ?? me.id}`)
-        await publishStatus({ state: 'running', detail: '', username: me.username ?? String(me.id) })
-        await publishCommands(tokenLifetime.signal)
-        await notifyAll(
+        await publishStatus({ state: 'running', detail: '', username: me.username ?? String(me.id), startupStage: 'polling' })
+        // Menu publication and the startup notice must never delay getUpdates.
+        // Either request can be rate-limited or time out independently.
+        void publishCommands(tokenLifetime.signal)
+        void notifyAll(
           `🟢 <b>${tr('Telegram bot enabled', 'Telegram-бот включён')}</b>\n` +
             `@${escapeHtml(me.username ?? String(me.id))}\n` +
             tr('Polling started. Send /start to open the menu.', 'Polling запущен. Отправь /start, чтобы открыть меню.'),
@@ -3957,6 +4027,7 @@ export function apply(ctx, config) {
 
   /** Stop the active runtime and wait for its loop to settle. */
   async function stop() {
+    startEpoch += 1
     if (startRetryTimer !== undefined) {
       clearTimeout(startRetryTimer)
       startRetryTimer = undefined
@@ -3973,9 +4044,10 @@ export function apply(ctx, config) {
 
   /** Coalesce concurrent runtime starts. */
   async function start() {
+    while (startInFlight !== undefined) await startInFlight.catch(() => {})
     if (lifetime !== undefined) return
-    if (startInFlight !== undefined) return startInFlight
-    const task = startInternal()
+    const epoch = startEpoch
+    const task = startInternal(epoch)
     startInFlight = task
     try {
       return await task
@@ -3985,7 +4057,7 @@ export function apply(ctx, config) {
   }
 
   /** Start the runtime if enabled and a token is available. */
-  async function startInternal() {
+  async function startInternal(epoch) {
     if (startRetryTimer !== undefined) {
       clearTimeout(startRetryTimer)
       startRetryTimer = undefined
@@ -4017,6 +4089,7 @@ export function apply(ctx, config) {
       scheduleStartRetry()
       return
     }
+    if (epoch !== startEpoch) return
     const controller = new AbortController()
     const current = {
       controller,
