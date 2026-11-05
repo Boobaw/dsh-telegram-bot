@@ -585,7 +585,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'forum-check',
+  codeRevision: 'bucket-50',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,
@@ -1214,7 +1214,7 @@ export function apply(ctx, config) {
     const key = String(chatId)
     let state = outboundStates.get(key)
     if (state === undefined) {
-      state = { tokens: 10, capacity: 10, intervalMs: 200, updatedAt: Date.now(), tail: Promise.resolve() }
+      state = { tokens: 10, capacity: 10, intervalMs: 50, updatedAt: Date.now(), tail: Promise.resolve() }
       outboundStates.set(key, state)
     }
     const previous = state.tail
@@ -1248,7 +1248,7 @@ export function apply(ctx, config) {
     if (state === undefined) return
     state.tokens = 0
     state.updatedAt = Date.now()
-    state.intervalMs = Math.min(5000, Math.max(200, Math.ceil((retryAfter ?? 1) * 1000)))
+    state.intervalMs = Math.min(5000, Math.max(50, Math.ceil((retryAfter ?? 1) * 1000)))
     state.capacity = Math.min(state.capacity, 2)
   }
 
@@ -3503,7 +3503,7 @@ export function apply(ctx, config) {
    * @param controlThreadId - thread that requested creation.
    * @param signal - request lifetime.
    */
-  async function createNewSessionTopic(chatId, controlThreadId, signal, cwd, initialText = '') {
+  async function createNewSessionTopic(chatId, controlThreadId, signal, cwd, initialText = '', initialAttachments = []) {
     await publishStatus({ lastCreateTopic: { initialText: initialText.slice(0, 160), controlThreadId } })
     // A command must never be forwarded into a new session as a prompt.
     if (initialText.trim().startsWith('/')) {
@@ -3533,7 +3533,7 @@ export function apply(ctx, config) {
         signal,
       )
       await sendMenu(chatId, threadId, chatState, signal)
-      if (initialText.trim().length > 0) await runAgent(chatState, initialText, signal)
+      if (initialText.trim().length > 0 || initialAttachments.length > 0) await runAgent(chatState, initialText, signal, initialAttachments)
     } catch (error) {
       await send(chatId, `❌ ${escapeHtml(messageOf(error))}`, signal, controlThreadId)
     }
@@ -3546,11 +3546,11 @@ export function apply(ctx, config) {
    * @param initialText - first prompt, if any.
    * @param signal - request lifetime.
    */
-  async function createSessionInCurrentTopic(chatState, cwd, initialText, signal) {
+  async function createSessionInCurrentTopic(chatState, cwd, initialText, signal, initialAttachments = []) {
     if (typeof cwd === 'string' && cwd.length > 0) chatState.cwd = cwd
     await ensureAgent(chatState)
     await sendMenu(chatState.chatId, chatState.threadId, chatState, signal)
-    if (initialText.trim().length > 0) await runAgent(chatState, initialText, signal)
+    if (initialText.trim().length > 0 || initialAttachments.length > 0) await runAgent(chatState, initialText, signal, initialAttachments)
   }
 
   /**
@@ -3619,8 +3619,8 @@ export function apply(ctx, config) {
     if (await consumeQuestionReply(chatState, text ?? '', signal)) return
     const inSession = typeof chatState.sessionId === 'string'
     if (hasAttachment) {
-      // All is a first-class chat: a file there starts a session in All
-      // instead of opening or creating a separate topic.
+      // A file in All follows the same path as text: create one session topic.
+      // A file in an existing sessionless topic is adopted in place.
       if (!inSession && !isAllThread(threadId)) {
         await send(chat.id, tr('Open a session first: /sessions.', 'Сначала открой сессию: /sessions.'), signal, threadId)
         return
@@ -3629,7 +3629,13 @@ export function apply(ctx, config) {
         const attachment = await saveTelegramAttachment(message, signal)
         const caption = typeof message.caption === 'string' ? message.caption.trim() : ''
         const prompt = caption.length > 0 ? caption : tr('Analyze the attached file.', 'Проанализируй приложенный файл.')
-        await runAgent(chatState, prompt, signal, [attachment.block])
+        if (isAllThread(threadId)) {
+          await createNewSessionTopic(chat.id, threadId, signal, defaultWorkspaceCwd(), prompt, [attachment.block])
+        } else if (!inSession) {
+          await createSessionInCurrentTopic(chatState, defaultWorkspaceCwd(), prompt, signal, [attachment.block])
+        } else {
+          await runAgent(chatState, prompt, signal, [attachment.block])
+        }
       } catch (error) {
         await send(chat.id, `❌ ${escapeHtml(messageOf(error))}`, signal, threadId)
       }
@@ -3745,7 +3751,6 @@ export function apply(ctx, config) {
             const body = chunkIndex === 0 ? `**${label}** · ${title}\n\n${chunk}` : chunk
             const sent = await sendAnswer(chat.id, body, signal, threadId)
             if (sent === undefined) throw new Error(`Telegram did not accept ${label} (${chunkIndex + 1}/${chunks.length})`)
-            await sleep(350, signal)
           }
         } catch (error) {
           reportError('last-send', error)
@@ -3867,11 +3872,8 @@ export function apply(ctx, config) {
         } catch {
           // Already idle or disposed.
         }
-        // Do not wait for a pending network edit: a rate-limited edit can
-        // otherwise hold /stop for tens of seconds.
-        if (chatState.answerEdit !== undefined) {
-          await Promise.race([chatState.answerEdit.catch(() => {}), sleep(200, bridgeAbort.signal)])
-        }
+        // Do not wait for a pending network edit; the outbound bucket keeps
+        // the stop marker ordered after any in-flight edit.
         // Delete auxiliary messages without blocking the stop acknowledgement.
         if (chatState.thinkingMessageId !== null) {
           const id = chatState.thinkingMessageId

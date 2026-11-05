@@ -245,6 +245,7 @@ test('stop settles a running Telegram turn without duplicates', async () => {
 test('a document in All reaches the agent as a file attachment', async () => {
   const result = await runScenario([topicFile(1, 0)], 20, 500)
   try {
+    assert.equal(result.calls.filter((call) => call.method === 'createForumTopic').length, 1)
     assert.equal(result.agent.received.length, 1)
     const content = result.agent.received[0].content
     assert.equal(content.some((part) => part.type === 'file'), true)
