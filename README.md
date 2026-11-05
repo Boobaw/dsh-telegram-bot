@@ -25,13 +25,13 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Then enable **Disallow
 - One Telegram topic per DSH session; Web and Telegram use the same session.
 - Telegram mirrors only turns initiated from Telegram; turns started in the Web UI stay in Web.
 - `/sessions` lists workspaces and existing sessions, and can create a new session in a selected workspace.
-- Assistant answers stream into the topic with Telegram Markdown formatting.
+- Assistant answers stream into the topic with Telegram Markdown formatting. Messages sent while the agent is working are queued and processed after the current turn; `/clear` removes that queue without stopping the current answer.
 - Reasoning and tool calls are shown as temporary messages and removed after the answer. Each tool-call entry is capped at two lines.
 - Inline controls for model, reasoning effort, permission mode and context usage.
 - Tool approvals with **Deny** / **Allow** buttons.
 - `ask_user_question` support: options, multi-select, custom answers and plan review.
 - Documents and photos sent in a session topic are saved as DSH attachments and passed to the agent.
-- `/last`, `/rename`, `/fork`, `/stop`, `/restart`, `/status` and `/menu`.
+- `/last`, `/rename`, `/fork`, `/clear`, `/stop`, `/restart`, `/status` and `/menu`.
 - `/fork [name]` creates a DSH session fork in a new Telegram topic; without a name it uses the previous title plus the branch number.
 - The session picker also has **🔀 Continue in Telegram fork**; automatic fork topics end with `(N)`.
 - English and Russian bot messages.
@@ -174,7 +174,7 @@ node --check client.js
 npm test
 ```
 
-`index.js` is the Host half: Telegram polling, topic routing and the session bridge. `client.js` registers the Settings page and the Plugins-page note. The plugin adds no model-facing tools or system-prompt text; it connects Telegram to the existing DSH agent.
+`src/app.js` is the Host runtime: Telegram polling, topic routing and the session bridge. `src/update-ledger.js` persists Telegram update cursors, `src/admission.js` uses the native DSH session queue. `src/formatting.js`, `src/state.js`, `src/status.js`, `src/utils.js`, `src/errors.js`, `src/config.js` and `src/constants.js` hold the supporting layers. Root `index.js` is only the public entry point. `client.js` registers the Settings page and the Plugins-page note. The plugin adds no model-facing tools or system-prompt text; it connects Telegram to the existing DSH agent.
 
 ## License
 

@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import https from 'node:https'
+import { STATUS_DIR } from '../src/constants.js'
 
 /**
  * One fake DSH agent that settles a Telegram turn without model streaming.
@@ -72,6 +73,8 @@ function makeContext(agent) {
 test('All message creates one topic, then the same topic continues', async () => {
   const home = await mkdtemp(join(tmpdir(), 'dsh-telegram-test-'))
   process.env.DSH_HOME = home
+  await mkdir(STATUS_DIR, { recursive: true })
+  await writeFile(join(STATUS_DIR, 'state.json'), JSON.stringify({ version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0 }))
   const agent = makeAgent('session-one', '/tmp/default-workspace')
   const { ctx, cleanup, logs } = makeContext(agent)
   const calls = []

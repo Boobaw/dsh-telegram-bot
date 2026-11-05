@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import https from 'node:https'
+import { STATUS_DIR } from '../src/constants.js'
 
 function makeAgent(id, cwd, idleMs) {
   const events = new EventEmitter()
@@ -136,6 +137,8 @@ function makeTelegram(updates) {
 async function runScenario(updates, idleMs = 20, waitMs = 400, afterReady) {
   const home = await mkdtemp(join(tmpdir(), 'dsh-telegram-command-'))
   process.env.DSH_HOME = home
+  await mkdir(STATUS_DIR, { recursive: true })
+  await writeFile(join(STATUS_DIR, 'state.json'), JSON.stringify({ version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0 }))
   const agent = makeAgent('session-one', '/tmp/default-workspace', idleMs)
   const context = makeContext(agent)
   const telegram = makeTelegram(updates)
@@ -191,6 +194,15 @@ test('/restart in All never creates a session topic', async () => {
   try {
     const topics = result.calls.filter((call) => call.method === 'createForumTopic')
     assert.equal(topics.length, 0)
+  } finally {
+    result.cleanup()
+  }
+})
+
+test('/clear in All does not create a session topic', async () => {
+  const result = await runScenario([all('/clear')], 20, 300)
+  try {
+    assert.equal(result.calls.filter((call) => call.method === 'createForumTopic').length, 0)
   } finally {
     result.cleanup()
   }

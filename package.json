@@ -19,7 +19,8 @@
     "icon.svg",
     "README.md",
     "CREDITS.md",
-    "docs"
+    "docs",
+    "src"
   ],
   "dsh": {
     "bundle": {
@@ -60,6 +61,6 @@
     "url": "https://github.com/Boobaw/dsh-telegram-bot/issues"
   },
   "scripts": {
-    "test": "NODE_ENV=test node --test"
+    "test": "NODE_ENV=test node --test --test-concurrency=1"
   }
 }
