@@ -3,17 +3,16 @@
   "version": "0.2.0",
   "description": "Telegram sessions, topics, model controls and approvals for DeepSeek Harness.",
   "type": "module",
-  "main": "index.js",
+  "main": "./src/index.js",
   "exports": {
     ".": "./index.js",
-    "./client": "./client.js",
+    "./client": "./src/client.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    ".\"": "./src/index.js"
   },
   "files": [
-    "index.js",
-    "client.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",

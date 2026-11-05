@@ -133,7 +133,7 @@ test('All message creates one topic, then the same topic continues', async () =>
     return request
   }
   try {
-    const { apply } = await import('../index.js')
+    const { apply } = await import('../src/index.js')
     apply(ctx, {
       enabled: true,
       tokenRef: 'TEST_TOKEN',

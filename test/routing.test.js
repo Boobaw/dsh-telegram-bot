@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { __testing } from '../index.js'
+import { __testing } from '../src/index.js'
 
 const { classifyError, isAllThread, isTelegramParseError, normalizeCommand, routeMessage, splitAnswerText } = __testing
 

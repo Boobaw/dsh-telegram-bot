@@ -145,7 +145,7 @@ async function runScenario(updates, idleMs = 20, waitMs = 400, afterReady) {
   const originalRequest = https.request
   https.request = telegram.fake
   try {
-    const { apply } = await import('../index.js')
+    const { apply } = await import('../src/index.js')
     apply(context.ctx, {
       enabled: true,
       tokenRef: 'TEST_TOKEN',
