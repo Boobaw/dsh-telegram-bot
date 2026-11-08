@@ -2,6 +2,8 @@
 
 [![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/boobaw/dsh-telegram-bot)
 
+> This is a maintained fork of [Boobaw/dsh-telegram-bot](https://github.com/Boobaw/dsh-telegram-bot) with `/new`, user-created topics with a workspace picker, two-way sync and sending into topics by name. See [MAINTAINING.md](MAINTAINING.md) for what differs and how upstream changes are merged in.
+
 Telegram client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). It connects a DSH profile to a Telegram bot and keeps the same DSH sessions available in both interfaces.
 
 ## Demo
@@ -61,6 +63,8 @@ From npm:
 ```bash
 npx @deepseek-ai/dsh plugin --profile web add dsh-telegram-bot@latest
 ```
+
+The npm package is the upstream release without this fork's features; install the fork from a clone of this repository.
 
 Restart `dsh web` after installing or updating the plugin. Then open **Settings → Telegram**.
 
