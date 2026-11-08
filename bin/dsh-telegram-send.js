@@ -78,7 +78,7 @@ const sessionId = sessionIdOf(values['from-session'] ?? process.env.DSH_SESSION_
 if (sessionId !== undefined) from.sessionId = sessionId
 
 const id = await enqueue({
-  topic: values.topic,
+  to: values.topic,
   text,
   files,
   ...(Object.keys(from).length === 0 ? {} : { from }),

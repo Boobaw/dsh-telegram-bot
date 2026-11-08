@@ -138,10 +138,17 @@ The command writes the request into `$DSH_HOME/telegram/outbox/` and waits up to
 From another Host plugin:
 
 ```js
-const result = await ctx.get('telegramTopics').send('notify', 'Backup **finished**', ['/tmp/report.pdf'], { from: { job: 'backup', sessionId: 'session-…' } })
+const result = await ctx.get('telegramTopics').send({
+  to: 'notify',                 // topic name (any case) or thread id
+  text: 'Backup **finished**',
+  files: ['/tmp/report.pdf'],   // absolute paths, optional
+  from: { job: 'backup', sessionId: 'session-…' }, // optional; `label` for other senders
+})
 // { chatId, threadId, topic, sessionId, recorded, messageIds }, plus note or recordError when it was not recorded
 ctx.get('telegramTopics').topics() // [{ threadId, name, sessionId }]
 ```
+
+`send` rejects when the message was not sent. Errors that a retry cannot fix (an unknown topic, a missing or oversized file, nothing to send, or a failure after part of a long message already went out) carry `retryable: false`; others, such as the bot not running yet, are worth trying again. This is the shape [dsh-cron-jobs](https://github.com/soffits/dsh-cron-jobs) expects from a delivery channel, so `deliver: { via: telegramTopics, to: notify }` sends scheduled job results into the topic, with the job and its session named as the sender.
 
 From an agent: the `telegram_send` tool takes `topic`, `text` and `files` (absolute paths). The calling session is named as the sender and does not get a copy of its own message.
 

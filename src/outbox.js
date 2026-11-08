@@ -19,7 +19,7 @@ const RESULT_TTL_MS = 24 * 60 * 60 * 1000
 
 /**
  * Write one send request atomically.
- * @param request - `{ topic, text, files, from }`.
+ * @param request - `{ to, text, files, from }`, as for the `telegramTopics` service's `send`.
  * @param dir - spool directory.
  * @returns the request id.
  */

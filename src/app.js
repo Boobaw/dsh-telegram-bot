@@ -2658,12 +2658,27 @@ export function apply(ctx, config) {
   }
 
   /**
+   * An error a retry will not fix: callers such as scheduled-job delivery
+   * read `retryable: false` and stop trying.
+   * @param error - the error, or its message.
+   * @returns the error, marked.
+   */
+  function finalError(error) {
+    const marked = error instanceof Error ? error : new Error(String(error))
+    marked.retryable = false
+    return marked
+  }
+
+  /**
    * Send text and files into a topic, addressed by name or thread id, and
    * record them in the session bound to that topic without starting a turn.
    * The Host service, the agent tool and the file spool all use this.
-   * @param request - `{ topic, text, files, from }`; `from` may hold `label`
-   *   (who sent it), `job` (a job name) and `sessionId` (the sender session;
-   *   when it is the bound session itself, no copy is recorded).
+   * Errors a retry cannot fix (an unknown topic, a bad file, a send that
+   * already reached Telegram in part) carry `retryable: false`.
+   * @param request - `{ to, text, files, from }`; `to` is a topic name or
+   *   thread id; `from` may hold `label` (who sent it), `job` (a job name)
+   *   and `sessionId` (the sender session; when it is the bound session
+   *   itself, no copy is recorded).
    * @param signal - request lifetime.
    * @returns where it went and whether the session recorded it.
    */
@@ -2673,16 +2688,26 @@ export function apply(ctx, config) {
     if (topics.chatId === 0) throw new Error('The bot has no chat yet. Send /start to the bot first.')
     const text = typeof request?.text === 'string' ? request.text : ''
     const paths = Array.isArray(request?.files) ? request.files.map(String) : []
-    if (text.trim().length === 0 && paths.length === 0) throw new Error('Nothing to send: give text or files.')
+    if (text.trim().length === 0 && paths.length === 0) throw finalError('Nothing to send: give text or files.')
     const chatId = topics.chatId
-    const target = resolveTopicTarget(state.topicNames, chatId, request?.topic)
+    let target
+    try {
+      target = resolveTopicTarget(state.topicNames, chatId, request?.to)
+    } catch (error) {
+      throw finalError(error)
+    }
     const threadId = target.threadId
     // Read every file first, so a bad path fails before anything is sent.
     const files = []
     for (const path of paths) {
-      if (!isAbsolute(path)) throw new Error(`File paths must be absolute: ${path}`)
-      const data = await readFile(path)
-      if (data.length > 50 * 1024 * 1024) throw new Error(`${path} is larger than the 50 MB bot upload limit.`)
+      if (!isAbsolute(path)) throw finalError(`File paths must be absolute: ${path}`)
+      let data
+      try {
+        data = await readFile(path)
+      } catch (error) {
+        throw finalError(error)
+      }
+      if (data.length > 50 * 1024 * 1024) throw finalError(`${path} is larger than the 50 MB bot upload limit.`)
       files.push({ path, name: basename(path), data })
     }
     const messageIds = []
@@ -2702,9 +2727,10 @@ export function apply(ctx, config) {
       if (/thread not found|topic.*not found/iu.test(messageOf(error))) {
         delete state.topicNames[`${chatId}:${threadId}`]
         await persistState()
-        throw new Error(`Telegram topic ${target.name === undefined ? threadId : `"${target.name}"`} no longer exists.`)
+        throw finalError(`Telegram topic ${target.name === undefined ? threadId : `"${target.name}"`} no longer exists.`)
       }
-      throw error
+      // Part of it is in Telegram already; sending again would repeat that part.
+      throw messageIds.length > 0 ? finalError(`${messageOf(error)} (after ${messageIds.length} message(s) were sent)`) : error
     }
     const sessionId = state.threads[`${chatId}:${threadId}`]
     const sender = senderOf(request?.from)
@@ -4496,12 +4522,11 @@ export function apply(ctx, config) {
   /** Topic sending for other plugins: `ctx.get('telegramTopics').send(...)`. */
   const topicService = {
     /**
-     * @param topic - topic name (any case) or numeric thread id.
-     * @param text - Markdown text.
-     * @param files - absolute file paths.
-     * @param options - `{ from: { label, sessionId, job } }`.
+     * @param request - `{ to, text, files, from }`: `to` is a topic name (any
+     *   case) or thread id, `text` Markdown, `files` absolute paths, `from`
+     *   `{ job, sessionId, label }` naming the sender.
      */
-    send: (topic, text, files = [], options = {}) => sendToTopic({ topic, text, files, from: options.from }),
+    send: ({ to, text, files = [], from } = {}) => sendToTopic({ to, text, files, from }),
     /** @returns known topic names and thread ids in the bot's chat. */
     topics: () => Object.entries(state.topicNames ?? {})
       .filter(([key]) => key.startsWith(`${topics.chatId}:`))
@@ -4530,7 +4555,7 @@ export function apply(ctx, config) {
       if (typeof args?.topic !== 'string' && typeof args?.topic !== 'number') throw new Error('topic is required')
       const sessionId = exec?.agent?.id ?? exec?.agent?.session?.id
       return sendToTopic({
-        topic: args.topic,
+        to: args.topic,
         text: typeof args.text === 'string' ? args.text : '',
         files: Array.isArray(args.files) ? args.files : [],
         from: typeof sessionId === 'string' ? { label: `session ${sessionId}`, sessionId } : undefined,

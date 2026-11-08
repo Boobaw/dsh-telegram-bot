@@ -492,7 +492,7 @@ test('the Host service posts into a named topic and records it in the bound sess
     const agent = run.host.makeAgent('session-notify', '/tmp/default-workspace')
     const file = join(STATUS_DIR, 'report.txt')
     await writeFile(file, 'report body')
-    const result = await run.host.provided.telegramTopics.send('notify', 'Backup **done**', [file], { from: { label: 'backup job' } })
+    const result = await run.host.provided.telegramTopics.send({ to: 'notify', text: 'Backup **done**', files: [file], from: { label: 'backup job' } })
     assert.equal(result.threadId, 7100)
     assert.equal(result.recorded, true)
     assert.ok(sent(run.telegram.calls, 7100).some((call) => call.body.text.includes('Backup')))
@@ -503,7 +503,22 @@ test('the Host service posts into a named topic and records it in the bound sess
     assert.match(content[0].text, /^\[Sent to the Telegram topic "Notify" by backup job\]\nBackup \*\*done\*\*/)
     assert.equal(content[1].type, 'file')
     assert.match(agent.injected[0].source.rpcId, /^telegram-post:/)
-    await assert.rejects(run.host.provided.telegramTopics.send('nope', 'x'), /Unknown Telegram topic "nope"/)
+    await assert.rejects(run.host.provided.telegramTopics.send({ to: 'nope', text: 'x' }), (error) => /Unknown Telegram topic "nope"/.test(error.message) && error.retryable === false)
+    await assert.rejects(run.host.provided.telegramTopics.send({ to: 'notify', text: 'x', files: [join(STATUS_DIR, 'missing.txt')] }), (error) => error.retryable === false)
+    await assert.rejects(run.host.provided.telegramTopics.send({ to: 'notify', text: ' ' }), (error) => /Nothing to send/.test(error.message) && error.retryable === false)
+  } finally {
+    run.stop()
+  }
+})
+
+test('send({ to, text, files, from }) takes a thread id and names the job and its session as the sender', async () => {
+  const run = await start({}, notifyState)
+  try {
+    const agent = run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    const result = await run.host.provided.telegramTopics.send({ to: '7100', text: 'Nothing new today', files: [], from: { job: 'Check-in', sessionId: 'session-job' } })
+    assert.equal(result.threadId, 7100)
+    assert.equal(result.recorded, true)
+    assert.match(agent.injected[0].content[0].text, /^\[Sent to the Telegram topic "Notify" by job "Check-in" from session session-job\]\nNothing new today$/u)
   } finally {
     run.stop()
   }
@@ -515,10 +530,10 @@ test('a renamed topic is found by its new name and keeps its target after /new',
     run.host.makeAgent('session-notify', '/tmp/default-workspace')
     run.telegram.push({ message_thread_id: 7100, forum_topic_edited: { name: 'Alerts' } })
     await wait(100)
-    await assert.rejects(run.host.provided.telegramTopics.send('notify', 'x'), /Unknown Telegram topic/)
+    await assert.rejects(run.host.provided.telegramTopics.send({ to: 'notify', text: 'x' }), /Unknown Telegram topic/)
     run.telegram.push({ message_thread_id: 7100, text: '/new' })
     await wait(200)
-    const result = await run.host.provided.telegramTopics.send('ALERTS', 'after new')
+    const result = await run.host.provided.telegramTopics.send({ to: 'ALERTS', text: 'after new' })
     assert.equal(result.threadId, 7100)
     assert.equal(result.sessionId, 'session-1')
     assert.equal(run.host.live.get('session-1').injected.length, 1)
@@ -537,11 +552,11 @@ test('the agent tool and the file spool use the same path', async () => {
     assert.equal(own.recorded, false, 'the sending session gets no copy of its own message')
     const other = await tool.execute({ topic: 'Notify', text: 'from elsewhere' }, { agent: { id: 'session-other' } })
     assert.equal(other.recorded, true)
-    const id = await enqueue({ topic: 'notify', text: 'from cron', from: { label: 'cron' } })
+    const id = await enqueue({ to: 'notify', text: 'from cron', from: { label: 'cron' } })
     const result = await waitForResult(id, 3000)
     assert.equal(result?.ok, true, JSON.stringify(result))
     assert.equal(result.result.threadId, 7100)
-    const bad = await waitForResult(await enqueue({ topic: 'missing', text: 'x' }), 3000)
+    const bad = await waitForResult(await enqueue({ to: 'missing', text: 'x' }), 3000)
     assert.equal(bad.ok, false)
     assert.match(bad.error, /Unknown Telegram topic/)
     assert.equal(agent.injected.length, 2)
@@ -555,7 +570,7 @@ test('a long send from a job is recorded with its sender, and a reply after /new
   try {
     const old = run.host.makeAgent('session-notify', '/tmp/default-workspace')
     const long = Array.from({ length: 900 }, (_, index) => `word${index}`).join(' ')
-    const id = await enqueue({ topic: 'notify', text: long, from: { job: 'Morning digest', sessionId: 'session-cron' } })
+    const id = await enqueue({ to: 'notify', text: long, from: { job: 'Morning digest', sessionId: 'session-cron' } })
     const result = (await waitForResult(id, 3000)).result
     assert.ok(result.messageIds.length >= 2, 'split into several messages')
     assert.equal(result.recorded, true)
@@ -591,7 +606,7 @@ test('a long send from a job is recorded with its sender, and a reply after /new
 test('a topic without a session, or a session that cannot record, still gets the message', async () => {
   const run = await start({}, { threads: {}, topicNames: { '100:7200': 'Loose' } })
   try {
-    const unbound = await run.host.provided.telegramTopics.send('loose', 'hello', [], { from: { job: 'probe' } })
+    const unbound = await run.host.provided.telegramTopics.send({ to: 'loose', text: 'hello', files: [], from: { job: 'probe' } })
     assert.equal(unbound.recorded, false)
     assert.match(unbound.note, /no bound session/u)
     assert.equal(sent(run.telegram.calls, 7200).length, 1)
@@ -602,7 +617,7 @@ test('a topic without a session, or a session that cannot record, still gets the
   try {
     const agent = broken.host.makeAgent('session-notify', '/tmp/default-workspace')
     agent.inject = () => { throw new Error('session closed') }
-    const result = await broken.host.provided.telegramTopics.send('notify', 'still sent')
+    const result = await broken.host.provided.telegramTopics.send({ to: 'notify', text: 'still sent' })
     assert.equal(result.recorded, false)
     assert.equal(result.recordError, 'session closed')
     assert.ok(sent(broken.telegram.calls, 7100).some((call) => call.body.text.includes('still sent')))
