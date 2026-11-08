@@ -282,6 +282,25 @@ function openFenceAtEnd(text) {
   return open
 }
 
+/** Wrap reasoning to the phone width and keep only the last lines. */
+function wrapThinkingLines(text, width = 43, maxLines = 9) {
+  // Hard character wrapping is prefix-stable: growing text never reflows the
+  // lines above, so only the bottom of the window changes.
+  const lines = []
+  for (const source of String(text).split('\n')) {
+    if (source.length === 0) {
+      lines.push('')
+      continue
+    }
+    for (let index = 0; index < source.length; index += width) {
+      lines.push(source.slice(index, index + width))
+    }
+  }
+  const tail = lines.slice(-maxLines)
+  if (tail.length > 0) tail[tail.length - 1] = tail.at(-1).slice(0, 30).trimEnd()
+  return tail.join('\n')
+}
+
 function splitAnswerText(text, limit = ANSWER_MARKDOWN_LIMIT) {
   const chunks = []
   let rest = text.trim()
@@ -333,4 +352,5 @@ export {
   routeMessage,
   clipPreview,
   splitAnswerText,
+  wrapThinkingLines,
 }

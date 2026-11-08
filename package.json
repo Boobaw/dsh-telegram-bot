@@ -62,6 +62,6 @@
     "url": "https://github.com/Boobaw/dsh-telegram-bot/issues"
   },
   "scripts": {
-    "test": "NODE_ENV=test node --test --test-concurrency=1"
+    "test": "NODE_ENV=test DSH_HOME=\"$(mktemp -d)\" node --test --test-concurrency=1"
   }
 }

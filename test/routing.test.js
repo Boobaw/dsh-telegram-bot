@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { __testing } from '../src/index.js'
+import { wrapThinkingLines } from '../src/formatting.js'
 
 const { classifyError, isAllThread, isTelegramParseError, normalizeCommand, routeMessage, splitAnswerText } = __testing
 
@@ -71,4 +72,15 @@ test('long fenced code stays balanced across answer messages', () => {
 test('invisible characters do not turn commands into prompts', () => {
   assert.equal(normalizeCommand('/restart\u200b'), '/restart')
   assert.equal(normalizeCommand('/last\ufeff@boobawnebot'), '/last')
+})
+
+
+test('thinking lines have a hard width and count boundary', () => {
+  const text = ('x'.repeat(100) + '\n').repeat(20)
+  const tail = wrapThinkingLines(text, 40, 9)
+  const lines = tail.split('\n')
+  assert.equal(lines.length <= 9, true)
+  assert.equal(lines.every((line) => line.length <= 40), true)
+  assert.equal(lines.at(-1).length <= 30, true)
+  assert.equal(lines.length <= 9, true)
 })

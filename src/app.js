@@ -26,10 +26,10 @@ import {
   normalizeCommand,
   parseToolArguments,
   routeMessage,
+  wrapThinkingLines,
   splitAnswerText,
   toTelegramMarkdown,
   toolArg,
-  wrapVisualLines,
 } from './formatting.js'
 import { admitText } from './admission.js'
 import { loadState, loadTopics, STATE_PATH, TOPICS_PATH } from './state.js'
@@ -141,6 +141,9 @@ export function apply(ctx, config) {
         thinkingLastText: '',
         tools: [],
         toolMessageId: null,
+        toolEpoch: 0,
+        toolEdit: Promise.resolve(),
+        thinkingEdit: Promise.resolve(),
         toolTimer: null,
         toolLastText: '',
         boundAgent: undefined,
@@ -428,12 +431,17 @@ export function apply(ctx, config) {
       const raw = String(tool.args ?? '').replace(/[{}\[\]"]/gu, '').replace(/\s+/gu, ' ').trim()
       detail = raw
     }
-    const label = `<b>${escapeHtml(name)}:</b>`
     if (detail === undefined || String(detail).trim().length === 0) return `${toolEmoji(name)} <b>${escapeHtml(name)}</b>`
-    const compact = String(detail).replace(/\s+/gu, ' ').trim()
-    const first = compact.slice(0, 36)
-    const second = compact.slice(36, 80)
-    return `${toolEmoji(name)} ${label} <code>${escapeHtml(first)}</code>${second.length === 0 ? '' : `\n<code>${escapeHtml(second)}</code>`}`
+    const compact = String(detail)
+      .replace(/\s+/gu, ' ')
+      .replace(/^cd\s+(?:"[^"]+"|'[^']+'|\S+)\s*(?=&&|;|\|\||$)/u, '[workspace] ')
+      .trim()
+    // Three mobile lines: command text starts on the header line, then two
+    // continuation lines. Extra detail is cut to keep the phone layout compact.
+    const first = compact.slice(0, 25)
+    const second = compact.slice(25, 58)
+    const third = compact.slice(58, 91)
+    return `${toolEmoji(name)} <b>${escapeHtml(name)}:</b> <code>${escapeHtml(first)}</code>${second.length === 0 ? '' : `\n<code>${escapeHtml(second)}</code>`}${third.length === 0 ? '' : `\n<code>${escapeHtml(third)}</code>`}`
   }
 
   /**
@@ -641,7 +649,7 @@ export function apply(ctx, config) {
     const key = String(chatId)
     let state = outboundStates.get(key)
     if (state === undefined) {
-      state = { tokens: 10, capacity: 10, intervalMs: 50, updatedAt: Date.now(), tail: Promise.resolve() }
+      state = { tokens: 10, capacity: 10, intervalMs: 50, minDelayMs: 20, updatedAt: Date.now(), tail: Promise.resolve() }
       outboundStates.set(key, state)
     }
     const previous = state.tail
@@ -652,13 +660,15 @@ export function apply(ctx, config) {
       const now = Date.now()
       state.tokens = Math.min(state.capacity, state.tokens + (now - state.updatedAt) / state.intervalMs)
       state.updatedAt = now
+      let wait = state.minDelayMs
       if (state.tokens < 1) {
-        await sleep(Math.ceil((1 - state.tokens) * state.intervalMs), signal)
+        wait = Math.max(state.minDelayMs, Math.ceil((1 - state.tokens) * state.intervalMs))
         state.tokens = 0
-        state.updatedAt = Date.now()
       } else {
         state.tokens -= 1
       }
+      await sleep(wait, signal)
+      state.updatedAt = Date.now()
     } finally {
       release()
     }
@@ -675,7 +685,7 @@ export function apply(ctx, config) {
     if (state === undefined) return
     state.tokens = 0
     state.updatedAt = Date.now()
-    state.intervalMs = Math.min(5000, Math.max(50, Math.ceil((retryAfter ?? 1) * 1000)))
+    state.intervalMs = Math.min(5000, Math.max(20, Math.ceil((retryAfter ?? 1) * 1000)))
     state.capacity = Math.min(state.capacity, 2)
   }
 
@@ -1140,6 +1150,9 @@ export function apply(ctx, config) {
   const pendingQuestions = new Map()
   /** In-flight topic opens keyed by chat and DSH session. */
   const openingTopics = new Map()
+  /** Short workspace codes for callback_data (Telegram limit is 64 bytes). */
+  const workspaceCodes = new Map()
+  let workspaceCodeSeq = 0
 
   /**
    * Resolve one pending approval and update its prompt in place.
@@ -1815,23 +1828,30 @@ export function apply(ctx, config) {
    * @param chat - chat bridge state.
    */
   async function flushThinking(chat) {
-    const full = chat.thinkingText.replace(/\r/gu, '')
-    if (full.trim().length === 0) return
-    if (chat.done) chat.thinkingShown = full.length
-    else chat.thinkingShown = Math.min(full.length, chat.thinkingShown + 40)
-    const text = full.slice(0, chat.thinkingShown).trim()
-    if (text.length === 0) return
-    const lines = wrapVisualLines(text, 52).slice(-10)
-    const body = `💭 Thinking\n${lines.join('\n')}`
-    if (body === chat.thinkingLastText) return
-    chat.thinkingLastText = body
-    if (chat.thinkingMessageId === null) {
-      const result = await sendPlain(chat.chatId, body, bridgeAbort.signal, chat.threadId)
-      chat.thinkingMessageId = result?.message_id ?? null
-    } else {
-      await editPlain(chat.chatId, chat.thinkingMessageId, body, bridgeAbort.signal, chat.threadId)
-    }
-    if (!chat.done && chat.thinkingShown < full.length) scheduleThinking(chat)
+    return queueAuxEdit(chat, 'thinkingEdit', 'thinking-edit', async () => {
+      const full = chat.thinkingText.replace(/\r/gu, '')
+      if (full.trim().length === 0) return
+      if (chat.done) chat.thinkingShown = full.length
+      else chat.thinkingShown = Math.min(full.length, chat.thinkingShown + 40)
+      const text = full.slice(0, chat.thinkingShown).trim()
+      if (text.length === 0) return
+      // Header counts as one line; keep at most nine wrapped content lines.
+      const bounded = wrapThinkingLines(text, 40, 9).trimEnd()
+      const body = `💭 Thinking\n${bounded}`
+      if (body === chat.thinkingLastText) return
+      chat.thinkingLastText = body
+      if (chat.thinkingMessageId === null) {
+        const result = await sendPlain(chat.chatId, body, bridgeAbort.signal, chat.threadId)
+        if (chat.done) {
+          if (result?.message_id !== undefined) await deleteMessage(chat.chatId, chat.threadId, result.message_id)
+          return
+        }
+        chat.thinkingMessageId = result?.message_id ?? null
+      } else {
+        await editPlain(chat.chatId, chat.thinkingMessageId, body, bridgeAbort.signal, chat.threadId)
+      }
+      if (!chat.done && chat.thinkingShown < full.length) scheduleThinking(chat)
+    })
   }
 
   /**
@@ -1850,7 +1870,7 @@ export function apply(ctx, config) {
     if (typeof chunk.name === 'string' && chunk.name.length > 0) tool.name = chunk.name
     if (typeof chunk.argumentsDelta === 'string') tool.args += chunk.argumentsDelta
     if (typeof chunk.arguments === 'string') tool.args = chunk.arguments
-    if (chat.tools.length > 10) chat.tools = chat.tools.slice(-10)
+    if (chat.tools.length > 5) chat.tools = chat.tools.slice(-5)
     return tool
   }
 
@@ -1858,17 +1878,31 @@ export function apply(ctx, config) {
    * Publish the rolling tool-call list as the second message.
    * @param chat - chat bridge state.
    */
+  function queueAuxEdit(chat, field, label, task) {
+    chat[field] = chat[field].then(task).catch((error) => reportError(label, error))
+    return chat[field]
+  }
+
   async function flushTool(chat) {
-    if (chat.tools.length === 0) return
-    const body = chat.tools.slice(-10).map(formatToolCall).join('\n')
-    if (body === chat.toolLastText) return
-    chat.toolLastText = body
-    if (chat.toolMessageId === null) {
-      const result = await sendKeyboard(chat.chatId, chat.threadId, body, [], bridgeAbort.signal)
-      chat.toolMessageId = result?.message_id ?? null
-    } else {
-      await editKeyboard(chat.chatId, chat.threadId, chat.toolMessageId, body, [], bridgeAbort.signal)
-    }
+    return queueAuxEdit(chat, 'toolEdit', 'tool-edit', async () => {
+      if (chat.done || chat.tools.length === 0) return
+      const epoch = chat.toolEpoch ?? 0
+      const lines = chat.tools.slice(-5).map(formatToolCall).join('\n').split('\n')
+      if (lines.length > 0) lines[lines.length - 1] = lines.at(-1).slice(0, 26).trimEnd()
+      const body = lines.join('\n')
+      if (body === chat.toolLastText) return
+      chat.toolLastText = body
+      if (chat.toolMessageId === null) {
+        const result = await sendKeyboard(chat.chatId, chat.threadId, body, [], bridgeAbort.signal)
+        if (chat.done || (chat.toolEpoch ?? 0) !== epoch) {
+          if (result?.message_id !== undefined) await deleteMessage(chat.chatId, chat.threadId, result.message_id)
+          return
+        }
+        chat.toolMessageId = result?.message_id ?? null
+      } else {
+        await editKeyboard(chat.chatId, chat.threadId, chat.toolMessageId, body, [], bridgeAbort.signal)
+      }
+    })
   }
 
   /**
@@ -1881,18 +1915,6 @@ export function apply(ctx, config) {
       chat.thinkingTimer = null
       fireAndForget('thinking-flush', () => flushThinking(chat))
     }, 650)
-  }
-
-  /**
-   * Throttle the tool-call display.
-   * @param chat - chat bridge state.
-   */
-  function scheduleTool(chat) {
-    if (chat.toolTimer !== null || chat.done) return
-    chat.toolTimer = setTimeout(() => {
-      chat.toolTimer = null
-      fireAndForget('tool-flush', () => flushTool(chat))
-    }, 1200)
   }
 
   /**
@@ -1930,16 +1952,15 @@ export function apply(ctx, config) {
     }
     if (frame.type === 'chunk' && frame.chunk?.type === 'tool-call-delta') {
       if (readLive(config.showToolCalls, true) !== true) return
+      // Tool arguments are only useful once complete; wait for block-end.
       chat.textSeparator = chat.text.length > 0
-      upsertTool(chat, frame.chunk)
-      scheduleTool(chat)
       return
     }
     if (frame.type === 'chunk' && frame.chunk?.type === 'block-end' && frame.chunk.block?.type === 'tool-call') {
       if (readLive(config.showToolCalls, true) !== true) return
       chat.textSeparator = chat.text.length > 0
       upsertTool(chat, frame.chunk.block)
-      scheduleTool(chat)
+      fireAndForget('tool-flush-now', () => flushTool(chat))
     }
   }
 
@@ -2005,8 +2026,14 @@ export function apply(ctx, config) {
     clearEditTimer(chat)
     clearAuxTimers(chat)
     if (chat.answerEdit !== undefined) await chat.answerEdit.catch(() => {})
-    if (chat.thinkingText.length > 0) await flushThinking(chat)
-    if (chat.tools.length > 0) await flushTool(chat)
+    // The final text is already available: remove auxiliary messages now,
+    // before spending time on answer edits and sends.
+    const thinkingId = chat.thinkingMessageId
+    const toolId = chat.toolMessageId
+    chat.thinkingMessageId = null
+    chat.toolMessageId = null
+    if (thinkingId !== null) await deleteMessage(chat.chatId, chat.threadId, thinkingId)
+    if (toolId !== null) await deleteMessage(chat.chatId, chat.threadId, toolId)
     const text = chat.text.trim()
     const chunks = splitAnswerText(text.length > 0 ? text : tr('✅ Done.', '✅ Готово.'))
     if (chat.messageId !== null) {
@@ -2017,14 +2044,6 @@ export function apply(ctx, config) {
     }
     for (const chunk of chunks.slice(1)) {
       await sendAnswer(chat.chatId, chunk, bridgeAbort.signal, chat.threadId)
-    }
-    // The final answer is the first message; remove the transient reasoning
-    // and tool-call messages after it has been committed.
-    if (chat.thinkingMessageId !== null) {
-      await deleteMessage(chat.chatId, chat.threadId, chat.thinkingMessageId)
-    }
-    if (chat.toolMessageId !== null) {
-      await deleteMessage(chat.chatId, chat.threadId, chat.toolMessageId)
     }
     chat.text = ''
     chat.lastText = ''
@@ -2096,6 +2115,7 @@ export function apply(ctx, config) {
     chat.awaitingTurn = true
     chat.activeTurn = undefined
     chat.turnEpoch = (chat.turnEpoch ?? 0) + 1
+    chat.toolEpoch = (chat.toolEpoch ?? 0) + 1
     const epoch = chat.turnEpoch
     chat.text = ''
     chat.lastText = ''
@@ -2702,6 +2722,21 @@ export function apply(ctx, config) {
     )
   }
 
+  /** Return a short, stable callback code for a workspace reference. */
+  function workspaceCode(workspaceRef) {
+    if (workspaceRef === undefined || workspaceRef === 'all') return 'a'
+    for (const [code, value] of workspaceCodes) if (value === workspaceRef) return code
+    workspaceCodeSeq += 1
+    const code = `w${workspaceCodeSeq}`
+    workspaceCodes.set(code, workspaceRef)
+    return code
+  }
+
+  /** Resolve a callback workspace code back to a workspace id. */
+  function workspaceFromCode(code) {
+    return code === 'a' ? 'all' : (workspaceCodes.get(code) ?? 'all')
+  }
+
   /**
    * Show sessions in one workspace (or all sessions).
    * @param chatId - control chat.
@@ -2735,7 +2770,7 @@ export function apply(ctx, config) {
       const title = await sessionTitle(record.header.id, record.header)
       rows.push([{
         text: `${record.live ? '🟢' : '⚪'} ${shortLabel(title, 44)}`,
-        callback_data: `s:${record.header.id}`,
+        callback_data: `s:${workspaceCode(workspaceRef)}:${record.header.id}`,
       }])
     }
     rows.push([{ text: tr('⬅️ Back', '⬅️ Назад'), callback_data: 'w:root' }])
@@ -2885,7 +2920,10 @@ export function apply(ctx, config) {
         return
       }
       if (prefix === 's') {
-        await showSessionPreview(chat.id, threadId, ref, 'all', signal, query.message.message_id)
+        const separator = ref.indexOf(':')
+        const code = separator === -1 ? 'a' : ref.slice(0, separator)
+        const sessionId = separator === -1 ? ref : ref.slice(separator + 1)
+        await showSessionPreview(chat.id, threadId, sessionId, workspaceFromCode(code), signal, query.message.message_id)
         return
       }
       if (prefix === 'n') {
@@ -3269,21 +3307,35 @@ export function apply(ctx, config) {
         await send(chat.id, tr('Topic name must be at most 128 characters.', 'Имя топика не должно быть длиннее 128 символов.'), signal, threadId)
         return
       }
+      const record = state.sessions[chatState.sessionId]
+      const previous = record === undefined ? undefined : { title: record.title, titleLocked: record.titleLocked }
+      if (record !== undefined) {
+        // Lock before the API call so a concurrent provider title event cannot
+        // rename the topic back while the request is in flight.
+        record.title = name
+        record.titleLocked = true
+        await persistState()
+      }
       try {
         await publishStatus({ lastTopicRename: { threadId, name, source: 'rename' } })
-        await call('editForumTopic', {
-          chat_id: chat.id,
-          message_thread_id: threadId,
-          name,
-        }, signal)
-        const record = state.sessions[chatState.sessionId]
-        if (record !== undefined) {
-          record.title = name
-          record.titleLocked = true
-          await persistState()
+        // Telegram's private-topic editForumTopic is currently inconsistent:
+        // it returns true while some clients keep the old title. Repeating the
+        // same edit gives those clients another service update to consume.
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          await call('editForumTopic', {
+            chat_id: chat.id,
+            message_thread_id: threadId,
+            name,
+          }, signal)
+          if (attempt < 2) await sleep(200, signal)
         }
         await send(chat.id, `✏️ ${tr('Topic renamed', 'Topic переименован')}: <b>${escapeHtml(name)}</b>`, signal, threadId)
       } catch (error) {
+        if (record !== undefined) {
+          record.title = previous?.title
+          record.titleLocked = previous?.titleLocked
+          await persistState()
+        }
         await send(chat.id, `❌ ${escapeHtml(messageOf(error))}`, signal, threadId)
       }
       return
