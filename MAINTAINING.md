@@ -6,6 +6,8 @@ This repository is a maintained fork of [Boobaw/dsh-telegram-bot](https://github
 - User-created topics: each new topic asks for its workspace and a new or existing session; `/workspace` switches; topic names are never changed after session titles.
 - Two-way sync: turns started in the Web UI, by scheduled tasks or by other plugins also appear in the bound topic (`mirrorTurns`).
 - Sending into topics by name: the `telegramTopics` Host service, the `telegram_send` tool and the `dsh-telegram-send` command.
+- Chat-wide commands sent in All are answered in All; the topic Telegram made for them is deleted.
+- Sender labels: each Telegram prompt names who wrote it.
 - Reply, quote and forward context: the agent sees what a message replies to, quotes or forwards, and forwards sent together become one prompt.
 
 Upstream changes are merged in, not rebased, so the history of both lines stays intact.

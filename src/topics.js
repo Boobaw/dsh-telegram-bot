@@ -18,6 +18,31 @@ export function topicNameOf(message) {
 }
 
 /**
+ * Commands about the chat as a whole rather than one topic. When one of them
+ * is sent in All, Telegram turns it into a topic of its own; the bot answers
+ * in All instead and removes that topic.
+ */
+export const CHAT_COMMANDS = new Set(['/start', '/help', '/sessions', '/status', '/menu', '/id', '/ping', '/restart'])
+
+/**
+ * Whether a message is a chat-wide command that Telegram moved into a topic it
+ * created for that very message: users who may create topics get one for any
+ * message sent in All, named after the message.
+ * @param command - normalized command token, such as `/start`.
+ * @param text - full message text.
+ * @param topicName - known name of the message's topic, if any.
+ * @param fresh - whether the topic has no session and no earlier activity.
+ * @returns true when the command should be answered in All.
+ */
+export function isAutoCommandTopic(command, text, topicName, fresh) {
+  if (!fresh || !CHAT_COMMANDS.has(command)) return false
+  if (typeof topicName !== 'string' || typeof text !== 'string') return false
+  const name = topicName.trim()
+  // Telegram names the topic after the message, cut to 128 characters.
+  return name.startsWith('/') && text.trim().startsWith(name)
+}
+
+/**
  * Resolve a send target: a numeric thread id, or a topic name compared
  * without regard to case.
  * @param names - `{ "<chatId>:<threadId>": name }`.

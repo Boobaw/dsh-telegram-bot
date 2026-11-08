@@ -81,6 +81,21 @@ export function composePrompt(message, options = {}) {
 }
 
 /**
+ * The line that tells the agent who wrote a Telegram message. Several allowed
+ * users can talk to the same bot, each in their own chat.
+ * @param user - Telegram `from` of the message.
+ * @returns a one-line label, or undefined without a sender.
+ */
+export function senderLabel(user) {
+  if (user === undefined || user === null || user.id === undefined) return undefined
+  const name = [user.first_name, user.last_name].filter((part) => typeof part === 'string' && part.trim().length > 0).join(' ').trim()
+  const details = []
+  if (typeof user.username === 'string' && user.username.length > 0) details.push(`@${user.username}`)
+  details.push(`user id ${user.id}`)
+  return name.length > 0 ? `[Telegram message from ${name} (${details.join(', ')})]` : `[Telegram message from ${details.join(', ')}]`
+}
+
+/**
  * Describe the replied-to or externally replied message, if any.
  * @returns the context block, or undefined.
  */

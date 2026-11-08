@@ -37,8 +37,8 @@ import { loadState, loadTopics, STATE_PATH, TOPICS_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
 import { createOutbox } from './outbox.js'
-import { resolveTopicTarget, topicNameOf } from './topics.js'
-import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage } from './message-context.js'
+import { isAutoCommandTopic, resolveTopicTarget, topicNameOf } from './topics.js'
+import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, senderLabel } from './message-context.js'
 import {
   allowedChatsOf,
   allowedUsersOf,
@@ -3646,6 +3646,14 @@ export function apply(ctx, config) {
       lastThreadId: threadId ?? null,
     })
 
+    const topicKey = `${chat.id}:${threadId}`
+    const freshTopic = !isAllThread(threadId) && !inSession && chatState.bindPickerShown !== true
+      && (chatState.bindPrompts?.length ?? 0) === 0
+    if (isAutoCommandTopic(command, text, state.topicNames?.[topicKey], freshTopic)) {
+      await answerInAll(message, signal, type)
+      return
+    }
+
     if (text.startsWith('🤖 Model:')) {
       if (!inSession) await send(chat.id, tr('Open a session first: /sessions.', 'Сначала открой сессию: /sessions.'), signal, threadId)
       else await showModelMenu(chatState, signal)
@@ -3680,7 +3688,7 @@ export function apply(ctx, config) {
           (inSession
             ? `${tr('Current session', 'Текущая сессия')}: <code>${chatState.sessionId}</code>\n`
             : isAllThread(threadId)
-              ? `${tr('Create a topic in this chat and send a message there. I ask which workspace it should use, then start a new session or continue an existing one. /sessions opens existing sessions in new topics.', 'Создай топик в этом чате и напиши туда сообщение. Я спрошу, какой workspace использовать, и начну новую сессию или продолжу существующую. /sessions открывает существующие сессии в новых топиках.')}\n`
+              ? `${tr('To start a conversation, create a topic and send a message in it, or just send a message here in All: Telegram makes a topic for it. In the topic, pick the workspace, then a new session or an existing one. /sessions opens existing sessions in new topics.', 'Чтобы начать разговор, создай топик и напиши в него, или просто напиши здесь, в All: Telegram сам создаст для сообщения топик. В топике выбери workspace, затем новую или существующую сессию. /sessions открывает существующие сессии в новых топиках.')}\n`
               : `${tr('This topic has no session yet. Send a message to choose a workspace.', 'У этого топика ещё нет сессии. Напиши сообщение, чтобы выбрать workspace.')}\n`) +
           `\n<b>${tr('First run', 'Первый запуск')}:</b> @BotFather → Bot Settings → <b>Threaded mode</b> → ${tr('Enable', 'Включить')}.\n` +
           `${tr('Commands', 'Команды')}: /sessions, /new, /workspace, /current, /menu, /rename, /fork, /last, /clear, /stop, /restart, /status, /id, /ping.`,
@@ -4003,6 +4011,44 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Answer a chat-wide command that Telegram moved into a topic created for
+   * it: run it as if sent in All, then delete that topic so it does not stay
+   * behind as an empty conversation.
+   * @param message - the command message, still carrying its topic.
+   * @param signal - runtime lifetime.
+   * @param type - Telegram update key, for diagnostics.
+   */
+  async function answerInAll(message, signal, type) {
+    const chatId = message.chat.id
+    const threadId = message.message_thread_id
+    const key = `${chatId}:${threadId}`
+    const { message_thread_id: _thread, is_topic_message: _topic, ...rest } = message
+    const inAll = { ...rest }
+    // The reply target of a topic's first message is the topic creation itself.
+    if (inAll.reply_to_message?.forum_topic_created !== undefined) delete inAll.reply_to_message
+    await handleMessage(inAll, signal, type)
+    chats.delete(key)
+    delete state.threads[key]
+    delete state.topicNames?.[key]
+    await persistState()
+    try {
+      await call('deleteForumTopic', { chat_id: chatId, message_thread_id: threadId }, signal)
+      await publishStatus({ lastAutoTopicDeleted: { threadId, at: Date.now() } })
+    } catch (error) {
+      reportError('auto-topic-delete', error)
+      await send(
+        chatId,
+        tr(
+          'Telegram made this topic from a command sent in All. The answer is in All; this topic can be deleted.',
+          'Telegram создал этот топик из команды, отправленной в All. Ответ — в All; этот топик можно удалить.',
+        ),
+        signal,
+        threadId,
+      )
+    }
+  }
+
+  /**
    * Build the agent prompt for one message: its text, what it replies to,
    * quotes or forwards, its own photo or document and a replied-to one.
    * @param message - Telegram message.
@@ -4040,7 +4086,7 @@ export function apply(ctx, config) {
       const ask = tr('Analyze the attached file.', 'Проанализируй приложенный файл.')
       text = text.length === 0 ? ask : `${text}\n\n${ask}`
     }
-    return { text, attachments, messageId: message.message_id }
+    return { text, attachments, messageId: message.message_id, from: message.from }
   }
 
   /**
@@ -4053,6 +4099,9 @@ export function apply(ctx, config) {
    * @param signal - runtime lifetime.
    */
   async function dispatchPrompt(chatState, chatId, threadId, prompt, signal) {
+    // Say who is writing: several allowed users may share one bot.
+    const label = senderLabel(prompt.from)
+    if (label !== undefined) prompt = { ...prompt, text: prompt.text.length > 0 ? `${label}\n${prompt.text}` : label }
     const route = routeMessage({ threadId, inSession: typeof chatState.sessionId === 'string' })
     if (route === 'new-topic') {
       await createNewSessionTopic(chatId, threadId, signal, defaultWorkspaceCwd(), prompt.text, prompt.attachments, prompt.messageId)
@@ -4096,6 +4145,7 @@ export function apply(ctx, config) {
         text: prompts.map((item) => item.text).filter((text) => text.length > 0).join('\n\n'),
         attachments: prompts.flatMap((item) => item.attachments),
         messageId: prompts[0].messageId,
+        from: prompts[0].from,
       }
       fireAndForget('forward-batch', () => dispatchPrompt(chatState, chatId, threadId, merged, signal))
     }, FORWARD_BATCH_MS)

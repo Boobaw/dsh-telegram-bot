@@ -36,6 +36,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Leave **Disallow users
 - Tool approvals with **Deny** / **Allow** buttons.
 - `ask_user_question` support: options, multi-select, custom answers and plan review.
 - Documents and photos sent in a session topic are saved as DSH attachments and passed to the agent.
+- Every prompt from Telegram starts with a line naming the sender, such as `[Telegram message from Ana Silva (@ana, user id 123)]`, so the agent knows who is writing when several allowed users share the bot. Prompts typed in the Web UI are not labelled.
 - Replies, quotes and forwards keep their context. The agent sees the text of the replied-to message (or only the quoted part), who wrote it and when; a replied-to photo or document is attached too. A forwarded message is labelled with its origin (person, hidden account, group or channel with a message link) and original date. Several messages forwarded together become one prompt, and forwarded text never runs as a command. Long quoted text is cut at about 2,000 characters with a note.
 - `/new`, `/workspace`, `/last`, `/rename`, `/fork`, `/clear`, `/stop`, `/restart`, `/status` and `/menu`.
 - `/new` in a session topic starts a fresh DSH session in the same workspace and binds it to the same topic; the previous session stays in DSH. In All it opens a new session topic.
@@ -96,7 +97,7 @@ The token field only reports whether a token is configured. A token supplied thr
 5. Add your user id to **Allowed users** and press **Save**.
 6. Create a topic and send a message in it. Choose a workspace, then **New session** or one of the listed sessions. Your message runs in that session.
 
-A message sent in **All** makes Telegram create a topic for it; the bot treats it like any new topic and asks for the workspace (if Telegram delivers it to All instead, the bot opens a new topic in the default workspace). `/sessions` in **All** still opens existing sessions in new topics, and commands such as `/fork` and `/last` work as before.
+A message sent in **All** makes Telegram create a topic for it; the bot treats it like any new topic and asks for the workspace (if Telegram delivers it to All instead, the bot opens a new topic in the default workspace). Chat-wide commands are the exception: when `/start`, `/help`, `/sessions`, `/status`, `/menu`, `/id`, `/ping` or `/restart` is sent in **All** and Telegram makes a topic for it, the bot answers in **All** and deletes that topic. If the topic cannot be deleted, it leaves a short note there. `/sessions` in **All** still opens existing sessions in new topics, and commands such as `/fork` and `/last` work as before.
 
 Topics bound by an earlier version keep their sessions after an upgrade.
 

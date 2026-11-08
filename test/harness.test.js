@@ -148,7 +148,7 @@ test('All message creates one topic, then the same topic continues', async () =>
     assert.equal(topicCalls.length, 1, 'All message must create exactly one topic')
     assert.equal(topicCalls[0].body.name, 'New session')
     assert.equal(agent.received.length, 1, 'the initial prompt must reach the new agent')
-    assert.equal(agent.received[0].content[0].text, 'hello from All')
+    assert.equal(agent.received[0].content[0].text, '[Telegram message from user id 42]\nhello from All')
   } finally {
     cleanup()
     https.request = originalRequest

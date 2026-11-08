@@ -5,8 +5,9 @@ import { join } from 'node:path'
 import test from 'node:test'
 import https from 'node:https'
 import { STATUS_DIR } from '../src/constants.js'
+import { senderLabel } from '../src/message-context.js'
 import { enqueue, waitForResult } from '../src/outbox.js'
-import { resolveTopicTarget, topicNameOf } from '../src/topics.js'
+import { isAutoCommandTopic, resolveTopicTarget, topicNameOf } from '../src/topics.js'
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -105,6 +106,7 @@ function makeTelegram() {
   const calls = []
   const pending = []
   const missingThreads = new Set()
+  const undeletable = new Set()
   let messageId = 0
   let topicId = 7000
   let updateId = 0
@@ -156,6 +158,9 @@ function makeTelegram() {
         if (missingThreads.has(body.message_thread_id)) return deliver({ ok: false, description: 'Bad Request: message thread not found' })
         return deliver({ ok: true, result: true })
       }
+      if (method === 'deleteForumTopic' && undeletable.has(body.message_thread_id)) {
+        return deliver({ ok: false, description: 'Bad Request: not enough rights to delete the topic' })
+      }
       if (method === 'sendDocument' || method === 'sendPhoto') {
         messageId += 1
         return deliver({ ok: true, result: { message_id: messageId } })
@@ -186,7 +191,7 @@ function makeTelegram() {
     messageId += 1
     pending.push({ update_id: updateId, message: { message_id: messageId, date: 1, chat: { id: 100, type: 'private' }, from: { id: 42 }, ...message } })
   }
-  return { fake, calls, push, pushCallback, missingThreads }
+  return { fake, calls, push, pushCallback, missingThreads, undeletable }
 }
 
 /** Start the plugin against fresh fakes and an optional initial state. */
@@ -234,6 +239,7 @@ function picker(calls, prefix) {
   }
 }
 
+const SENDER = '[Telegram message from user id 42]\n'
 const sent = (calls, threadId) => calls.filter((call) => call.method === 'sendMessage' && call.body.message_thread_id === threadId)
 
 test('/new binds a fresh session to the same topic and keeps the old one in DSH', async () => {
@@ -254,7 +260,7 @@ test('/new binds a fresh session to the same topic and keeps the old one in DSH'
     assert.equal(run.telegram.calls.filter((call) => call.method === 'createForumTopic').length, 1, '/new creates no topic')
     run.telegram.push({ message_thread_id: 7001, text: 'second' })
     await wait(150)
-    assert.equal(run.host.live.get('session-2').received.at(-1).content[0].text, 'second')
+    assert.equal(run.host.live.get('session-2').received.at(-1).content[0].text, '[Telegram message from user id 42]\nsecond')
     assert.equal(run.host.live.get('session-1').received.length, 1)
   } finally {
     run.stop()
@@ -293,7 +299,7 @@ test('a new topic asks for a workspace, then runs the waiting message in a new s
     assert.equal(run.host.created[0].cwd, '/tmp/notes')
     const state = await run.readState()
     assert.equal(state.threads['100:9001'], 'session-1')
-    assert.equal(run.host.live.get('session-1').received[0].content[0].text, 'first question')
+    assert.equal(run.host.live.get('session-1').received[0].content[0].text, '[Telegram message from user id 42]\nfirst question')
     assert.equal(run.telegram.calls.filter((call) => call.method === 'createForumTopic').length, 0)
   } finally {
     run.stop()
@@ -321,7 +327,7 @@ test('a topic can bind an existing session, which leaves its old topic', async (
     assert.equal(state.threads['100:5000'], undefined, 'one session is bound to one topic')
     assert.equal(state.sessions['session-old'].threadId, 9002)
     assert.equal(run.host.created.length, 0)
-    assert.equal(run.host.live.get('session-old').received.at(-1).content[0].text, 'continue here')
+    assert.equal(run.host.live.get('session-old').received.at(-1).content[0].text, '[Telegram message from user id 42]\ncontinue here')
   } finally {
     run.stop()
   }
@@ -454,7 +460,7 @@ test('a Telegram message during a Web turn waits for that turn', async () => {
     agent.emit('session/event', { id: 'session-1' }, { type: 'assistant/message', data: { turn: 5, step: 1, message: { content: [{ type: 'text', text: 'done on web' }] } } })
     agent.emit('session/event', { id: 'session-1' }, { type: 'turn/end', data: { turn: 5, reason: { kind: 'completed' } } })
     await wait(150)
-    assert.equal(agent.received.at(-1).content[0].text, 'queued from phone')
+    assert.equal(agent.received.at(-1).content[0].text, '[Telegram message from user id 42]\nqueued from phone')
   } finally {
     run.stop()
   }
@@ -572,7 +578,7 @@ test('a reply carries the replied-to text, its author and its photo', async () =
     await wait(250)
     const last = agent.received.at(-1)
     const text = promptText(last)
-    assert.match(text, /^\[Replying to a message from the assistant \(this bot\) \(sent 2025-11-08 11:06 UTC; contains a photo, attached\)\]\n> Weekly chart\n\nwhat does this show\?$/u)
+    assert.match(text, /^\[Telegram message from user id 42\]\n\[Replying to a message from the assistant \(this bot\) \(sent 2025-11-08 11:06 UTC; contains a photo, attached\)\]\n> Weekly chart\n\nwhat does this show\?$/u)
     assert.equal(last.content.filter((block) => block.type === 'image').length, 1)
     assert.ok(run.telegram.calls.some((call) => call.method === 'getFile' && call.body.file_id === 'large'))
   } finally {
@@ -591,7 +597,7 @@ test('a partial quote replaces the full text, and the topic root is not a reply'
       reply_to_message: { message_id: 7001, date: 1, chat: { id: 100 }, forum_topic_created: { name: 'hello' } },
     })
     await wait(250)
-    assert.equal(promptText(agent.received.at(-1)), 'plain message')
+    assert.equal(promptText(agent.received.at(-1)), '[Telegram message from user id 42]\nplain message')
     run.telegram.push({
       message_thread_id: 7001,
       is_topic_message: true,
@@ -607,7 +613,7 @@ test('a partial quote replaces the full text, and the topic root is not a reply'
     })
     await wait(250)
     const text = promptText(agent.received.at(-1))
-    assert.match(text, /^\[Replying to a message from Sam \(@sam\) \(sent [^)]+\); the user quoted only this part\]\n> the second step\n\nis this right\?$/u)
+    assert.match(text, /^\[Telegram message from user id 42\]\n\[Replying to a message from Sam \(@sam\) \(sent [^)]+\); the user quoted only this part\]\n> the second step\n\nis this right\?$/u)
     assert.doesNotMatch(text, /third step/u)
   } finally {
     run.stop()
@@ -624,7 +630,7 @@ test('a reply to a mirrored Web prompt is not shown as an assistant message', as
       reply_to_message: { message_id: 502, date: 1, chat: { id: 100 }, from: { id: 1, is_bot: true }, text: '🖥 From Web:\nsummarize the logs' },
     })
     await wait(250)
-    assert.match(promptText(agent.received.at(-1)), /^\[Replying to a message from the Web UI \(a user prompt this bot mirrored into the chat, not an assistant answer\)/u)
+    assert.match(promptText(agent.received.at(-1)), /^\[Telegram message from user id 42\]\n\[Replying to a message from the Web UI \(a user prompt this bot mirrored into the chat, not an assistant answer\)/u)
   } finally {
     run.stop()
   }
@@ -658,6 +664,128 @@ test('several forwarded messages become one prompt and never run as commands', a
     assert.match(text, /\[Forwarded message from Sam \(originally sent [^)]+\)\]\n> \/new/u)
     assert.match(text, /\[Forwarded message from Alex \(account hidden\) \(originally sent [^;]+; contains a video, not attached\)\]\n> clip/u)
     assert.equal(run.host.created.length, 1, 'a forwarded /new is not a command')
+  } finally {
+    run.stop()
+  }
+})
+
+test('isAutoCommandTopic matches only chat-wide commands in a fresh topic named after them', () => {
+  assert.equal(isAutoCommandTopic('/start', '/start', '/start', true), true)
+  assert.equal(isAutoCommandTopic('/sessions', '/sessions@testbot', '/sessions@testbot', true), true)
+  assert.equal(isAutoCommandTopic('/start', '/start', '/start', false), false, 'a topic with a session or activity')
+  assert.equal(isAutoCommandTopic('/start', '/start', 'My topic', true), false, 'a topic the user named')
+  assert.equal(isAutoCommandTopic('/start', '/start', undefined, true), false, 'unknown topic name')
+  assert.equal(isAutoCommandTopic('/new', '/new', '/new', true), false, '/new belongs to the topic')
+  assert.equal(isAutoCommandTopic(undefined, 'hello', 'hello', true), false)
+})
+
+/** The two messages Telegram delivers when a user sends text in All with topic creation on. */
+function pushAutoTopic(run, threadId, text) {
+  run.telegram.push({ message_thread_id: threadId, forum_topic_created: { name: text, icon_color: 1 } })
+  run.telegram.push({
+    message_thread_id: threadId,
+    is_topic_message: true,
+    text,
+    reply_to_message: { message_id: threadId, chat: { id: 100, type: 'private' }, forum_topic_created: { name: text, icon_color: 1 } },
+  })
+}
+
+test('a chat-wide command that Telegram turned into a topic is answered in All and the topic is deleted', async () => {
+  const run = await start()
+  try {
+    pushAutoTopic(run, 9100, '/start')
+    await wait(200)
+    const replies = run.telegram.calls.filter((call) => call.method === 'sendMessage' && !/Polling started/u.test(call.body.text))
+    assert.equal(replies.length, 1)
+    assert.equal(replies[0].body.message_thread_id, undefined, 'the reply goes to All')
+    assert.match(replies[0].body.text, /send a message here in All/u)
+    assert.match(replies[0].body.text, /pick the workspace, then a new session or an existing one/u)
+    const deleted = run.telegram.calls.filter((call) => call.method === 'deleteForumTopic')
+    assert.deepEqual(deleted.map((call) => call.body), [{ chat_id: 100, message_thread_id: 9100 }])
+    assert.equal(picker(run.telegram.calls, 'tw:'), undefined, 'no workspace picker')
+    const state = await run.readState()
+    assert.equal(state.topicNames['100:9100'], undefined, 'the deleted topic is forgotten')
+    assert.equal(run.host.created.length, 0)
+
+    pushAutoTopic(run, 9110, '/sessions')
+    await wait(200)
+    const last = run.telegram.calls.filter((call) => call.method === 'sendMessage').at(-1)
+    assert.equal(last.body.message_thread_id, undefined, '/sessions answers in All')
+    assert.equal(run.telegram.calls.filter((call) => call.method === 'deleteForumTopic').length, 2)
+  } finally {
+    run.stop()
+  }
+})
+
+test('an ordinary message in a fresh auto-created topic still asks for the workspace', async () => {
+  const run = await start()
+  try {
+    pushAutoTopic(run, 9120, 'what is on my list today')
+    await wait(200)
+    assert.ok(picker(run.telegram.calls, 'tw:'), 'workspace picker shown')
+    assert.equal(sent(run.telegram.calls, 9120).length >= 1, true, 'the picker is in the topic')
+    assert.equal(run.telegram.calls.filter((call) => call.method === 'deleteForumTopic').length, 0)
+  } finally {
+    run.stop()
+  }
+})
+
+test('a command in a topic that already has a session stays in that topic', async () => {
+  const run = await start({}, {
+    sessions: { 'session-old': { sessionId: 'session-old', chatId: 100, threadId: 9130, title: '/status', cwd: '/tmp/notes', updatedAt: 1 } },
+    threads: { '100:9130': 'session-old' },
+    topicNames: { '100:9130': '/status' },
+  })
+  try {
+    run.host.makeAgent('session-old', '/tmp/notes')
+    run.telegram.push({ message_thread_id: 9130, text: '/status' })
+    await wait(200)
+    assert.equal(sent(run.telegram.calls, 9130).length, 1)
+    assert.equal(run.telegram.calls.filter((call) => call.method === 'deleteForumTopic').length, 0)
+  } finally {
+    run.stop()
+  }
+})
+
+test('when the auto-created topic cannot be deleted, a short note is left in it', async () => {
+  const run = await start()
+  try {
+    run.telegram.undeletable.add(9140)
+    pushAutoTopic(run, 9140, '/ping')
+    await wait(200)
+    const all = run.telegram.calls.filter((call) => call.method === 'sendMessage' && call.body.message_thread_id === undefined)
+    assert.equal(all.at(-1).body.text, 'pong')
+    const note = sent(run.telegram.calls, 9140)
+    assert.equal(note.length, 1)
+    assert.match(note[0].body.text, /The answer is in All/u)
+    assert.ok(run.host.logs.some((line) => /auto-topic-delete/u.test(line)), 'the failure is logged')
+  } finally {
+    run.stop()
+  }
+})
+
+test('senderLabel names the Telegram user compactly', () => {
+  assert.equal(senderLabel({ id: 7, first_name: 'Livia', last_name: 'Li', username: 'lia' }), '[Telegram message from Livia Li (@lia, user id 7)]')
+  assert.equal(senderLabel({ id: 8, first_name: 'Sam' }), '[Telegram message from Sam (user id 8)]')
+  assert.equal(senderLabel({ id: 9 }), '[Telegram message from user id 9]')
+  assert.equal(senderLabel(undefined), undefined)
+})
+
+test('every Telegram prompt says who wrote it, once per forwarded batch', async () => {
+  const run = await start()
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'hello', from: { id: 42, first_name: 'Livia', username: 'lia' } })
+    await wait(200)
+    const agent = run.host.live.get('session-1')
+    assert.equal(promptText(agent.received[0]), '[Telegram message from Livia (@lia, user id 42)]\nhello')
+    const before = agent.received.length
+    run.telegram.push({ message_thread_id: 7001, text: 'one', forward_origin: { type: 'hidden_user', sender_user_name: 'A', date: 1 } })
+    run.telegram.push({ message_thread_id: 7001, text: 'two', forward_origin: { type: 'hidden_user', sender_user_name: 'B', date: 2 } })
+    await wait(1800)
+    assert.equal(agent.received.length, before + 1)
+    const text = promptText(agent.received.at(-1))
+    assert.equal(text.match(/\[Telegram message from/gu).length, 1, 'one label for the batch')
+    assert.ok(text.startsWith(SENDER))
   } finally {
     run.stop()
   }
