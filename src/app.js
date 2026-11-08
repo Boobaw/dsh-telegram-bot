@@ -3038,6 +3038,52 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Bind a fresh DSH session to an existing topic. The previous session stays
+   * in DSH as history; only the topic binding moves. The topic keeps its name.
+   * @param chatState - current topic state.
+   * @param signal - request lifetime.
+   */
+  async function startNewSessionInTopic(chatState, signal) {
+    const previousId = chatState.sessionId
+    const previous = typeof previousId === 'string' ? state.sessions[previousId] : undefined
+    const cwd = chatState.cwd ?? previous?.cwd ?? defaultWorkspaceCwd()
+    const title = previous?.title
+    cancelQuestionsForChat(chatState)
+    chatState.pendingPrompts = []
+    // Old agent listeners check boundAgent and go quiet once it changes.
+    chatState.boundAgent = undefined
+    chatState.sessionId = undefined
+    chatState.panelMessageId = undefined
+    // Keep the topic's model choice, but not the object the old agent reads.
+    if (chatState.selection !== undefined) {
+      chatState.selection = { current: { ...chatState.selection.current }, assembled: undefined }
+    }
+    chatState.cwd = cwd
+    delete state.threads[chatState.key]
+    // The old record would otherwise still point at this topic, and
+    // "Continue in Telegram" would reopen it here.
+    if (typeof previousId === 'string') delete state.sessions[previousId]
+    await persistState()
+    await ensureAgent(chatState)
+    const record = state.sessions[chatState.sessionId]
+    if (record !== undefined && typeof title === 'string' && title.length > 0) {
+      record.title = title
+      record.titleLocked = true
+      await persistState()
+    }
+    await send(
+      chatState.chatId,
+      `🆕 ${tr('New session started in this topic.', 'В этом топике начата новая сессия.')}` +
+        (typeof previousId === 'string'
+          ? `\n${tr('The previous session stays in DSH', 'Предыдущая сессия осталась в DSH')}: <code>${escapeHtml(previousId)}</code>`
+          : ''),
+      signal,
+      chatState.threadId,
+    )
+    await sendMenu(chatState.chatId, chatState.threadId, chatState, signal)
+  }
+
+  /**
    * Handle one authorized Telegram message and dispatch its command or prompt.
    * @param message - Telegram message.
    * @param signal - runtime lifetime.
@@ -3169,7 +3215,7 @@ export function apply(ctx, config) {
             ? `${tr('Current session', 'Текущая сессия')}: <code>${chatState.sessionId}</code>\n`
             : `${tr('Global topic. Choose a session or create a new one.', 'Глобальный чат. Выбери сессию или создай новую.')}\n`) +
           `\n<b>${tr('First run', 'Первый запуск')}:</b> @BotFather → Bot Settings → <b>Threaded mode</b> → ${tr('Enable', 'Включить')}.\n` +
-          `${tr('Commands', 'Команды')}: /sessions, /current, /menu, /rename, /fork, /last, /clear, /stop, /restart, /status, /id, /ping.`,
+          `${tr('Commands', 'Команды')}: /sessions, /new, /current, /menu, /rename, /fork, /last, /clear, /stop, /restart, /status, /id, /ping.`,
         signal,
         threadId,
       )
@@ -3191,6 +3237,27 @@ export function apply(ctx, config) {
     }
     if (command === '/sessions') {
       await showWorkspaces(chat.id, threadId, signal)
+      return
+    }
+    if (command === '/new') {
+      if (isAllThread(threadId)) {
+        await createNewSessionTopic(chat.id, threadId, signal, defaultWorkspaceCwd())
+        return
+      }
+      if (chatState.busy) {
+        await send(chat.id, tr('Stop the current task before starting a new session.', 'Останови текущую задачу перед новой сессией.'), signal, threadId)
+        return
+      }
+      if (!inSession) {
+        // No workspace to keep yet: ask for one like any new topic.
+        await askTopicBinding(chatState, undefined, signal)
+        return
+      }
+      try {
+        await startNewSessionInTopic(chatState, signal)
+      } catch (error) {
+        await send(chat.id, `❌ ${escapeHtml(messageOf(error))}`, signal, threadId)
+      }
       return
     }
 
