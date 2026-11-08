@@ -168,6 +168,20 @@ From an agent: the `telegram_send` tool takes `thread` (the thread id), `text` a
 
 Text is Markdown, converted for Telegram like assistant answers. JPEG, PNG and WebP files up to 10 MB are sent as photos, other files as documents (up to 50 MB).
 
+## Stickers
+
+A sticker sent to the bot (also when replied to) reaches the agent as an image with a note naming its emoji, set and id, plus the meaning saved for it, if any. Static stickers are passed as they are; animated (`.tgs`) and video (`.webm`) stickers use Telegram's thumbnail, or for a video sticker without one, its first frame (ffmpeg, `ffmpegPath`). An animated sticker without a thumbnail comes as the note only.
+
+Every received sticker is kept in a sticker library (`$DSH_HOME/telegram/stickers.json`, previews in `sticker-previews/`), keyed by Telegram's `file_unique_id`, with the `file_id` needed to send it again. The agent's `telegram_sticker` tool works with it:
+
+| Action | Does |
+|---|---|
+| `find` | Search by words in the saved meaning, emoji, set name or title (`query`, `emoji`, `set`, `limit`) |
+| `view` | Show one sticker (`id`) as an image |
+| `note` | Save what a sticker means and when to use it (`id`, `meaning`) |
+| `add_set` | Add every sticker of a set (`set`: its name or `t.me/addstickers/` link) |
+| `send` | Send a sticker (`id`) into a topic (`thread`); recorded in the bound session and the send log like `telegram_send` |
+
 ## Voice messages
 
 Voice messages, audio files and round video messages (also when replied to or forwarded) are downloaded, stored as a DSH file attachment and transcribed. The agent receives a note with the transcript, who transcribed it and the stored file's path, followed by the file itself. When transcription fails or is off, the file is still passed on and the note says why. A recording sent without text gets no "analyze the file" prompt: its transcript is the message.
@@ -252,7 +266,7 @@ node --check client.js
 npm test
 ```
 
-`src/app.js` is the Host runtime: Telegram polling, topic routing and the session bridge. `src/update-ledger.js` persists Telegram update cursors, `src/admission.js` uses the native DSH session queue. `src/formatting.js`, `src/state.js`, `src/status.js`, `src/utils.js`, `src/errors.js`, `src/config.js` and `src/constants.js` hold the supporting layers. `src/index.js` is the public entry point; root `index.js` is the loader-compatible wrapper. Root `client.js` is the loader-compatible client bundle. `src/client.js` contains the client source. `src/message-context.js` turns replies, quotes and forwards into the labelled context the agent reads. `src/topics.js` resolves send targets to thread ids and recognises deleted topics, `src/voice.js` decodes and transcribes recordings, `src/outbox.js` is the file spool behind `bin/dsh-telegram-send.js`, `src/sent-log.js` remembers sent messages for later replies, and `src/steer.js` sends messages into a running turn. The plugin adds one model-facing tool, `telegram_send`, and no system-prompt text.
+`src/app.js` is the Host runtime: Telegram polling, topic routing and the session bridge. `src/update-ledger.js` persists Telegram update cursors, `src/admission.js` uses the native DSH session queue. `src/formatting.js`, `src/state.js`, `src/status.js`, `src/utils.js`, `src/errors.js`, `src/config.js` and `src/constants.js` hold the supporting layers. `src/index.js` is the public entry point; root `index.js` is the loader-compatible wrapper. Root `client.js` is the loader-compatible client bundle. `src/client.js` contains the client source. `src/message-context.js` turns replies, quotes and forwards into the labelled context the agent reads. `src/topics.js` resolves send targets to thread ids and recognises deleted topics, `src/voice.js` decodes and transcribes recordings, `src/outbox.js` is the file spool behind `bin/dsh-telegram-send.js`, `src/sent-log.js` remembers sent messages for later replies, and `src/steer.js` sends messages into a running turn, and `src/stickers.js` is the sticker library. The plugin adds two model-facing tools, `telegram_send` and `telegram_sticker`, and no system-prompt text.
 
 ## License
 

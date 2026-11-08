@@ -65,7 +65,8 @@ export function createSentLog({ path = SENT_LOG_PATH, now = Date.now, onError = 
     /**
      * Remember one send.
      * @param entry - `{ chatId, threadId, topic, messageIds, text, files,
-     *   fromSession, job, label, boundSession, recorded }`.
+     *   sticker, fromSession, job, label, boundSession, recorded }`;
+     *   `sticker` is `{ id, emoji, setName }` when one was sent.
      */
     async record(entry) {
       await load()
@@ -79,6 +80,7 @@ export function createSentLog({ path = SENT_LOG_PATH, now = Date.now, onError = 
         text: text.length > SENT_LOG_MAX_TEXT ? text.slice(0, SENT_LOG_MAX_TEXT) : text,
         textCut: text.length > SENT_LOG_MAX_TEXT ? text.length - SENT_LOG_MAX_TEXT : 0,
         files: Array.isArray(entry.files) ? entry.files : [],
+        ...(entry.sticker === undefined || entry.sticker === null ? {} : { sticker: entry.sticker }),
         fromSession: entry.fromSession ?? null,
         job: entry.job ?? null,
         label: entry.label ?? null,

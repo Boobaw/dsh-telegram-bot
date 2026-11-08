@@ -41,7 +41,8 @@ import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
 import { createOutbox } from './outbox.js'
 import { isAutoCommandTopic, isPlaceholderTitle, isTopicGone, resolveThreadTarget, topicNameOf, topicTask, topicTitle } from './topics.js'
-import { spokenMediaOf, transcribe, transcriptNote } from './voice.js'
+import { runProgram, spokenMediaOf, transcribe, transcriptNote } from './voice.js'
+import { createStickerLibrary, describeSticker, STICKER_PREVIEW_DIR } from './stickers.js'
 import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference, senderLabel } from './message-context.js'
 import { createSentLog } from './sent-log.js'
 import {
@@ -1039,6 +1040,100 @@ export function apply(ctx, config) {
     }
   }
 
+  /** Stickers seen or loaded from sets, with the agent's meaning notes. */
+  const stickerLibrary = createStickerLibrary({ onError: (error) => reportError('sticker-library', error) })
+
+  /**
+   * Image type from the first bytes of a file.
+   * @param data - file bytes.
+   * @returns `{ mediaType, ext }`, or undefined for other data.
+   */
+  function sniffImage(data) {
+    if (data.length >= 12 && data.toString('latin1', 0, 4) === 'RIFF' && data.toString('latin1', 8, 12) === 'WEBP') return { mediaType: 'image/webp', ext: '.webp' }
+    if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return { mediaType: 'image/jpeg', ext: '.jpg' }
+    if (data.length >= 8 && data.toString('latin1', 1, 4) === 'PNG') return { mediaType: 'image/png', ext: '.png' }
+    return undefined
+  }
+
+  /**
+   * A still image of a sticker: the sticker itself when static, otherwise
+   * Telegram's thumbnail, or the first frame of a video sticker (ffmpeg).
+   * Animated (.tgs) stickers without a thumbnail have none. Previews are
+   * cached by sticker id.
+   * @param entry - sticker library entry.
+   * @param signal - request lifetime.
+   * @returns `{ data, mediaType, path }`, or undefined.
+   */
+  async function stickerPreview(entry, signal) {
+    const base = join(STICKER_PREVIEW_DIR, entry.id.replace(/[^\w-]/gu, '_'))
+    for (const ext of ['.webp', '.jpg', '.png']) {
+      try {
+        const data = await readFile(base + ext)
+        const type = sniffImage(data)
+        if (type !== undefined) return { data, mediaType: type.mediaType, path: base + ext }
+      } catch {
+        // Not cached in this format.
+      }
+    }
+    let data
+    if (entry.kind === 'static') data = await downloadTelegramFile(entry.fileId, signal)
+    else if (typeof entry.thumbnailId === 'string') data = await downloadTelegramFile(entry.thumbnailId, signal)
+    else if (entry.kind === 'video') {
+      const video = await downloadTelegramFile(entry.fileId, signal)
+      const scratch = await mkdtemp(join(tmpdir(), 'dsh-telegram-sticker-'))
+      try {
+        await writeFile(join(scratch, 'sticker.webm'), video)
+        data = await runProgram([readLive(config.ffmpegPath, 'ffmpeg'), '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', join(scratch, 'sticker.webm'), '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'png', 'pipe:1'], signal, 30_000)
+      } finally {
+        await rm(scratch, { recursive: true, force: true })
+      }
+    }
+    if (data === undefined) return undefined
+    const type = sniffImage(data)
+    if (type === undefined) return undefined
+    const path = base + type.ext
+    try {
+      await mkdir(STICKER_PREVIEW_DIR, { recursive: true, mode: 0o700 })
+      await writeFile(path, data, { mode: 0o600 })
+    } catch (error) {
+      warn(`sticker preview not cached: ${messageOf(error)}`)
+    }
+    return { data, mediaType: type.mediaType, path }
+  }
+
+  /**
+   * Add a received sticker to the library and give the agent its picture
+   * (when one can be made) and a line naming it, with its saved meaning.
+   * @param sticker - Bot API Sticker.
+   * @param signal - request lifetime.
+   * @returns the image block (or undefined), the note block and a name.
+   */
+  async function saveSticker(sticker, signal) {
+    const [entry] = await stickerLibrary.remember([sticker], { source: 'received' })
+    if (entry === undefined) throw new Error('Telegram sticker has no id')
+    let block
+    let missing = ''
+    try {
+      const preview = await stickerPreview(entry, signal)
+      if (preview !== undefined) {
+        const attachment = await ctx.get('attachments').saveImage({ data: preview.data, mediaType: preview.mediaType, name: `sticker-${entry.id}${extname(preview.path)}` })
+        block = { type: 'image', attachment }
+      } else {
+        missing = '; no still image is available for it'
+      }
+    } catch (error) {
+      if (signal.aborted) throw error
+      warn(`sticker ${entry.id} preview failed: ${messageOf(error)}`)
+      missing = `; its image could not be loaded (${messageOf(error)})`
+    }
+    const meaning = entry.meaning.length > 0 ? `\nSaved meaning: ${entry.meaning}` : '\nNo meaning saved yet; telegram_sticker can save one.'
+    return {
+      block,
+      note: { type: 'text', text: `[Sticker ${describeSticker(entry)}${missing}]${meaning}` },
+      name: `sticker ${entry.id}`,
+    }
+  }
+
   /**
    * Save one Telegram attachment and return its DSH content blocks.
    * @param message - Telegram message carrying a photo, document or recording.
@@ -1050,6 +1145,7 @@ export function apply(ctx, config) {
     if (attachments === undefined) throw new Error('DSH attachment store is unavailable')
     const spoken = spokenMediaOf(message)
     if (spoken !== undefined && message.document === undefined && !Array.isArray(message.photo)) return saveSpokenMedia(message, spoken, signal)
+    if (message.sticker !== undefined && message.document === undefined && !Array.isArray(message.photo)) return saveSticker(message.sticker, signal)
     const photo = Array.isArray(message.photo) ? message.photo.at(-1) : undefined
     const document = message.document
     const fileId = photo?.file_id ?? document?.file_id
@@ -3307,7 +3403,9 @@ export function apply(ctx, config) {
     if (topics.chatId === 0) throw new Error('The bot has no chat yet. Send /start to the bot first.')
     const text = typeof request?.text === 'string' ? request.text : ''
     const paths = Array.isArray(request?.files) ? request.files.map(String) : []
-    if (text.trim().length === 0 && paths.length === 0) throw finalError('Nothing to send: give text or files.')
+    // A sticker library entry (`{ id, fileId, emoji, setName }`).
+    const sticker = typeof request?.sticker?.fileId === 'string' ? request.sticker : undefined
+    if (text.trim().length === 0 && paths.length === 0 && sticker === undefined) throw finalError('Nothing to send: give text, files or a sticker.')
     const chatId = topics.chatId
     let threadId
     try {
@@ -3327,6 +3425,10 @@ export function apply(ctx, config) {
           if (result?.message_id === undefined) throw new Error('Telegram did not accept the message.')
           messageIds.push(result.message_id)
         }
+      }
+      if (sticker !== undefined) {
+        const result = await call('sendSticker', { chat_id: chatId, message_thread_id: threadId, sticker: sticker.fileId }, signal)
+        if (result?.message_id !== undefined) messageIds.push(result.message_id)
       }
       // The bound session sending into its own topic: present later in the
       // same turn skips these files.
@@ -3376,7 +3478,8 @@ export function apply(ctx, config) {
         const agent = ctx.get('agents')?.get(sessionId) ?? await ensureAgent(chat)
         const label = sender.length > 0 ? ` by ${sender}` : ''
         const where = target.name === undefined ? `topic ${threadId}` : `topic "${target.name}"`
-        const content = [{ type: 'text', text: `[Sent to the Telegram ${where}${label}]${text.trim().length > 0 ? `\n${text.trim()}` : ''}` }]
+        const stickerLine = sticker === undefined ? '' : `\n[Sticker ${describeSticker(sticker)}]`
+        const content = [{ type: 'text', text: `[Sent to the Telegram ${where}${label}]${text.trim().length > 0 ? `\n${text.trim()}` : ''}${stickerLine}` }]
         const store = ctx.get('attachments')
         for (const file of files) {
           if (store === undefined) break
@@ -3410,6 +3513,7 @@ export function apply(ctx, config) {
         messageIds,
         text: text.trim(),
         files: files.map((file) => file.name),
+        ...(sticker === undefined ? {} : { sticker: { id: sticker.id ?? null, emoji: sticker.emoji ?? null, setName: sticker.setName ?? null } }),
         fromSession: typeof request?.from?.sessionId === 'string' ? request.from.sessionId : null,
         job: typeof request?.from?.job === 'string' && request.from.job.trim().length > 0 ? request.from.job.trim() : null,
         label: typeof request?.from?.label === 'string' ? request.from.label : null,
@@ -4822,7 +4926,7 @@ export function apply(ctx, config) {
     if (downloadableFile(message) !== undefined) {
       const saved = await saveTelegramAttachment(message, signal)
       if (saved.note !== undefined) attachments.push(saved.note)
-      attachments.push(saved.block)
+      if (saved.block !== undefined) attachments.push(saved.block)
       ownFile = true
     }
     // A replied-to photo or document is attached as well; a failure only
@@ -4837,7 +4941,7 @@ export function apply(ctx, config) {
         try {
           const saved = await saveTelegramAttachment(target, signal)
           if (saved.note !== undefined) attachments.push(saved.note)
-          attachments.push(saved.block)
+          if (saved.block !== undefined) attachments.push(saved.block)
           replyFile = 'attached'
         } catch (error) {
           replyFile = 'failed'
@@ -4857,8 +4961,8 @@ export function apply(ctx, config) {
       }
     }
     let text = composePrompt(message, { botId: me?.id, ownFile, replyFile, sent, currentSession })
-    // A recording speaks for itself through its transcript.
-    if (ownFile && !forwarded && spokenMediaOf(message) === undefined && messageBody(message).trim().length === 0) {
+    // A recording speaks for itself through its transcript, a sticker through its note.
+    if (ownFile && !forwarded && spokenMediaOf(message) === undefined && message.sticker === undefined && messageBody(message).trim().length === 0) {
       const ask = tr('Analyze the attached file.', 'Проанализируй приложенный файл.')
       text = text.length === 0 ? ask : `${text}\n\n${ask}`
     }
@@ -5245,12 +5349,91 @@ export function apply(ctx, config) {
       }, exec?.signal ?? bridgeAbort.signal)
     },
   }
+  /** A library entry as the agent sees it. */
+  const stickerView = (entry) => ({ id: entry.id, emoji: entry.emoji, set: entry.setName, setTitle: entry.setTitle, kind: entry.kind, meaning: entry.meaning })
+
+  /** Model-facing tool for the sticker library; see stickers.js. */
+  const stickerTool = {
+    name: 'telegram_sticker',
+    description: 'Use the Telegram sticker library: stickers the user sent (added automatically) and whole sets you add. find: search by meaning words, emoji or set. view: see one sticker as an image. note: save what a sticker means and when to use it, so find can pick it later. add_set: load every sticker of a set by its name (the part after t.me/addstickers/). send: send a sticker into a topic by thread id; it is recorded in the bound session like telegram_send.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['find', 'view', 'note', 'add_set', 'send'], description: 'What to do.' },
+        id: { type: 'string', description: 'Sticker id from find or from a received sticker (view, note, send).' },
+        query: { type: 'string', description: 'find: words to match in meanings, emoji, set name or title.' },
+        emoji: { type: 'string', description: 'find: only stickers with this emoji.' },
+        set: { type: 'string', description: 'find: only this set. add_set: the set name.' },
+        meaning: { type: 'string', description: 'note: what the sticker shows or says and when to use it; empty clears it.' },
+        thread: { type: 'string', description: 'send: numeric Telegram thread id of the topic.' },
+        limit: { type: 'number', description: 'find: most results (default 20, max 100).' },
+      },
+      required: ['action'],
+    },
+    output: {
+      schema: {},
+      render: (_args, value) => {
+        const { image, ...rest } = value ?? {}
+        const blocks = [{ type: 'text', text: JSON.stringify(rest, null, 2) }]
+        if (image !== undefined && image !== null) blocks.push({ type: 'image', attachment: image })
+        return blocks
+      },
+    },
+    async execute(args, exec) {
+      const signal = exec?.signal ?? bridgeAbort.signal
+      const action = args?.action
+      const known = async () => {
+        const entry = await stickerLibrary.get(typeof args?.id === 'string' ? args.id.trim() : undefined)
+        if (entry === undefined) throw new Error(`Unknown sticker id ${args?.id}; use find to list stickers.`)
+        return entry
+      }
+      if (action === 'find') {
+        const found = await stickerLibrary.find({ query: args.query, emoji: args.emoji, set: args.set, limit: args.limit })
+        return { total: found.total, stickers: found.stickers.map(stickerView) }
+      }
+      if (action === 'view') {
+        const entry = await known()
+        const preview = await stickerPreview(entry, signal)
+        if (preview === undefined) return { sticker: stickerView(entry), note: 'No still image is available for this animated sticker.' }
+        const store = ctx.get('attachments')
+        const image = store === undefined ? undefined : await store.saveImage({ data: preview.data, mediaType: preview.mediaType, name: `sticker-${entry.id}${extname(preview.path)}` })
+        return { sticker: stickerView(entry), path: preview.path, ...(image === undefined ? {} : { image }) }
+      }
+      if (action === 'note') {
+        const entry = await known()
+        return { sticker: stickerView(await stickerLibrary.setMeaning(entry.id, args.meaning ?? '')) }
+      }
+      if (action === 'add_set') {
+        const setName = typeof args.set === 'string' ? args.set.trim().replace(/^https?:\/\/t\.me\/addstickers\//u, '') : ''
+        if (setName.length === 0) throw new Error('set is required: the sticker set name.')
+        const result = await call('getStickerSet', { name: setName }, signal)
+        const stored = await stickerLibrary.remember(Array.isArray(result?.stickers) ? result.stickers : [], { setTitle: result?.title, source: 'set' })
+        return { set: result?.name ?? setName, title: result?.title ?? null, added: stored.length, stickers: stored.map(stickerView) }
+      }
+      if (action === 'send') {
+        const entry = await known()
+        if (typeof args.thread !== 'string' && typeof args.thread !== 'number') throw new Error('thread is required')
+        const sessionId = exec?.agent?.id ?? exec?.agent?.session?.id
+        return sendToTopic({
+          to: args.thread,
+          sticker: entry,
+          from: typeof sessionId === 'string' ? { label: `session ${sessionId}`, sessionId } : undefined,
+        }, signal)
+      }
+      throw new Error('action must be find, view, note, add_set or send')
+    },
+  }
+
   if (typeof ctx.inject === 'function') {
     // Register whenever the Host tool registry is available; the
     // registration ends with this plugin.
-    ctx.inject(['tools'], (scoped) => { scoped.tools.register(sendTool) })
+    ctx.inject(['tools'], (scoped) => {
+      scoped.tools.register(sendTool)
+      scoped.tools.register(stickerTool)
+    })
   } else if (typeof ctx.get('tools')?.register === 'function') {
     ctx.effect(() => ctx.get('tools').register(sendTool), 'dsh-telegram-bot: telegram_send tool')
+    ctx.effect(() => ctx.get('tools').register(stickerTool), 'dsh-telegram-bot: telegram_sticker tool')
   }
 
   /** Requests written by `dsh-telegram-send` or any process with DSH home access. */

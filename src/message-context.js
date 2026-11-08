@@ -40,14 +40,14 @@ export function isForwarded(message) {
 }
 
 /**
- * The photo, document or spoken recording (voice, audio, round video) of a
- * message, when the bot can download it.
+ * The photo, document, spoken recording (voice, audio, round video) or
+ * sticker of a message, when the bot can download it.
  * @param message - Telegram message or external reply.
  * @returns the file kind and size, or undefined.
  */
 export function downloadableFile(message) {
   const photo = Array.isArray(message?.photo) ? message.photo.at(-1) : undefined
-  const candidates = [['photo', photo], ['document', message?.document], ['voice', message?.voice], ['video_note', message?.video_note], ['audio', message?.audio]]
+  const candidates = [['photo', photo], ['document', message?.document], ['voice', message?.voice], ['video_note', message?.video_note], ['audio', message?.audio], ['sticker', message?.sticker]]
   const found = candidates.find(([, file]) => typeof file?.file_id === 'string')
   if (found === undefined) return undefined
   const [kind, file] = found
@@ -192,6 +192,7 @@ export function describeSent(sent, options = {}) {
   if (typeof sent.fromSession === 'string' && sent.fromSession.length > 0) details.push(`from DSH session ${sent.fromSession}`)
   else if (typeof sent.label === 'string' && sent.label.length > 0 && sent.job == null) details.push(`by ${sent.label}`)
   if (Array.isArray(sent.messageIds) && sent.messageIds.length > 1) details.push(`${sent.messageIds.length} Telegram messages`)
+  if (sent.sticker !== undefined && sent.sticker !== null) details.push(`with sticker ${[sent.sticker.emoji, sent.sticker.setName === null || sent.sticker.setName === undefined ? undefined : `from set "${sent.sticker.setName}"`, `(${sent.sticker.id})`].filter(Boolean).join(' ')}`)
   if (Array.isArray(sent.files) && sent.files.length > 0) details.push(`with ${sent.files.length === 1 ? 'file' : 'files'} ${sent.files.map((name) => `"${name}"`).join(', ')}`)
   const bound = typeof sent.boundSession === 'string' ? sent.boundSession : undefined
   if (bound !== undefined && sent.recorded === true && bound !== options.currentSession) details.push(`recorded in session ${bound}, not this one`)
@@ -298,7 +299,11 @@ function mediaKind(message) {
   }
   if (message.voice !== undefined) return 'a voice message'
   if (message.video_note !== undefined) return 'a video message'
-  if (message.sticker !== undefined) return `a sticker${typeof message.sticker.emoji === 'string' ? ` ${message.sticker.emoji}` : ''}`
+  if (message.sticker !== undefined) {
+    const emoji = typeof message.sticker.emoji === 'string' ? ` ${message.sticker.emoji}` : ''
+    const set = typeof message.sticker.set_name === 'string' ? ` from set "${message.sticker.set_name}"` : ''
+    return `a sticker${emoji}${set}`
+  }
   if (message.poll !== undefined) return `a poll "${message.poll.question ?? ''}"`
   if (message.venue !== undefined) return `a venue "${message.venue.title ?? ''}"`
   if (message.location !== undefined) return `a location (${message.location.latitude}, ${message.location.longitude})`

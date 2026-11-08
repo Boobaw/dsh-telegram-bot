@@ -173,7 +173,8 @@ function makeTelegram() {
       }
       if (String(options.path).includes('/file/')) {
         setTimeout(() => {
-          response.emit('data', Buffer.from('file-data'))
+          // Sticker files and thumbnails are WebP images.
+          response.emit('data', String(options.path).includes('sticker') ? Buffer.from('RIFF\0\0\0\0WEBPVP8 data', 'latin1') : Buffer.from('file-data'))
           response.emit('end')
           request.emit('close')
         }, 0)
@@ -198,7 +199,13 @@ function makeTelegram() {
       if (method === 'deleteForumTopic' && undeletable.has(body.message_thread_id)) {
         return deliver({ ok: false, description: 'Bad Request: not enough rights to delete the topic' })
       }
-      if (method === 'sendDocument' || method === 'sendPhoto') {
+      if (method === 'getStickerSet') {
+        return deliver({ ok: true, result: { name: body.name, title: 'Cat Moods', stickers: [
+          { file_id: 'sticker-set-1', file_unique_id: 'U-SET-1', emoji: '😾', set_name: body.name, is_animated: false, is_video: false },
+          { file_id: 'sticker-set-2', file_unique_id: 'U-SET-2', emoji: '😻', set_name: body.name, is_animated: true, is_video: false, thumbnail: { file_id: 'sticker-set-2-thumb' } },
+        ] } })
+      }
+      if (method === 'sendDocument' || method === 'sendPhoto' || method === 'sendSticker') {
         messageId += 1
         return deliver({ ok: true, result: { message_id: messageId } })
       }
@@ -236,6 +243,8 @@ async function start(config = {}, initialState = {}, topicsFile = { chatId: 100 
   await mkdir(STATUS_DIR, { recursive: true })
   // Message ids restart with every fake bot; old sends must not match them.
   await rm(join(STATUS_DIR, 'sent-messages.json'), { force: true })
+  await rm(join(STATUS_DIR, 'stickers.json'), { force: true })
+  await rm(join(STATUS_DIR, 'sticker-previews'), { recursive: true, force: true })
   await writeFile(join(STATUS_DIR, 'state.json'), JSON.stringify({ version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, ...initialState }))
   await writeFile(join(STATUS_DIR, 'topics.json'), JSON.stringify(topicsFile))
   const host = makeHost()
@@ -1426,6 +1435,71 @@ test('each busy topic shows its own "typing…" until its turn ends', async () =
     const stoppedTwo = typing(7002)
     await wait(300)
     assert.equal(typing(7002), stoppedTwo, 'the failed topic stops')
+  } finally {
+    run.stop()
+  }
+})
+
+test('a received sticker reaches the agent as an image with its set, emoji and saved meaning', async () => {
+  const run = await start({}, notifyState)
+  try {
+    const agent = run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    run.telegram.push({ message_thread_id: 7100, sticker: { file_id: 'sticker-hi', file_unique_id: 'U-HI', emoji: '👋', set_name: 'CatWaves', is_animated: false, is_video: false } })
+    await wait(250)
+    const first = agent.received.at(-1)
+    assert.ok(first, 'a turn is started for a lone sticker')
+    const note = first.content.find((block) => block.type === 'text' && block.text.includes('[Sticker'))
+    assert.match(note.text, /\[Sticker 👋 from set "CatWaves" \(sticker U-HI\)\]\nNo meaning saved yet/u)
+    assert.ok(first.content.some((block) => block.type === 'image' && block.attachment.mediaType === 'image/webp'))
+    assert.doesNotMatch(promptText(first), /Analyze the attached file/u)
+    const tool = run.host.tools.get('telegram_sticker')
+    await tool.execute({ action: 'note', id: 'U-HI', meaning: 'waving hello; use as a greeting' }, {})
+    // An animated sticker uses its thumbnail; the saved meaning comes along.
+    run.telegram.push({ message_thread_id: 7100, sticker: { file_id: 'sticker-dance', file_unique_id: 'U-DANCE', emoji: '💃', set_name: 'CatWaves', is_animated: true, is_video: false, thumbnail: { file_id: 'sticker-dance-thumb' } } })
+    await wait(250)
+    const second = agent.received.at(-1)
+    assert.ok(second.content.some((block) => block.type === 'image'))
+    const fetched = run.telegram.calls.filter((call) => call.method === 'getFile').map((call) => call.body.file_id)
+    assert.ok(fetched.includes('sticker-dance-thumb') && !fetched.includes('sticker-dance'), fetched.join(','))
+    run.telegram.push({ message_thread_id: 7100, sticker: { file_id: 'sticker-hi-2', file_unique_id: 'U-HI', emoji: '👋', set_name: 'CatWaves', is_animated: false, is_video: false } })
+    await wait(250)
+    assert.match(promptText(agent.received.at(-1)) + agent.received.at(-1).content.map((block) => block.text ?? '').join('\n'), /Saved meaning: waving hello; use as a greeting/u)
+    const library = JSON.parse(await readFile(join(STATUS_DIR, 'stickers.json'), 'utf8'))
+    assert.equal(library.stickers['U-HI'].fileId, 'sticker-hi-2', 'the newest file id is kept for sending')
+    assert.equal(library.stickers['U-HI'].meaning, 'waving hello; use as a greeting')
+  } finally {
+    run.stop()
+  }
+})
+
+test('telegram_sticker finds, views, loads sets and sends stickers into a topic', async () => {
+  const run = await start({}, notifyState)
+  try {
+    const agent = run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    const tool = run.host.tools.get('telegram_sticker')
+    assert.ok(tool, 'tool registered')
+    const loaded = await tool.execute({ action: 'add_set', set: 'https://t.me/addstickers/CatMoods' }, {})
+    assert.equal(loaded.added, 2)
+    assert.equal(loaded.title, 'Cat Moods')
+    assert.equal(run.telegram.calls.find((call) => call.method === 'getStickerSet').body.name, 'CatMoods')
+    await tool.execute({ action: 'note', id: 'U-SET-1', meaning: 'grumpy, annoyed, no' }, {})
+    assert.deepEqual((await tool.execute({ action: 'find', query: 'annoyed' }, {})).stickers.map((entry) => entry.id), ['U-SET-1'])
+    assert.deepEqual((await tool.execute({ action: 'find', emoji: '😻' }, {})).stickers.map((entry) => entry.id), ['U-SET-2'])
+    assert.equal((await tool.execute({ action: 'find', set: 'catmoods' }, {})).total, 2)
+    const viewed = await tool.execute({ action: 'view', id: 'U-SET-2' }, {})
+    assert.equal(viewed.image.mediaType, 'image/webp')
+    const rendered = tool.output.render({}, viewed)
+    assert.equal(rendered[1].type, 'image')
+    await assert.rejects(tool.execute({ action: 'view', id: 'nope' }, {}), /Unknown sticker id/u)
+    const sent = await tool.execute({ action: 'send', id: 'U-SET-1', thread: '7100' }, { agent: { id: 'session-other' } })
+    const call = run.telegram.calls.find((entry) => entry.method === 'sendSticker')
+    assert.equal(call.body.sticker, 'sticker-set-1')
+    assert.equal(call.body.message_thread_id, 7100)
+    assert.equal(sent.recorded, true)
+    assert.match(agent.injected.at(-1).content[0].text, /\[Sticker 😾 from set "CatMoods" \(Cat Moods\) \(sticker U-SET-1\)\]/u)
+    const log = JSON.parse(await readFile(join(STATUS_DIR, 'sent-messages.json'), 'utf8'))
+    assert.deepEqual(log.entries.at(-1).sticker, { id: 'U-SET-1', emoji: '😾', setName: 'CatMoods' })
+    assert.deepEqual(log.entries.at(-1).messageIds, sent.messageIds)
   } finally {
     run.stop()
   }
