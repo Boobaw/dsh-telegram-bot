@@ -10,6 +10,8 @@ export const POLL_TIMEOUT_SECONDS = 25
 export const RETRY_DELAY_MS = 3000
 /** Coalesce a settings write and a token write into one restart. */
 export const RESTART_DEBOUNCE_MS = 300
+/** Forwarded messages arriving this close together become one prompt. */
+export const FORWARD_BATCH_MS = 1200
 
 /** Loader row id and settings namespace; the npm package name stays dsh-telegram-bot. */
 export const name = 'telegram-bot'

@@ -20,12 +20,13 @@ async function loadState() {
         threads: parsed.threads !== null && typeof parsed.threads === 'object' ? parsed.threads : {},
         updateLedger: parsed.updateLedger !== null && typeof parsed.updateLedger === 'object' && !Array.isArray(parsed.updateLedger) ? parsed.updateLedger : {},
         updateOffset: Number.isSafeInteger(parsed.updateOffset) && parsed.updateOffset >= 0 ? parsed.updateOffset : 0,
+        topicNames: parsed.topicNames !== null && typeof parsed.topicNames === 'object' && !Array.isArray(parsed.topicNames) ? parsed.topicNames : {},
       }
     }
   } catch {
     // Missing or corrupt state is nonfatal; the next session creates a mapping.
   }
-  return { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0 }
+  return { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {} }
 }
 
 /** Durable control-chat id for lifecycle notifications. */
