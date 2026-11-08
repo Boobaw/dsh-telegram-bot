@@ -1,8 +1,8 @@
 /** Host runtime: Telegram polling, topic routing and the DSH session bridge. */
 import { randomUUID } from 'node:crypto'
-import { mkdir, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import https from 'node:https'
-import { basename, resolve } from 'node:path'
+import { basename, extname, isAbsolute, resolve } from 'node:path'
 import {
   BOT_COMMANDS,
   BOT_COMMANDS_RU,
@@ -35,6 +35,8 @@ import { admitText } from './admission.js'
 import { loadState, loadTopics, STATE_PATH, TOPICS_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
+import { createOutbox } from './outbox.js'
+import { resolveTopicTarget, topicNameOf } from './topics.js'
 import {
   allowedChatsOf,
   allowedUsersOf,
@@ -72,7 +74,7 @@ export function apply(ctx, config) {
   /** Invalidates a start that was overtaken by stop/restart. */
   let startEpoch = 0
   /** Durable chat → session mapping. */
-  let state = { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0 }
+  let state = { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {} }
   /** Serializes state-file writes. */
   let stateWrite = Promise.resolve()
   /** Per-chat live bridge state. */
@@ -90,7 +92,19 @@ export function apply(ctx, config) {
     loadState().then((loaded) => { state = loaded }),
     loadTopics().then((loaded) => { topics = loaded }),
   ]).catch((error) => warn(`state load failed: ${messageOf(error)}`))
-    .finally(() => { stateLoaded = true })
+    .finally(() => {
+      stateLoaded = true
+      // Earlier versions renamed topics after their session title, so a stored
+      // title is the best known name of an existing topic.
+      state.topicNames ??= {}
+      for (const record of Object.values(state.sessions)) {
+        if (typeof record?.chatId !== 'number' || typeof record.threadId !== 'number') continue
+        const key = `${record.chatId}:${record.threadId}`
+        if (state.topicNames[key] === undefined && typeof record.title === 'string' && record.title.trim().length > 0) {
+          state.topicNames[key] = record.title.trim()
+        }
+      }
+    })
   /** Ids of legacy follow-up messages the bridge submitted from Telegram. */
   const telegramMessageIds = new Set()
 
@@ -725,13 +739,16 @@ export function apply(ctx, config) {
    * @param signal - runtime lifetime.
    * @returns the method result.
    */
-  async function call(method, payload, signal, timeoutMs = 30_000) {
+  async function call(method, payload, signal, timeoutMs = 30_000, encoded) {
     const token = await resolveToken()
     if (token === undefined) throw new Error('TELEGRAM_BOT_TOKEN is not configured')
     if (process.env.NODE_ENV !== 'test' && payload !== null && typeof payload === 'object' && payload.chat_id !== undefined && method !== 'getUpdates') {
       await paceOutbound(payload.chat_id, signal)
     }
-    const body = JSON.stringify(payload)
+    // `encoded` carries a prepared body (a file upload); `payload` then only
+    // names the chat for pacing.
+    const body = encoded?.body ?? JSON.stringify(payload)
+    const contentType = encoded?.contentType ?? 'application/json'
     // Mirror Hermes' Telegram fallback: try the normal IPv4 path first, then
     // the Bot API seed IPv4 literals with Host/SNI kept on api.telegram.org.
     // Some networks blackhole one family or one anycast path for long polls
@@ -742,7 +759,7 @@ export function apply(ctx, config) {
     for (let attempt = 0; attempt < targets.length + 4; attempt += 1) {
       const target = targets[attempt % targets.length]
       try {
-        return await requestOnce(target, token, method, body, signal, timeoutMs)
+        return await requestOnce(target, token, method, body, signal, timeoutMs, contentType)
       } catch (error) {
         lastError = error
         if (signal.aborted) throw error
@@ -774,7 +791,7 @@ export function apply(ctx, config) {
    * @param timeoutMs - socket inactivity bound.
    * @returns the Bot API result.
    */
-  function requestOnce(target, token, method, body, signal, timeoutMs) {
+  function requestOnce(target, token, method, body, signal, timeoutMs, contentType = 'application/json') {
     return new Promise((resolve, reject) => {
       const options = {
         host: target ?? 'api.telegram.org',
@@ -785,7 +802,7 @@ export function apply(ctx, config) {
         servername: 'api.telegram.org',
         headers: {
           host: 'api.telegram.org',
-          'content-type': 'application/json',
+          'content-type': contentType,
           'content-length': Buffer.byteLength(body),
         },
         timeout: timeoutMs,
@@ -2570,6 +2587,132 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Remember a topic's name so senders can address it by name.
+   * @param chatId - chat holding the topic.
+   * @param threadId - topic thread.
+   * @param name - topic name.
+   * @param authoritative - false fills only an unknown name.
+   */
+  function rememberTopicName(chatId, threadId, name, authoritative) {
+    if (typeof threadId !== 'number' || isAllThread(threadId)) return
+    const key = `${chatId}:${threadId}`
+    state.topicNames ??= {}
+    if (!authoritative && state.topicNames[key] !== undefined) return
+    if (state.topicNames[key] === name) return
+    state.topicNames[key] = name
+    void persistState()
+  }
+
+  /** File types Telegram shows inline as photos. */
+  const PHOTO_TYPES = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' }
+
+  /**
+   * Upload one local file into a topic.
+   * @param chatId - target chat.
+   * @param threadId - topic thread.
+   * @param file - `{ name, data }`.
+   * @param signal - request lifetime.
+   * @returns the Bot API message.
+   */
+  async function uploadFile(chatId, threadId, file, signal) {
+    const photo = PHOTO_TYPES[extname(file.name).toLowerCase()] !== undefined && file.data.length <= 10 * 1024 * 1024
+    const method = photo ? 'sendPhoto' : 'sendDocument'
+    const field = photo ? 'photo' : 'document'
+    const boundary = `----dsh-telegram-${randomUUID()}`
+    const safeName = file.name.replace(/["\r\n]/gu, '_')
+    const parts = [
+      `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`,
+      `--${boundary}\r\nContent-Disposition: form-data; name="message_thread_id"\r\n\r\n${threadId}\r\n`,
+      `--${boundary}\r\nContent-Disposition: form-data; name="${field}"; filename="${safeName}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+    ]
+    const body = Buffer.concat([
+      Buffer.from(parts.join(''), 'utf8'),
+      file.data,
+      Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
+    ])
+    return call(method, { chat_id: chatId }, signal, 120_000, { body, contentType: `multipart/form-data; boundary=${boundary}` })
+  }
+
+  /**
+   * Send text and files into a topic, addressed by name or thread id, and
+   * record them in the session bound to that topic without starting a turn.
+   * The Host service, the agent tool and the file spool all use this.
+   * @param request - `{ topic, text, files, from }`; `from` may hold `label`
+   *   (who sent it) and `sessionId` (a sender session that needs no copy).
+   * @param signal - request lifetime.
+   * @returns where it went and whether the session recorded it.
+   */
+  async function sendToTopic(request, signal = bridgeAbort.signal) {
+    await stateReady
+    if (lifetime === undefined) throw new Error('The Telegram bot is not running.')
+    if (topics.chatId === 0) throw new Error('The bot has no chat yet. Send /start to the bot first.')
+    const text = typeof request?.text === 'string' ? request.text : ''
+    const paths = Array.isArray(request?.files) ? request.files.map(String) : []
+    if (text.trim().length === 0 && paths.length === 0) throw new Error('Nothing to send: give text or files.')
+    const chatId = topics.chatId
+    const target = resolveTopicTarget(state.topicNames, chatId, request?.topic)
+    const threadId = target.threadId
+    // Read every file first, so a bad path fails before anything is sent.
+    const files = []
+    for (const path of paths) {
+      if (!isAbsolute(path)) throw new Error(`File paths must be absolute: ${path}`)
+      const data = await readFile(path)
+      if (data.length > 50 * 1024 * 1024) throw new Error(`${path} is larger than the 50 MB bot upload limit.`)
+      files.push({ path, name: basename(path), data })
+    }
+    const messageIds = []
+    try {
+      if (text.trim().length > 0) {
+        for (const chunk of splitAnswerText(text.trim())) {
+          const result = await sendAnswer(chatId, chunk, signal, threadId)
+          if (result?.message_id === undefined) throw new Error('Telegram did not accept the message.')
+          messageIds.push(result.message_id)
+        }
+      }
+      for (const file of files) {
+        const result = await uploadFile(chatId, threadId, file, signal)
+        if (result?.message_id !== undefined) messageIds.push(result.message_id)
+      }
+    } catch (error) {
+      if (/thread not found|topic.*not found/iu.test(messageOf(error))) {
+        delete state.topicNames[`${chatId}:${threadId}`]
+        await persistState()
+        throw new Error(`Telegram topic ${target.name === undefined ? threadId : `"${target.name}"`} no longer exists.`)
+      }
+      throw error
+    }
+    const sessionId = state.threads[`${chatId}:${threadId}`]
+    let recorded = false
+    if (typeof sessionId === 'string' && sessionId !== request?.from?.sessionId) {
+      const chat = await chatFor(chatId, threadId)
+      const agent = ctx.get('agents')?.get(sessionId) ?? await ensureAgent(chat)
+      const label = typeof request?.from?.label === 'string' && request.from.label.trim().length > 0 ? ` by ${request.from.label.trim()}` : ''
+      const where = target.name === undefined ? `topic ${threadId}` : `topic "${target.name}"`
+      const content = [{ type: 'text', text: `[Sent to the Telegram ${where}${label}]${text.trim().length > 0 ? `\n${text.trim()}` : ''}` }]
+      const store = ctx.get('attachments')
+      for (const file of files) {
+        if (store === undefined) break
+        const mediaType = PHOTO_TYPES[extname(file.name).toLowerCase()]
+        const attachment = mediaType === undefined
+          ? await store.saveFile({ data: file.data, name: file.name })
+          : await store.saveImage({ data: file.data, mediaType, name: file.name })
+        content.push({ type: mediaType === undefined ? 'file' : 'image', attachment })
+      }
+      const id = randomUUID()
+      // A next-step inbox item is durable and waits for whatever turn comes
+      // next; it does not wake the agent. The request id keeps the mirror from
+      // echoing it back into the topic.
+      const message = { id, role: 'user', content, source: { kind: 'user', rpcId: `telegram-post:${id}` } }
+      if (typeof agent?.inject === 'function') agent.inject(message)
+      else if (typeof agent?.send === 'function') agent.send(message, 'next-step', false)
+      else throw new Error('The bound session cannot record messages.')
+      recorded = true
+    }
+    await publishStatus({ lastTopicSend: { threadId, topic: target.name ?? null, at: new Date().toISOString(), recorded } })
+    return { chatId, threadId, topic: target.name ?? null, sessionId: sessionId ?? null, recorded, messageIds }
+  }
+
+  /**
    * Create a DM topic in the control chat.
    * @param chatId - chat with Topics enabled.
    * @param name - topic name.
@@ -2582,7 +2725,10 @@ export function apply(ctx, config) {
     for (const candidate of [clean, `${clean} · ${randomUUID().slice(0, 4)}`]) {
       try {
         const topic = await call('createForumTopic', { chat_id: chatId, name: candidate }, signal)
-        if (typeof topic?.message_thread_id === 'number') return topic.message_thread_id
+        if (typeof topic?.message_thread_id === 'number') {
+          rememberTopicName(chatId, topic.message_thread_id, candidate, true)
+          return topic.message_thread_id
+        }
       } catch (error) {
         const message = messageOf(error).toLowerCase()
         if (message.includes('duplicate') || message.includes('already')) continue
@@ -3419,6 +3565,14 @@ export function apply(ctx, config) {
       lastOutcome: 'received',
       detail: '',
     })
+    const announced = topicNameOf(message)
+    if (announced !== undefined && chat !== undefined && typeof message.message_thread_id === 'number') {
+      try {
+        if (chatAllowed(chat, allowedChatsOf(config))) rememberTopicName(chat.id, message.message_thread_id, announced.name, announced.authoritative)
+      } catch {
+        // A malformed allowlist is reported by the main check below.
+      }
+    }
     const hasAttachment = message.document !== undefined || (Array.isArray(message.photo) && message.photo.length > 0)
     if (((text === undefined || text.length === 0) && !hasAttachment) || from === undefined || chat === undefined) {
       await publishStatus({ lastOutcome: 'ignored' })
@@ -3722,6 +3876,7 @@ export function apply(ctx, config) {
           }, signal)
           if (attempt < 2) await sleep(200, signal)
         }
+        rememberTopicName(chat.id, threadId, name, true)
         await send(chat.id, `✏️ ${tr('Topic renamed', 'Topic переименован')}: <b>${escapeHtml(name)}</b>`, signal, threadId)
       } catch (error) {
         if (record !== undefined) {
@@ -4127,6 +4282,69 @@ export function apply(ctx, config) {
       fireAndForget('restart', () => restart(reason))
     }, RESTART_DEBOUNCE_MS)
   }
+
+  /** Topic sending for other plugins: `ctx.get('telegramTopics').send(...)`. */
+  const topicService = {
+    /**
+     * @param topic - topic name (any case) or numeric thread id.
+     * @param text - Markdown text.
+     * @param files - absolute file paths.
+     * @param options - `{ from: { label, sessionId } }`.
+     */
+    send: (topic, text, files = [], options = {}) => sendToTopic({ topic, text, files, from: options.from }),
+    /** @returns known topic names and thread ids in the bot's chat. */
+    topics: () => Object.entries(state.topicNames ?? {})
+      .filter(([key]) => key.startsWith(`${topics.chatId}:`))
+      .map(([key, name]) => ({ threadId: Number(key.split(':')[1]), name, sessionId: state.threads[key] ?? null })),
+  }
+  if (typeof ctx.provide === 'function') ctx.provide('telegramTopics', topicService)
+
+  /** Model-facing tool for sending into a topic; see sendToTopic. */
+  const sendTool = {
+    name: 'telegram_send',
+    description: 'Send a message, and optionally files, into a Telegram topic of the DSH Telegram bot, addressed by topic name or thread id. The message appears in the topic and is recorded in the session bound to that topic, which sees it on its next turn; no turn is started. Use it to notify the user on Telegram. Fails on an unknown or ambiguous topic name.',
+    parameters: {
+      type: 'object',
+      properties: {
+        topic: { type: 'string', description: 'Topic name (case does not matter) or numeric thread id.' },
+        text: { type: 'string', description: 'Message text; Markdown is converted for Telegram.' },
+        files: { type: 'array', items: { type: 'string' }, description: 'Absolute paths of files to attach.' },
+      },
+      required: ['topic'],
+    },
+    output: {
+      schema: {},
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    },
+    async execute(args, exec) {
+      if (typeof args?.topic !== 'string' && typeof args?.topic !== 'number') throw new Error('topic is required')
+      const sessionId = exec?.agent?.id ?? exec?.agent?.session?.id
+      return sendToTopic({
+        topic: args.topic,
+        text: typeof args.text === 'string' ? args.text : '',
+        files: Array.isArray(args.files) ? args.files : [],
+        from: typeof sessionId === 'string' ? { label: `session ${sessionId}`, sessionId } : undefined,
+      }, exec?.signal ?? bridgeAbort.signal)
+    },
+  }
+  if (typeof ctx.inject === 'function') {
+    // Register whenever the Host tool registry is available; the
+    // registration ends with this plugin.
+    ctx.inject(['tools'], (scoped) => { scoped.tools.register(sendTool) })
+  } else if (typeof ctx.get('tools')?.register === 'function') {
+    ctx.effect(() => ctx.get('tools').register(sendTool), 'dsh-telegram-bot: telegram_send tool')
+  }
+
+  /** Requests written by `dsh-telegram-send` or any process with DSH home access. */
+  const outbox = createOutbox({
+    handle: (request) => sendToTopic(request),
+    ready: () => lifetime !== undefined && topics.chatId !== 0 && !bridgeAbort.signal.aborted,
+    onError: (error) => reportError('outbox', error),
+  })
+  ctx.effect(() => {
+    void stateReady.then(() => outbox.start()).catch((error) => reportError('outbox', error))
+    return () => outbox.stop()
+  }, 'dsh-telegram-bot: outbox')
 
   // Host-wide feeds: every session's events, whichever client started the
   // turn. Only sessions bound to a topic are mirrored.

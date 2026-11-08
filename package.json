@@ -4,6 +4,9 @@
   "description": "Telegram sessions, topics, model controls and approvals for DeepSeek Harness.",
   "type": "module",
   "main": "./index.js",
+  "bin": {
+    "dsh-telegram-send": "./bin/dsh-telegram-send.js"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -13,6 +16,7 @@
     ".\"": "./index.js"
   },
   "files": [
+    "bin",
     "client.js",
     "index.js",
     "cordis.patch.yml",

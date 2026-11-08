@@ -106,6 +106,34 @@ A correct configuration contains:
 "usersCanCreateTopics": true
 ```
 
+## Send to a topic
+
+Scripts, scheduled jobs, other plugins and agents can post into a topic by its name or thread id. The message (text and files) appears in the topic and is also recorded in the session bound to that topic, without starting a turn: whoever answers there next sees it, even after `/new`. A name that matches no topic, or more than one, is an error; nothing is created.
+
+Names ignore case. The bot learns a topic's name when it creates the topic, when Telegram reports a topic being created or renamed, and on `/rename`. Topics bound by an earlier version start with their last title. `/id` in a topic shows its thread id.
+
+From a shell (no bot token needed):
+
+```bash
+dsh-telegram-send --topic notify "Backup finished"
+some-report | dsh-telegram-send --topic notify --from nightly-report
+dsh-telegram-send --topic 7100 --file /tmp/report.pdf "Monthly report"
+```
+
+The command writes the request into `$DSH_HOME/telegram/outbox/` and waits up to `--timeout` seconds (default 30) for the plugin's answer. Exit codes: `0` sent, `1` failed (the error is printed, for example an unknown topic), `2` bad arguments, `3` still queued (the bot sends it once it runs). `--no-wait` returns right after queueing. The spool keeps requests while DSH is stopped, which is why it is a directory and not a socket; a request interrupted by a restart is sent again. The command is installed as the package's `bin`; link it onto your `PATH` if needed (`node_modules/.bin/dsh-telegram-send` in the profile).
+
+From another Host plugin:
+
+```js
+const result = await ctx.get('telegramTopics').send('notify', 'Backup **finished**', ['/tmp/report.pdf'], { from: { label: 'backup' } })
+// { chatId, threadId, topic, sessionId, recorded, messageIds }
+ctx.get('telegramTopics').topics() // [{ threadId, name, sessionId }]
+```
+
+From an agent: the `telegram_send` tool takes `topic`, `text` and `files` (absolute paths). The sending session does not get a copy of its own message.
+
+Text is Markdown, converted for Telegram like assistant answers. JPEG, PNG and WebP files up to 10 MB are sent as photos, other files as documents (up to 50 MB). A topic with no session only shows the message.
+
 ## Plugins page
 
 The plugin page is informational. It points to **Settings → Telegram** and lists the manual configuration files. Use the bundle switch there to enable or disable the plugin; **Enable bot** is a soft pause that keeps the plugin loaded but stops polling.
@@ -175,7 +203,7 @@ node --check client.js
 npm test
 ```
 
-`src/app.js` is the Host runtime: Telegram polling, topic routing and the session bridge. `src/update-ledger.js` persists Telegram update cursors, `src/admission.js` uses the native DSH session queue. `src/formatting.js`, `src/state.js`, `src/status.js`, `src/utils.js`, `src/errors.js`, `src/config.js` and `src/constants.js` hold the supporting layers. `src/index.js` is the public entry point; root `index.js` is the loader-compatible wrapper. Root `client.js` is the loader-compatible client bundle. `src/client.js` contains the client source. The plugin adds no model-facing tools or system-prompt text; it connects Telegram to the existing DSH agent.
+`src/app.js` is the Host runtime: Telegram polling, topic routing and the session bridge. `src/update-ledger.js` persists Telegram update cursors, `src/admission.js` uses the native DSH session queue. `src/formatting.js`, `src/state.js`, `src/status.js`, `src/utils.js`, `src/errors.js`, `src/config.js` and `src/constants.js` hold the supporting layers. `src/index.js` is the public entry point; root `index.js` is the loader-compatible wrapper. Root `client.js` is the loader-compatible client bundle. `src/client.js` contains the client source. `src/topics.js` resolves topic names and `src/outbox.js` is the file spool behind `bin/dsh-telegram-send.js`. The plugin adds one model-facing tool, `telegram_send`, and no system-prompt text.
 
 ## License
 

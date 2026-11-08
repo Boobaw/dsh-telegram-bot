@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import test from 'node:test'
 import https from 'node:https'
 import { STATUS_DIR } from '../src/constants.js'
+import { enqueue, waitForResult } from '../src/outbox.js'
+import { resolveTopicTarget, topicNameOf } from '../src/topics.js'
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -36,6 +38,8 @@ function makeHost() {
       status: 'idle',
       received: [],
       followup(message) { this.received.push(message) },
+      injected: [],
+      inject(message) { this.injected.push(message) },
       whenIdle() { return wait(20) },
       cancel() {},
       /** Emit one agent-scoped event to the agent and to global listeners. */
@@ -76,14 +80,22 @@ function makeHost() {
       create: async () => ({ id: 'workspace-new', attachSession() {} }),
     },
     llm: { listModels: async () => [], resolveModel: async () => ({ context: { contextWindow: 1_000_000 } }) },
+    attachments: {
+      async saveFile({ data, name }) { return { attachmentId: `file-${name}`, name, bytes: data.length } },
+      async saveImage({ data, name, mediaType }) { return { attachmentId: `image-${name}`, name, bytes: data.length, mediaType, width: 1, height: 1 } },
+    },
+    tools: { register(definition) { tools.set(definition.name, definition); return () => tools.delete(definition.name) } },
   }
+  const provided = {}
+  const tools = new Map()
   const ctx = {
+    provide(name, value) { provided[name] = value },
     logger: { info(message) { logs.push(`I ${message}`) }, warn(message) { logs.push(`W ${message}`) } },
     get: (name) => services[name],
     on(name, fn) { hostEvents.on(name, fn); return () => hostEvents.off(name, fn) },
     effect(fn) { cleanups.push(fn()) },
   }
-  return { ctx, live, created, logs, makeAgent, sessionRecords, cleanup: () => { for (const fn of cleanups) fn?.() } }
+  return { ctx, live, created, logs, makeAgent, sessionRecords, provided, tools, cleanup: () => { for (const fn of cleanups) fn?.() } }
 }
 
 /**
@@ -113,7 +125,14 @@ function makeTelegram() {
       }, delay)
     }
     request.end = (value = '') => {
-      const body = value.length > 0 ? JSON.parse(value) : undefined
+      let body
+      try {
+        body = value.length > 0 ? JSON.parse(String(value)) : undefined
+      } catch {
+        // A multipart upload; keep the raw form fields for assertions.
+        const raw = Buffer.from(value).toString('latin1')
+        body = { raw, message_thread_id: Number(/name="message_thread_id"\r\n\r\n(\d+)/u.exec(raw)?.[1]) }
+      }
       if (method === 'getMe') return deliver({ ok: true, result: { id: 1, username: 'testbot' } })
       if (method === 'getUpdates') return deliver({ ok: true, result: pending.splice(0) }, 15)
       calls.push({ method, body })
@@ -124,6 +143,10 @@ function makeTelegram() {
       if (method === 'editForumTopic') {
         if (missingThreads.has(body.message_thread_id)) return deliver({ ok: false, description: 'Bad Request: message thread not found' })
         return deliver({ ok: true, result: true })
+      }
+      if (method === 'sendDocument' || method === 'sendPhoto') {
+        messageId += 1
+        return deliver({ ok: true, result: { message_id: messageId } })
       }
       if (method === 'sendMessage' || method === 'editMessageText') {
         messageId += 1
@@ -420,6 +443,88 @@ test('a Telegram message during a Web turn waits for that turn', async () => {
     agent.emit('session/event', { id: 'session-1' }, { type: 'turn/end', data: { turn: 5, reason: { kind: 'completed' } } })
     await wait(150)
     assert.equal(agent.received.at(-1).content[0].text, 'queued from phone')
+  } finally {
+    run.stop()
+  }
+})
+
+
+test('topic targets resolve by name without case, or by thread id', () => {
+  const names = { '100:7001': 'Notify', '100:7002': 'chat', '100:7003': 'Chat', '200:9': 'notify' }
+  assert.deepEqual(resolveTopicTarget(names, 100, 'NOTIFY'), { threadId: 7001, name: 'Notify' })
+  assert.deepEqual(resolveTopicTarget(names, 100, '7002'), { threadId: 7002, name: 'chat' })
+  assert.deepEqual(resolveTopicTarget(names, 100, 4242), { threadId: 4242, name: undefined })
+  assert.throws(() => resolveTopicTarget(names, 100, 'chat'), /Several topics are named "chat" \(thread ids 7002, 7003\)/)
+  assert.throws(() => resolveTopicTarget(names, 100, 'missing'), /Unknown Telegram topic "missing"/)
+  assert.equal(topicNameOf({ forum_topic_edited: { name: 'Alerts' } }).name, 'Alerts')
+  assert.equal(topicNameOf({ reply_to_message: { forum_topic_created: { name: 'Old' } } }).authoritative, false)
+})
+
+/** State with one topic named "Notify" bound to session-notify. */
+const notifyState = {
+  sessions: { 'session-notify': { sessionId: 'session-notify', chatId: 100, threadId: 7100, title: 'Notify', cwd: '/tmp/default-workspace', updatedAt: 1 } },
+  threads: { '100:7100': 'session-notify' },
+}
+
+test('the Host service posts into a named topic and records it in the bound session', async () => {
+  const run = await start({}, notifyState)
+  try {
+    const agent = run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    const file = join(STATUS_DIR, 'report.txt')
+    await writeFile(file, 'report body')
+    const result = await run.host.provided.telegramTopics.send('notify', 'Backup **done**', [file], { from: { label: 'backup job' } })
+    assert.equal(result.threadId, 7100)
+    assert.equal(result.recorded, true)
+    assert.ok(sent(run.telegram.calls, 7100).some((call) => call.body.text.includes('Backup')))
+    assert.equal(run.telegram.calls.filter((call) => call.method === 'sendDocument' && call.body.message_thread_id === 7100).length, 1)
+    assert.equal(agent.received.length, 0, 'no turn is started')
+    assert.equal(agent.injected.length, 1)
+    const content = agent.injected[0].content
+    assert.match(content[0].text, /^\[Sent to the Telegram topic "Notify" by backup job\]\nBackup \*\*done\*\*/)
+    assert.equal(content[1].type, 'file')
+    assert.match(agent.injected[0].source.rpcId, /^telegram-post:/)
+    await assert.rejects(run.host.provided.telegramTopics.send('nope', 'x'), /Unknown Telegram topic "nope"/)
+  } finally {
+    run.stop()
+  }
+})
+
+test('a renamed topic is found by its new name and keeps its target after /new', async () => {
+  const run = await start({}, notifyState)
+  try {
+    run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    run.telegram.push({ message_thread_id: 7100, forum_topic_edited: { name: 'Alerts' } })
+    await wait(100)
+    await assert.rejects(run.host.provided.telegramTopics.send('notify', 'x'), /Unknown Telegram topic/)
+    run.telegram.push({ message_thread_id: 7100, text: '/new' })
+    await wait(200)
+    const result = await run.host.provided.telegramTopics.send('ALERTS', 'after new')
+    assert.equal(result.threadId, 7100)
+    assert.equal(result.sessionId, 'session-1')
+    assert.equal(run.host.live.get('session-1').injected.length, 1)
+  } finally {
+    run.stop()
+  }
+})
+
+test('the agent tool and the file spool use the same path', async () => {
+  const run = await start({}, notifyState)
+  try {
+    const agent = run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    const tool = run.host.tools.get('telegram_send')
+    assert.ok(tool, 'tool registered')
+    const own = await tool.execute({ topic: 'Notify', text: 'from my own session' }, { agent: { id: 'session-notify' } })
+    assert.equal(own.recorded, false, 'the sending session gets no copy of its own message')
+    const other = await tool.execute({ topic: 'Notify', text: 'from elsewhere' }, { agent: { id: 'session-other' } })
+    assert.equal(other.recorded, true)
+    const id = await enqueue({ topic: 'notify', text: 'from cron', from: { label: 'cron' } })
+    const result = await waitForResult(id, 3000)
+    assert.equal(result?.ok, true, JSON.stringify(result))
+    assert.equal(result.result.threadId, 7100)
+    const bad = await waitForResult(await enqueue({ topic: 'missing', text: 'x' }), 3000)
+    assert.equal(bad.ok, false)
+    assert.match(bad.error, /Unknown Telegram topic/)
+    assert.equal(agent.injected.length, 2)
   } finally {
     run.stop()
   }
