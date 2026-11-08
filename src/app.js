@@ -2897,10 +2897,30 @@ export function apply(ctx, config) {
       // Part of it is in Telegram already; sending again would repeat that part.
       throw messageIds.length > 0 ? finalError(`${messageOf(error)} (after ${messageIds.length} message(s) were sent)`) : error
     }
-    const sessionId = state.threads[`${chatId}:${threadId}`]
+    let sessionId = state.threads[`${chatId}:${threadId}`]
     const sender = senderOf(request?.from)
     let recorded = false
     let recordError
+    let note
+    if (typeof sessionId !== 'string') {
+      // A known topic without a session gets one, as /new would make, so the
+      // message is recorded. A topic whose user is choosing a session is left
+      // to that choice.
+      const chat = await chatFor(chatId, threadId)
+      if (chat.bindPickerShown === true) {
+        note = 'The topic is waiting for someone to choose its session; the message was only sent to Telegram.'
+      } else {
+        try {
+          chat.cwd = cwdOf()
+          await ensureAgent(chat)
+          sessionId = chat.sessionId
+          info(`opened session ${sessionId} for topic ${threadId} to record a send`)
+        } catch (error) {
+          recordError = `no session could be opened for the topic: ${messageOf(error)}`
+          reportError('topic-send-open', error)
+        }
+      }
+    }
     if (typeof sessionId === 'string' && sessionId !== request?.from?.sessionId) {
       try {
         const chat = await chatFor(chatId, threadId)
@@ -2958,7 +2978,7 @@ export function apply(ctx, config) {
       sessionId: sessionId ?? null,
       recorded,
       ...(recordError === undefined ? {} : { recordError }),
-      ...(typeof sessionId === 'string' ? {} : { note: 'The topic has no bound session; the message was only sent to Telegram.' }),
+      ...(note === undefined ? {} : { note }),
       messageIds,
     }
   }

@@ -613,13 +613,22 @@ test('a long send from a job is recorded with its sender, and a reply after /new
   }
 })
 
-test('a topic without a session, or a session that cannot record, still gets the message', async () => {
+test('a known topic without a session gets one like /new, and a session that cannot record still gets the message', async () => {
   const run = await start({}, { threads: {}, topicNames: { '100:7200': 'Loose' } })
   try {
     const unbound = await run.host.provided.telegramTopics.send({ to: '7200', text: 'hello', files: [], from: { job: 'probe' } })
-    assert.equal(unbound.recorded, false)
-    assert.match(unbound.note, /no bound session/u)
     assert.equal(sent(run.telegram.calls, 7200).length, 1)
+    assert.equal(unbound.sessionId, 'session-1')
+    assert.equal(unbound.recorded, true)
+    assert.equal(unbound.note, undefined)
+    assert.equal(run.host.created[0].cwd, '/tmp/default-workspace', 'the configured working directory')
+    const opened = run.host.live.get('session-1')
+    assert.equal(opened.turns, 1, 'never left blank')
+    assert.equal(opened.received.length, 0)
+    assert.equal(opened.session.title, 'TG · Loose')
+    assert.match(opened.injected[0].content[0].text, /^\[Sent to the Telegram topic "Loose" by job "probe"\]\nhello$/u)
+    const state = await run.readState()
+    assert.equal(state.threads['100:7200'], 'session-1')
   } finally {
     run.stop()
   }
