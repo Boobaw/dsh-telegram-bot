@@ -55,6 +55,24 @@ function makeHost() {
       followup(message) { followupThroughGate(this, events, message) },
       injected: [],
       inject(message) { this.injected.push(message) },
+      /** Messages sent into a running turn; the test plays what DSH does next. */
+      steered: [],
+      steer(message) {
+        this.steered.push(message)
+        this.inbox.nextStep.push(message)
+        this.onSteer?.(message)
+      },
+      inbox: {
+        nextStep: [],
+        nextTurn: [],
+        get hasPending() { return this.nextStep.length > 0 || this.nextTurn.length > 0 },
+        remove(id) {
+          for (const list of [this.nextStep, this.nextTurn]) {
+            const index = list.findIndex((message) => message.id === id)
+            if (index !== -1) list.splice(index, 1)
+          }
+        },
+      },
       whenIdle() { return wait(20) },
       cancel() {},
       /** Emit one agent-scoped event to the agent and to global listeners. */
@@ -467,8 +485,8 @@ test('scheduled turns are labelled, and mirroring can be turned off', async () =
   }
 })
 
-test('a Telegram message during a Web turn waits for that turn', async () => {
-  const run = await start()
+test('with busyMessages: queue, a Telegram message during a Web turn waits for that turn', async () => {
+  const run = await start({ busyMessages: 'queue' })
   try {
     run.telegram.push({ message_thread_id: 1, text: 'hello' })
     await wait(200)
@@ -486,6 +504,150 @@ test('a Telegram message during a Web turn waits for that turn', async () => {
   }
 })
 
+
+/**
+ * Open topic 7001, then start a second Telegram turn that keeps running until
+ * the test ends it (DSH would report `running`).
+ * @returns the session's fake agent.
+ */
+async function runningTelegramTurn(run) {
+  run.telegram.push({ message_thread_id: 1, text: 'hello' })
+  await wait(250)
+  const agent = run.host.live.get('session-1')
+  agent.whenIdle = () => new Promise(() => {})
+  run.telegram.push({ message_thread_id: 7001, text: 'long task' })
+  await wait(120)
+  agent.status = 'running'
+  agent.emit('session/event', { id: 'session-1' }, { type: 'turn/start', data: { turn: 2 } })
+  return agent
+}
+
+const reactions = (calls) => calls.filter((call) => call.method === 'setMessageReaction')
+const queueNotes = (calls) => calls.filter((call) => call.method === 'sendMessage' && String(call.body.text).includes('Accepted into the session queue'))
+
+test('a Telegram message during a Web turn goes into that turn', async () => {
+  const run = await start()
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'hello' })
+    await wait(200)
+    const agent = run.host.live.get('session-1')
+    agent.status = 'running'
+    agent.emit('session/event', { id: 'session-1' }, { type: 'turn/start', data: { turn: 5 } })
+    run.telegram.push({ message_thread_id: 7001, text: 'steer from phone' })
+    await wait(120)
+    assert.equal(agent.received.length, 1, 'no turn of its own')
+    assert.equal(agent.steered.length, 1)
+    assert.equal(promptText(agent.steered[0]), '[Telegram message from user id 42]\nsteer from phone')
+    assert.match(agent.steered[0].source.rpcId, /^telegram:100:\d+$/u)
+    const reacted = reactions(run.telegram.calls)
+    assert.equal(reacted.length, 1, 'the message gets a reaction')
+    assert.deepEqual(reacted[0].body.reaction, [{ type: 'emoji', emoji: '👀' }])
+    assert.equal(queueNotes(run.telegram.calls).length, 0)
+    // The steered message is not echoed back when DSH records it.
+    const before = run.telegram.calls.length
+    agent.emit('session/event', { id: 'session-1' }, { type: 'user/message', data: { ...agent.steered[0], id: 'recorded' } })
+    await wait(50)
+    assert.deepEqual(texts(run.telegram.calls.slice(before), 7001), [])
+  } finally {
+    run.stop()
+  }
+})
+
+test('a photo sent during a Telegram turn is steered with its image', async () => {
+  const run = await start()
+  try {
+    const agent = await runningTelegramTurn(run)
+    run.telegram.push({ message_thread_id: 7001, caption: 'also this one', photo: [{ file_id: 'small', file_size: 5 }, { file_id: 'big', file_size: 9 }] })
+    await wait(200)
+    assert.equal(agent.received.length, 2, 'only the two turn-opening prompts were follow-ups')
+    assert.equal(agent.steered.length, 1)
+    const message = agent.steered[0]
+    assert.equal(message.content.filter((block) => block.type === 'image').length, 1)
+    assert.match(promptText(message), /also this one/u)
+    assert.match(message.source.rpcId, /^telegram:100:\d+$/u)
+    assert.equal(reactions(run.telegram.calls).length, 1)
+    // The turn then ends normally and its answer lands in the topic.
+    agent.inbox.nextStep.splice(0)
+    agent.emit('agent/assistant-stream', { agent, frame: { type: 'chunk', chunk: { type: 'text-delta', text: 'both done' } } })
+    agent.emit('session/event', { id: 'session-1' }, { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+    await wait(150)
+    assert.ok(texts(run.telegram.calls, 7001).some((text) => text.includes('both done')))
+  } finally {
+    run.stop()
+  }
+})
+
+for (const mirrorTurns of [true, false]) {
+  test(`a message that lands as the turn ends gets a new turn, shown in the topic (mirrorTurns ${mirrorTurns})`, async () => {
+    const run = await start({ mirrorTurns })
+    try {
+      const agent = await runningTelegramTurn(run)
+      const session = { id: 'session-1' }
+      agent.onSteer = (message) => {
+        // DSH ended turn 2 just as the message arrived: it stays in the inbox,
+        // so DSH starts turn 3 for it right away.
+        agent.emit('agent/assistant-stream', { agent, frame: { type: 'chunk', chunk: { type: 'text-delta', text: 'first answer' } } })
+        agent.emit('session/event', session, { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+        setTimeout(() => {
+          agent.inbox.nextStep.splice(0)
+          agent.emit('session/event', session, { type: 'turn/start', data: { turn: 3 } })
+          agent.emit('session/event', session, { type: 'user/message', data: { ...message, id: 'claimed' } })
+          agent.emit('agent/assistant-stream', { agent, frame: { type: 'chunk', chunk: { type: 'text-delta', text: 'answer to the late one' } } })
+          agent.emit('session/event', session, { type: 'assistant/message', data: { turn: 3, step: 1, message: { content: [{ type: 'text', text: 'answer to the late one' }] } } })
+          agent.emit('session/event', session, { type: 'turn/end', data: { turn: 3, reason: { kind: 'completed' } } })
+          agent.status = 'idle'
+        }, 5)
+      }
+      run.telegram.push({ message_thread_id: 7001, text: 'late message' })
+      await wait(400)
+      assert.equal(agent.steered.length, 1, 'delivered once')
+      assert.equal(agent.received.length, 2, 'not also sent as a follow-up')
+      assert.equal(queueNotes(run.telegram.calls).length, 0)
+      const shown = texts(run.telegram.calls, 7001)
+      assert.ok(shown.some((text) => text.includes('first answer')), shown.join('\n---\n'))
+      assert.ok(shown.some((text) => text.includes('answer to the late one')), shown.join('\n---\n'))
+      assert.equal(shown.filter((text) => text.includes('late message')).length, 0, 'the prompt is not echoed')
+      // With mirroring off, following ends with that turn.
+      if (!mirrorTurns) {
+        const before = run.telegram.calls.length
+        await playExternalTurn(agent, 4, { id: 'w', role: 'user', content: [{ type: 'text', text: 'web' }], source: { kind: 'user' } }, 'hidden answer')
+        assert.deepEqual(texts(run.telegram.calls.slice(before), 7001), [])
+      }
+    } finally {
+      run.stop()
+    }
+  })
+}
+
+test('/clear drops steered messages the agent has not taken yet', async () => {
+  const run = await start()
+  try {
+    const agent = await runningTelegramTurn(run)
+    run.telegram.push({ message_thread_id: 7001, text: 'never mind this' })
+    await wait(150)
+    assert.equal(agent.inbox.nextStep.length, 1)
+    run.telegram.push({ message_thread_id: 7001, text: '/clear' })
+    await wait(150)
+    assert.equal(agent.inbox.nextStep.length, 0)
+    assert.ok(texts(run.telegram.calls, 7001).some((text) => text.includes('Cleared queued messages') && text.includes('1')))
+  } finally {
+    run.stop()
+  }
+})
+
+test('a message falls back to the bot queue when this DSH cannot steer', async () => {
+  const run = await start()
+  try {
+    const agent = await runningTelegramTurn(run)
+    agent.steer = undefined
+    run.telegram.push({ message_thread_id: 7001, text: 'old dsh' })
+    await wait(150)
+    assert.equal(queueNotes(run.telegram.calls).length, 1)
+    assert.equal(agent.received.length, 2)
+  } finally {
+    run.stop()
+  }
+})
 
 test('send targets are thread ids the bot knows; names are not addresses', () => {
   const known = new Set([7001, 7002])

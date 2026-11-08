@@ -43,6 +43,12 @@ export const Config = z.object({
    */
   mirrorTurns: z.boolean().default(true).volatile(),
   /**
+   * Telegram messages sent while the session's turn runs: `steer` sends them
+   * into that turn (the agent sees them at its next step, like a message typed
+   * in the Web UI during a turn); `queue` holds them until the turn ends.
+   */
+  busyMessages: z.union(['steer', 'queue']).default('steer').volatile(),
+  /**
    * How voice messages, audio files and round video messages are turned into
    * text: `dsh` uses the DSH speech-to-text service (decoded with ffmpeg),
    * `command` runs `transcribeCommand`, `off` passes only the file.

@@ -34,7 +34,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Leave **Disallow users
 - `/workspace` moves the topic to another workspace: pick the workspace, then a new or existing session there. A session's working directory is fixed when it is created, so the previous session is not continued in this topic; it stays in DSH and can be bound again later as an existing session.
 - Two-way sync: turns started anywhere else (Web UI, scheduled tasks, other plugins) also appear in the session's topic. The prompt is shown with a **From Web** or **Scheduled task** label, followed by the streamed answer. Messages sent from Telegram are not echoed back, and context that plugins add on their own (time, runtime notes) is not shown. A Telegram message sent while such a turn runs waits for it. Approvals and questions from those turns are answered where the turn started. Turn this off with **Show turns from other clients**.
 - `/sessions` lists workspaces and existing sessions, and can create a new session in a selected workspace.
-- Assistant answers stream into the topic with Telegram Markdown formatting. Messages sent while the agent is working are queued and processed after the current turn; `/clear` removes that queue without stopping the current answer.
+- Assistant answers stream into the topic with Telegram Markdown formatting. A message sent while the agent is working (text, photos, files, voice, forwards, replies) goes into the running turn, the way a message typed into the DSH Web UI during a turn does: the agent sees it at its next step, and the message gets a 👀 reaction (a short note where reactions are unavailable). If the turn ends just as the message arrives, DSH starts a new turn for it, and that turn's answer appears in the topic. `/clear` removes Telegram messages the agent has not picked up yet without stopping the current answer. Set `busyMessages: queue` to hold such messages until the turn ends instead.
 - Reasoning and tool calls are shown as temporary messages and removed after the answer. Each tool-call entry is capped at two lines.
 - Inline controls for model, reasoning effort, permission mode and context usage.
 - Tool approvals with **Deny** / **Allow** buttons.
@@ -89,6 +89,7 @@ Restart `dsh web` after installing or updating the plugin. Then open **Settings 
 | Show model thinking | Show reasoning in a temporary message |
 | Show tool calls | Show tool calls in a temporary message |
 | Show turns from other clients (`mirrorTurns`) | Mirror turns started outside Telegram into the bound topic; default on |
+| `busyMessages` | `steer` (default): messages sent during a turn go into it; `queue`: they wait until the turn ends |
 | `transcriber` | `dsh` (default), `command` or `off`; see [Voice messages](#voice-messages) |
 | `transcribeLanguage` | Language hint for DSH speech-to-text, such as `zh` or `en`; empty uses its own setting |
 | `transcribeCommand` | Program and arguments for `transcriber: command` |
@@ -96,7 +97,7 @@ Restart `dsh web` after installing or updating the plugin. Then open **Settings 
 | Bot language | `en` (default) or `ru` |
 | Enable bot | Start or pause Telegram polling |
 
-The voice fields have no controls on the settings page yet; set them in the profile's `cordis.patch.yml` under the `telegram-bot` row's `config`.
+The voice fields and `busyMessages` have no controls on the settings page yet; set them in the profile's `cordis.patch.yml` under the `telegram-bot` row's `config`.
 
 The token field only reports whether a token is configured. A token supplied through the environment cannot be overwritten from the page.
 
@@ -249,7 +250,7 @@ node --check client.js
 npm test
 ```
 
-`src/app.js` is the Host runtime: Telegram polling, topic routing and the session bridge. `src/update-ledger.js` persists Telegram update cursors, `src/admission.js` uses the native DSH session queue. `src/formatting.js`, `src/state.js`, `src/status.js`, `src/utils.js`, `src/errors.js`, `src/config.js` and `src/constants.js` hold the supporting layers. `src/index.js` is the public entry point; root `index.js` is the loader-compatible wrapper. Root `client.js` is the loader-compatible client bundle. `src/client.js` contains the client source. `src/message-context.js` turns replies, quotes and forwards into the labelled context the agent reads. `src/topics.js` resolves send targets to thread ids and recognises deleted topics, `src/voice.js` decodes and transcribes recordings, `src/outbox.js` is the file spool behind `bin/dsh-telegram-send.js`, and `src/sent-log.js` remembers sent messages for later replies. The plugin adds one model-facing tool, `telegram_send`, and no system-prompt text.
+`src/app.js` is the Host runtime: Telegram polling, topic routing and the session bridge. `src/update-ledger.js` persists Telegram update cursors, `src/admission.js` uses the native DSH session queue. `src/formatting.js`, `src/state.js`, `src/status.js`, `src/utils.js`, `src/errors.js`, `src/config.js` and `src/constants.js` hold the supporting layers. `src/index.js` is the public entry point; root `index.js` is the loader-compatible wrapper. Root `client.js` is the loader-compatible client bundle. `src/client.js` contains the client source. `src/message-context.js` turns replies, quotes and forwards into the labelled context the agent reads. `src/topics.js` resolves send targets to thread ids and recognises deleted topics, `src/voice.js` decodes and transcribes recordings, `src/outbox.js` is the file spool behind `bin/dsh-telegram-send.js`, `src/sent-log.js` remembers sent messages for later replies, and `src/steer.js` sends messages into a running turn. The plugin adds one model-facing tool, `telegram_send`, and no system-prompt text.
 
 ## License
 

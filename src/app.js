@@ -34,6 +34,7 @@ import {
   toolArg,
 } from './formatting.js'
 import { admitText } from './admission.js'
+import { STEER_REACTION, busyMode, clearTelegramInbox, hasPendingInput, steerPrompt } from './steer.js'
 import { loadState, loadTopics, STATE_PATH, TOPICS_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
@@ -2273,9 +2274,17 @@ export function apply(ctx, config) {
    * @param event - durable session event.
    */
   function onMirrorEvent(session, event) {
-    if (readLive(config.mirrorTurns, true) !== true || lifetime === undefined) return
+    if (lifetime === undefined) return
     const chat = chatForSession(session?.id)
     if (chat === undefined) return
+    // A steered message may open a turn of its own (the previous one ended as
+    // it landed); that turn is shown even with mirroring off. Once a turn ends
+    // with nothing left in the inbox, every steered message has been taken.
+    const follow = readLive(config.mirrorTurns, true) === true || chat.steerFollow === true
+    if (event.type === 'turn/end' && chat.steerFollow === true && !hasPendingInput(ctx.get('agents')?.get(session.id))) {
+      chat.steerFollow = false
+    }
+    if (!follow) return
     const turn = event.data?.turn
     if (event.type === 'user/message') {
       mirrorUserMessage(chat, event.data)
@@ -2362,6 +2371,12 @@ export function apply(ctx, config) {
    */
   async function runAgent(chat, text, signal, attachments = [], messageId) {
     const nativeText = attachments.length === 0 && Number.isSafeInteger(messageId)
+    // A prompt that is still being handed to DSH goes first, so a quick second
+    // message cannot overtake it.
+    while (chat.admission !== undefined) await chat.admission
+    if (chat.busy && busyMode(readLive(config.busyMessages, 'steer')) === 'steer') {
+      if (await steerAgent(chat, text, signal, attachments, messageId)) return
+    }
     if (chat.busy) {
       chat.pendingPrompts ??= []
       chat.pendingPrompts.push({ text, attachments, messageId })
@@ -2382,6 +2397,115 @@ export function apply(ctx, config) {
     clearEditTimer(chat)
     resetAux(chat)
     chat.answerEdit = Promise.resolve()
+    await admitInOrder(chat, () => startTurn(chat, text, signal, attachments, messageId, nativeText, epoch))
+  }
+
+  /**
+   * Run one hand-over of a prompt to DSH while later prompts of the same topic
+   * wait for it (`runAgent` waits on `chat.admission`), so messages reach the
+   * agent in the order they were sent.
+   * @param chat - chat bridge state.
+   * @param task - the hand-over.
+   * @returns the task's result.
+   */
+  async function admitInOrder(chat, task) {
+    let admitted
+    const admission = new Promise((resolve) => { admitted = resolve })
+    chat.admission = admission
+    try {
+      return await task()
+    } finally {
+      if (chat.admission === admission) chat.admission = undefined
+      admitted()
+    }
+  }
+
+  /**
+   * Send a prompt into the turn that is running in the topic's session; DSH
+   * gives it to the agent at its next step (`steer`, as the Web UI does).
+   * @param chat - chat bridge state.
+   * @param text - prompt text.
+   * @param signal - runtime lifetime.
+   * @param attachments - stored attachment blocks.
+   * @param messageId - Telegram message id.
+   * @returns false when the prompt still needs a turn of its own or the queue.
+   */
+  async function steerAgent(chat, text, signal, attachments, messageId) {
+    const steered = await admitInOrder(chat, async () => {
+      let agent
+      try {
+        agent = await ensureAgent(chat)
+      } catch (error) {
+        reportError('steer', error)
+        return false
+      }
+      if (!chat.busy) return false
+      // The bridge shows a turn that DSH no longer runs and that is not being
+      // finalized (a lost turn/end): forget it and start a fresh turn.
+      if (agent.status === 'idle' && !chat.done) {
+        resetStaleTurn(chat)
+        return false
+      }
+      let requestId
+      try {
+        requestId = await steerPrompt(ctx, agent, { sessionId: chat.sessionId, chatId: chat.chatId, messageId, text, attachments }, signal)
+      } catch (error) {
+        // Not admitted: the bot's queue still delivers it after the turn.
+        reportError('steer', error)
+        return false
+      }
+      if (requestId === undefined) return false
+      // If the turn ended just before the message landed, DSH opens a new turn
+      // for it; follow that turn in the topic even when mirroring is off.
+      chat.steerFollow = true
+      return true
+    })
+    if (!steered) return false
+    // After the hand-over, so the next message does not wait for Telegram.
+    await acknowledgeSteer(chat, messageId, signal)
+    await publishStatus({ lastOutcome: 'prompt-steered' })
+    return true
+  }
+
+  /** Forget a bridge turn that DSH no longer runs. */
+  function resetStaleTurn(chat) {
+    clearEditTimer(chat)
+    clearAuxTimers(chat)
+    chat.busy = false
+    chat.done = true
+    chat.turnSource = undefined
+    chat.awaitingTurn = false
+    chat.activeTurn = undefined
+    chat.turnEpoch = (chat.turnEpoch ?? 0) + 1
+  }
+
+  /**
+   * Tell the sender that a message reached the running turn: a reaction on
+   * the message, or a short note when reactions are unavailable.
+   */
+  async function acknowledgeSteer(chat, messageId, signal) {
+    if (Number.isSafeInteger(messageId)) {
+      try {
+        await call('setMessageReaction', {
+          chat_id: chat.chatId,
+          message_id: messageId,
+          reaction: [{ type: 'emoji', emoji: STEER_REACTION }],
+        }, signal)
+        return
+      } catch (error) {
+        if (signal.aborted) return
+        warn(`setMessageReaction failed: ${messageOf(error)}`)
+      }
+    }
+    await sendPlain(chat.chatId, tr('↪️ Sent to the running turn.', '↪️ Отправлено в текущий ход.'), signal, chat.threadId)
+  }
+
+  /**
+   * Show the turn's placeholders and hand its prompt to DSH.
+   * @param chat - chat bridge state.
+   * @param epoch - the turn epoch this prompt opened.
+   */
+  async function startTurn(chat, text, signal, attachments, messageId, nativeText, epoch) {
     const answer = await sendPlain(chat.chatId, tr('⏳ Generating…', '⏳ Генерирую…'), bridgeAbort.signal, chat.threadId)
     chat.messageId = answer?.message_id ?? null
     if (readLive(config.showThinking, true) === true) {
@@ -3723,6 +3847,7 @@ export function apply(ctx, config) {
     const previousId = chatState.sessionId
     cancelQuestionsForChat(chatState)
     chatState.pendingPrompts = []
+    chatState.steerFollow = false
     // Old agent listeners check boundAgent and go quiet once it changes.
     chatState.boundAgent = undefined
     chatState.sessionId = undefined
@@ -4348,8 +4473,15 @@ export function apply(ctx, config) {
         await send(chat.id, tr('There is no active session in this topic.', 'В этом topic нет активной сессии.'), signal, threadId)
         return
       }
-      const queued = chatState.pendingPrompts?.length ?? 0
+      // The bot's own queue (busyMessages: queue) and Telegram messages that
+      // DSH holds but the agent has not taken yet.
+      let queued = chatState.pendingPrompts?.length ?? 0
       chatState.pendingPrompts = []
+      try {
+        queued += clearTelegramInbox(ctx.get('agents')?.get(chatState.sessionId), chatState.chatId)
+      } catch (error) {
+        reportError('clear', error)
+      }
       await send(
         chat.id,
         queued === 0
@@ -4376,6 +4508,7 @@ export function apply(ctx, config) {
         chatState.awaitingTurn = false
         chatState.activeTurn = undefined
         chatState.pendingPrompts = []
+        chatState.steerFollow = false
         chatState.turnEpoch = (chatState.turnEpoch ?? 0) + 1
         try {
           ctx.get('agents')?.get(chatState.sessionId)?.inbox?.clear()
@@ -4970,9 +5103,9 @@ export function apply(ctx, config) {
   }, { global: true })
   ctx.on('agent/assistant-stream', (payload) => {
     try {
-      if (readLive(config.mirrorTurns, true) !== true) return
       const chat = chatForSession(payload?.agent?.session?.id)
       if (chat === undefined || chat.turnSource !== 'mirror') return
+      if (readLive(config.mirrorTurns, true) !== true && chat.steerFollow !== true) return
       onFrame(chat, payload.frame)
     } catch (error) {
       reportError('mirror-stream', error)
