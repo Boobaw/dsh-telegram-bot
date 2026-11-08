@@ -2889,6 +2889,11 @@ export function apply(ctx, config) {
    * commits claimed context, and a running one gets it queued for its next
    * step, which comes soon. The source is the bot's own notice kind, so the
    * mirror, title generation and the Web UI do not treat it as typed text.
+   * A session that has not run its first step yet has no system prompt at
+   * surface node 0. DSH's first step appends one there, and the session
+   * format rejects a log whose first system/message comes after another
+   * surface message, so such a session gets the note queued instead; the
+   * first step then commits it after the system prompt.
    * @param agent - the session's live agent.
    * @param text - note text for the model and for search.
    * @param summary - one-line label the Web UI shows.
@@ -2900,12 +2905,38 @@ export function apply(ctx, config) {
       content: [{ type: 'text', text }],
       source: { kind: 'telegram-topic', form: 'notice', summary: summary.slice(0, 120) },
     }
-    if (agent.status === 'idle' && typeof agent.session?.append === 'function') {
+    if (agent.status === 'idle' && typeof agent.session?.append === 'function' && hasSystemHead(agent.session)) {
       agent.session.append('user/message', message, { surfaceOp: 'append' })
     } else if (typeof agent.inject === 'function') {
       agent.inject(message)
     } else {
       throw new Error('The session cannot record notes.')
+    }
+  }
+
+  /**
+   * Whether a session's first surface node is a system/message, the only
+   * state in which a message may be appended to it outside a step.
+   * @param session - DSH session.
+   * @returns false when the head cannot be read, so callers queue instead.
+   */
+  function hasSystemHead(session) {
+    try {
+      const nodes = session.surface?.nodes
+      if (nodes !== undefined) {
+        if (nodes.length === 0) return false
+        const event = typeof session.eventAt === 'function'
+          ? session.eventAt(nodes[0])
+          : session.snapshotEvents?.().find((item) => item.seq === nodes[0])
+        return event?.type === 'system/message'
+      }
+      const events = typeof session.snapshotEvents === 'function' ? session.snapshotEvents() : session.events
+      if (!Array.isArray(events)) return false
+      const surfaceTypes = new Set(['system/message', 'user/message', 'developer/message', 'assistant/message', 'tool/result'])
+      const first = events.find((event) => surfaceTypes.has(event.type))
+      return first?.type === 'system/message'
+    } catch {
+      return false
     }
   }
 

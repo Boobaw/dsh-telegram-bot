@@ -1097,6 +1097,8 @@ test('a topic session is titled "<topic name> · <DSH title>" and a rename moves
     const first = state.topicNames['100:7001']
     assert.equal(agent.session.title, first, 'the bare topic name before any conversation title')
     const titles = run.host.ctx.get('sessionTitle')
+    // DSH's first step puts the system prompt at surface node 0.
+    agent.session.append('system/message', { turn: 1, step: 1, message: { id: 's1', role: 'system', content: [], source: { kind: 'system-prompt' } } })
 
     // A model request with no typed message yet does not ask for a title.
     agent.session.append('request/header', { header: {} })
@@ -1157,9 +1159,40 @@ test('a topic rename while its session is busy queues the note, and an unopened 
     await wait(150)
     const opened = cold.host.live.get('session-notify')
     assert.ok(opened, 'the bound session was opened to record the note')
-    assert.equal(opened.session.events.filter((event) => event.type === 'user/message').length, 1)
+    // It has had no turn yet, so the note waits for the first step instead of
+    // landing ahead of the system prompt.
+    assert.equal(opened.session.events.filter((event) => event.type === 'user/message').length, 0)
+    assert.equal(opened.injected.length, 1)
   } finally {
     cold.stop()
+  }
+})
+
+test('a note never lands ahead of the system prompt of a session that has not run yet', async () => {
+  const run = await start({}, notifyState)
+  try {
+    // Idle and never run: an append would put a user/message at surface node
+    // 0, and DSH's first system/message after it makes the log unreadable.
+    const fresh = run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    run.telegram.push({ message_thread_id: 7100, forum_topic_edited: { name: 'Alerts' } })
+    await wait(150)
+    assert.equal(fresh.session.events.filter((event) => event.type === 'user/message').length, 0)
+    assert.equal(fresh.injected.length, 1)
+    assert.match(fresh.injected[0].content[0].text, /"Notify" -> "Alerts"/u)
+
+    // A session whose surface starts with the system prompt gets the note
+    // appended at once, read through DSH's surface API.
+    fresh.session.append('system/message', { turn: 1, step: 1, message: { id: 's1', role: 'system', content: [], source: { kind: 'system-prompt' } } })
+    fresh.session.surface = { get nodes() { return fresh.session.events.filter((event) => event.type.endsWith('/message')).map((event) => event.seq) } }
+    fresh.session.eventAt = (seq) => fresh.session.events[seq]
+    run.telegram.push({ message_thread_id: 7100, forum_topic_edited: { name: 'Alerts 2' } })
+    await wait(150)
+    const notes = fresh.session.events.filter((event) => event.type === 'user/message')
+    assert.equal(notes.length, 1)
+    assert.match(notes[0].data.content[0].text, /"Alerts" -> "Alerts 2"/u)
+    assert.equal(fresh.injected.length, 1)
+  } finally {
+    run.stop()
   }
 })
 
