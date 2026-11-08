@@ -6,7 +6,8 @@ This repository is a maintained fork of [Boobaw/dsh-telegram-bot](https://github
 - User-created topics: each new topic asks for its workspace and a new or existing session; `/workspace` switches; topic names are never changed after session titles.
 - Two-way sync: turns started in the Web UI, by scheduled tasks or by other plugins also appear in the bound topic (`mirrorTurns`).
 - Sending into topics by thread id: the `telegramTopics` Host service, the `telegram_send` tool and the `dsh-telegram-send` command, with the sender (job, session) recorded and remembered, so replies to those messages carry the full original.
-- Sessions the bot creates are titled `TG · <topic name>` and never left blank (DSH's New conversation would reuse them): see `claimForTopic` in `src/app.js`.
+- Sessions the bot creates are never left blank (DSH's New conversation would reuse them): see `claimForTopic` in `src/app.js`.
+- Topic session titles are `<topic name> · <DSH title>`: DSH has no title hook, so `syncTopicTitle` re-appends each generated `session/title` with the prefix and the same source (automatic titling keeps running), and `startTopicTitle` calls `sessionTitle.refresh` at the first model request, because the bare-name placeholder is a user title that stops automatic titling. Topic renames record a `telegram-topic` notice as a `user/message` (`recordNote`): session search indexes only message, tool and todo events, not titles or queued inbox items.
 - Deleted topics are forgotten as soon as any Bot API call reports them gone (`forgetGoneTopic`).
 - Chat-wide commands sent in All are answered in All; the topic Telegram made for them is deleted.
 - Sender labels: each Telegram prompt names who wrote it.

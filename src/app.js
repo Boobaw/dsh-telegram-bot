@@ -38,7 +38,7 @@ import { loadState, loadTopics, STATE_PATH, TOPICS_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
 import { createOutbox } from './outbox.js'
-import { isAutoCommandTopic, isTopicGone, resolveThreadTarget, topicNameOf } from './topics.js'
+import { isAutoCommandTopic, isPlaceholderTitle, isTopicGone, resolveThreadTarget, topicNameOf, topicTask, topicTitle } from './topics.js'
 import { spokenMediaOf, transcribe, transcriptNote } from './voice.js'
 import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference, senderLabel } from './message-context.js'
 import { createSentLog } from './sent-log.js'
@@ -1634,6 +1634,11 @@ export function apply(ctx, config) {
   function attachAgent(agent, chat) {
     if (chat.boundAgent === agent) return
     chat.boundAgent = agent
+    // Older versions titled topic sessions "TG · <name>"; move them to the
+    // current form when the session is next used.
+    if (agent.session !== undefined && typeof chat.threadId === 'number' && topicOfSession(agent.session.id) !== undefined) {
+      fireAndForget('topic-title', () => syncTopicTitle(agent.session, chat.chatId, chat.threadId))
+    }
     agent.ctx.on('session/event', (session, event) => {
       try {
         if (chat.boundAgent !== agent || session?.id !== chat.sessionId) return
@@ -1777,9 +1782,15 @@ export function apply(ctx, config) {
    */
   async function claimForTopic(agent, chat) {
     const session = agent?.session
-    if (session !== undefined && currentSessionTitle(session) === undefined) {
-      const name = state.topicNames?.[chat.key]
-      setSessionTitle(session, boundTitle(typeof name === 'string' && name.length > 0 ? name : `topic ${chat.threadId}`))
+    if (session !== undefined && typeof chat.threadId === 'number') {
+      const service = ctx.get('sessionTitle')
+      let current
+      try {
+        current = service?.get(session)
+      } catch {
+        current = undefined
+      }
+      if (service !== undefined && current === undefined) setSessionTitle(session, topicPrefixOf(chat.chatId, chat.threadId))
     }
     if (typeof agent?.followup !== 'function' || typeof agent?.ctx?.on !== 'function') {
       warn(`session ${session?.id ?? agent?.id} cannot run an empty turn; DSH may treat it as blank`)
@@ -2701,8 +2712,9 @@ export function apply(ctx, config) {
 
   /**
    * Remember a topic's name, for labels and the titles of bound sessions.
-   * When the bound session still carries the title the bot gave it, the title
-   * follows the new name; a title someone chose is left alone.
+   * A rename of a topic with a bound session moves the title's topic prefix
+   * and records a note in the session, so session search finds it under
+   * either name.
    * @param chatId - chat holding the topic.
    * @param threadId - topic thread.
    * @param name - topic name.
@@ -2717,36 +2729,163 @@ export function apply(ctx, config) {
     if (previous === name) return
     state.topicNames[key] = name
     void persistState()
-    const sessionId = state.threads[key]
-    const session = typeof sessionId === 'string' ? ctx.get('agents')?.get(sessionId)?.session : undefined
-    if (session === undefined) return
-    const current = currentSessionTitle(session)
-    if (current === boundTitle(previous ?? `topic ${threadId}`) || current === boundTitle(`topic ${threadId}`)) {
-      setSessionTitle(session, boundTitle(name))
+    if (typeof state.threads[key] !== 'string') return
+    fireAndForget('topic-rename', () => onTopicRenamed(chatId, threadId, previous, name))
+  }
+
+  /**
+   * Carry a topic rename into the bound session: move its title prefix and,
+   * when the old name was known, record the rename as a note.
+   * @param chatId - chat holding the topic.
+   * @param threadId - topic thread.
+   * @param previous - the old name, if the bot knew it.
+   * @param name - the new name.
+   */
+  async function onTopicRenamed(chatId, threadId, previous, name) {
+    const sessionId = state.threads[`${chatId}:${threadId}`]
+    if (typeof sessionId !== 'string') return
+    let agent = ctx.get('agents')?.get(sessionId)
+    // The note must land in the session even when nobody has it open.
+    if (agent === undefined && previous !== undefined) {
+      const chat = await chatFor(chatId, threadId)
+      if (chat.sessionId !== sessionId) return
+      agent = await ensureAgent(chat)
+    }
+    if (agent?.session !== undefined) syncTopicTitle(agent.session, chatId, threadId, previous === undefined ? [] : [previous])
+    if (previous === undefined || agent === undefined) return
+    const text = `Telegram topic renamed: "${previous}" -> "${name}" (thread ${threadId})`
+    recordNote(agent, text, `Topic renamed: ${previous} → ${name}`)
+  }
+
+  /**
+   * Record a note in a session without starting a turn, as a message that
+   * session search indexes. Search indexes `user/message` events; context
+   * queued with `agent.inject` becomes one only when the next step claims it.
+   * So an idle session gets the message appended now, the way the agent loop
+   * commits claimed context, and a running one gets it queued for its next
+   * step, which comes soon. The source is the bot's own notice kind, so the
+   * mirror, title generation and the Web UI do not treat it as typed text.
+   * @param agent - the session's live agent.
+   * @param text - note text for the model and for search.
+   * @param summary - one-line label the Web UI shows.
+   */
+  function recordNote(agent, text, summary) {
+    const message = {
+      id: randomUUID(),
+      role: 'user',
+      content: [{ type: 'text', text }],
+      source: { kind: 'telegram-topic', form: 'notice', summary: summary.slice(0, 120) },
+    }
+    if (agent.status === 'idle' && typeof agent.session?.append === 'function') {
+      agent.session.append('user/message', message, { surfaceOp: 'append' })
+    } else if (typeof agent.inject === 'function') {
+      agent.inject(message)
+    } else {
+      throw new Error('The session cannot record notes.')
     }
   }
 
   /**
-   * The DSH title of a session bound to a topic.
-   * @param topicName - the topic's name.
-   * @returns the session title.
+   * The topic name a bound session's title starts with.
+   * @param chatId - chat holding the topic.
+   * @param threadId - topic thread.
+   * @returns the topic's name, or "topic <id>" while it is unknown.
    */
-  function boundTitle(topicName) {
-    return `TG · ${topicName}`
+  function topicPrefixOf(chatId, threadId) {
+    const name = state.topicNames?.[`${chatId}:${threadId}`]
+    return typeof name === 'string' && name.trim().length > 0 ? name.trim() : `topic ${threadId}`
   }
 
   /**
-   * Read a live session's DSH title.
+   * The topic a session is bound to.
+   * @param sessionId - DSH session id.
+   * @returns `{ chatId, threadId }`, or undefined.
+   */
+  function topicOfSession(sessionId) {
+    if (!stateLoaded || typeof sessionId !== 'string') return undefined
+    const record = state.sessions[sessionId]
+    if (typeof record?.chatId !== 'number' || typeof record.threadId !== 'number') return undefined
+    if (state.threads[`${record.chatId}:${record.threadId}`] !== sessionId) return undefined
+    return { chatId: record.chatId, threadId: record.threadId }
+  }
+
+  /**
+   * Bring a topic session's title to "<topic name> · <conversation title>".
+   * DSH writes the conversation part (its title provider, or the first-prompt
+   * fallback); DSH has no title hook, so the bot adds the prefix by appending
+   * the same title event with the same source, which keeps automatic titling
+   * going. Before a conversation title exists the title is the bare topic
+   * name, set as a user title so DSH's fallback does not replace it; the bot
+   * asks DSH for the real title at the first model request (see
+   * `startTopicTitle`). A title someone typed is left alone.
    * @param session - live session.
-   * @returns the title, or undefined when it has none or no title service runs.
+   * @param chatId - chat holding the topic.
+   * @param threadId - topic thread.
+   * @param previousNames - earlier topic names the title may still carry.
    */
-  function currentSessionTitle(session) {
+  function syncTopicTitle(session, chatId, threadId, previousNames = []) {
+    const service = ctx.get('sessionTitle')
+    if (service === undefined) return
+    const prefix = topicPrefixOf(chatId, threadId)
+    const names = [prefix, ...previousNames, `topic ${threadId}`]
+    let current
     try {
-      const title = ctx.get('sessionTitle')?.get(session)
-      return typeof title?.title === 'string' ? title.title : undefined
-    } catch {
-      return undefined
+      current = service.get(session)
+    } catch (error) {
+      warn(`session title not read for ${session?.id}: ${messageOf(error)}`)
+      return
     }
+    if (current === undefined) {
+      setSessionTitle(session, prefix)
+      return
+    }
+    const title = current.title
+    if (current.source?.kind === 'user') {
+      if (isPlaceholderTitle(title, names) && title !== prefix) setSessionTitle(session, prefix)
+      return
+    }
+    const wanted = topicTitle(prefix, topicTask(title, names))
+    if (wanted === title) return
+    try {
+      session.append('session/title', {
+        title: wanted,
+        messageSeqs: Array.isArray(current.messageSeqs) ? [...current.messageSeqs] : [],
+        source: current.source,
+      })
+    } catch (error) {
+      warn(`session title not set for ${session?.id}: ${messageOf(error)}`)
+    }
+  }
+
+  /** Sessions whose first conversation title is being generated. */
+  const titleRequests = new Set()
+
+  /**
+   * Ask DSH for a topic session's conversation title once the session has a
+   * message and a model route, while its title is still the bot placeholder.
+   * The placeholder is a user title, which stops DSH's automatic titling, so
+   * the bot starts it with `sessionTitle.refresh` (the registered provider,
+   * or DSH's fallback when none is). It waits for a `request/header` event
+   * because model providers take their route from the logged header.
+   * @param session - live session that logged a request header.
+   */
+  function startTopicTitle(session) {
+    const topic = topicOfSession(session?.id)
+    const service = ctx.get('sessionTitle')
+    if (topic === undefined || typeof service?.refresh !== 'function' || titleRequests.has(session.id)) return
+    const current = service.get(session)
+    const names = [topicPrefixOf(topic.chatId, topic.threadId), `topic ${topic.threadId}`]
+    if (current !== undefined && (current.source?.kind !== 'user' || !isPlaceholderTitle(current.title, names))) return
+    const events = typeof session.snapshotEvents === 'function' ? session.snapshotEvents() : []
+    const hasPrompt = events.some((event) => event?.type === 'user/message'
+      && event.data?.source?.kind === 'user'
+      && (event.data.content ?? []).some((block) => block?.type === 'text' && block.text.trim().length > 0))
+    if (!hasPrompt) return
+    titleRequests.add(session.id)
+    Promise.resolve()
+      .then(() => service.refresh(session))
+      .catch((error) => warn(`session title not generated for ${session.id}: ${messageOf(error)}`))
+      .finally(() => titleRequests.delete(session.id))
   }
 
   /**
@@ -4812,6 +4951,21 @@ export function apply(ctx, config) {
       onMirrorEvent(session, event)
     } catch (error) {
       reportError('mirror-event', error)
+    }
+    // Topic session titles: prefix every title DSH generates with the topic
+    // name, and start the first one. Both run after the current event, so the
+    // title service has folded it and no event is appended inside another's
+    // delivery.
+    if (event?.type === 'session/title' && event.data?.source?.kind !== 'user') {
+      const topic = topicOfSession(session?.id)
+      if (topic !== undefined) {
+        fireAndForget('topic-title', () => {
+          const live = ctx.get('agents')?.get(session.id)?.session
+          if (live !== undefined) syncTopicTitle(live, topic.chatId, topic.threadId)
+        })
+      }
+    } else if (event?.type === 'request/header') {
+      fireAndForget('topic-title', () => startTopicTitle(session))
     }
   }, { global: true })
   ctx.on('agent/assistant-stream', (payload) => {

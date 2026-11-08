@@ -17,6 +17,50 @@ export function topicNameOf(message) {
   return undefined
 }
 
+/** Joins a topic name and the task part of a topic session's title. */
+export const TITLE_SEPARATOR = ' · '
+
+/** The title form earlier versions gave topic sessions: "TG · <topic name>". */
+const LEGACY_PREFIX = 'TG · '
+
+/**
+ * The DSH title of a topic session: the topic name, then what the
+ * conversation is about once DSH has titled it.
+ * @param prefix - the topic's name.
+ * @param task - the conversation's own title, or empty before one exists.
+ * @returns the session title.
+ */
+export function topicTitle(prefix, task) {
+  const rest = typeof task === 'string' ? task.trim() : ''
+  return rest.length === 0 ? prefix : `${prefix}${TITLE_SEPARATOR}${rest}`
+}
+
+/**
+ * Whether a title is one the bot set before any conversation title existed:
+ * a bare topic name (current or earlier) or the old "TG · <name>" form.
+ * @param title - current session title.
+ * @param names - topic names the title may carry.
+ * @returns true for a bot placeholder.
+ */
+export function isPlaceholderTitle(title, names) {
+  return typeof title === 'string' && (title.startsWith(LEGACY_PREFIX) || names.includes(title))
+}
+
+/**
+ * The conversation part of a title, without a topic-name prefix the bot added.
+ * @param title - current session title.
+ * @param names - topic names a prefix may carry, current name first.
+ * @returns the task part; empty when the title is only a prefix.
+ */
+export function topicTask(title, names) {
+  if (isPlaceholderTitle(title, names)) return ''
+  // Longest name first, so "Chat · 2" wins over "Chat" for "Chat · 2 · Fix".
+  for (const name of [...names].sort((a, b) => b.length - a.length)) {
+    if (title.startsWith(`${name}${TITLE_SEPARATOR}`)) return title.slice(name.length + TITLE_SEPARATOR.length).trim()
+  }
+  return title
+}
+
 /**
  * Commands about the chat as a whole rather than one topic. When one of them
  * is sent in All, Telegram turns it into a topic of its own; the bot answers

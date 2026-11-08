@@ -8,7 +8,7 @@ import { STATUS_DIR } from '../src/constants.js'
 import { followupThroughGate, makeTitleService } from './fake-dsh.js'
 import { senderLabel } from '../src/message-context.js'
 import { enqueue, waitForResult } from '../src/outbox.js'
-import { isAutoCommandTopic, isTopicGone, resolveThreadTarget, topicNameOf } from '../src/topics.js'
+import { isAutoCommandTopic, isPlaceholderTitle, isTopicGone, resolveThreadTarget, topicNameOf, topicTask, topicTitle } from '../src/topics.js'
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -33,9 +33,22 @@ function makeHost() {
   function makeAgent(id, cwd) {
     const events = new EventEmitter()
     events.setMaxListeners(100)
+    const session = {
+      id,
+      header: { cwd },
+      events: [],
+      append(type, data) {
+        const event = { type, data, seq: this.events.length, time: Date.now() }
+        this.events.push(event)
+        if (type === 'session/title') Object.assign(this, { title: data.title, titleSource: data.source, titleSeqs: data.messageSeqs })
+        agent.emit('session/event', this, event)
+        return event
+      },
+      snapshotEvents() { return [...this.events] },
+    }
     const agent = {
       id,
-      session: { id, header: { cwd }, append() {} },
+      session,
       ctx: { on: (name, fn) => { events.on(name, fn); return () => events.off(name, fn) } },
       status: 'idle',
       received: [],
@@ -625,7 +638,7 @@ test('a known topic without a session gets one like /new, and a session that can
     const opened = run.host.live.get('session-1')
     assert.equal(opened.turns, 1, 'never left blank')
     assert.equal(opened.received.length, 0)
-    assert.equal(opened.session.title, 'TG · Loose')
+    assert.equal(opened.session.title, 'Loose')
     assert.match(opened.injected[0].content[0].text, /^\[Sent to the Telegram topic "Loose" by job "probe"\]\nhello$/u)
     const state = await run.readState()
     assert.equal(state.threads['100:7200'], 'session-1')
@@ -903,7 +916,7 @@ test('a session opened for a topic is never blank and carries the topic title', 
     assert.equal(fresh.received.length, 0, 'nothing reached the model')
     assert.equal(fresh.rejected.length, 1)
     assert.match(fresh.rejected[0].source.rpcId, /^telegram-claim:/u)
-    assert.equal(fresh.session.title, 'TG · Alerts')
+    assert.equal(fresh.session.title, 'Alerts', 'the bare topic name until DSH titles the conversation')
     const before = run.telegram.calls.length
     run.telegram.push({ message_thread_id: 7100, text: 'real question' })
     await wait(200)
@@ -914,20 +927,88 @@ test('a session opened for a topic is never blank and carries the topic title', 
   }
 })
 
-test('the session title follows a topic rename unless someone chose another title', async () => {
+test('a topic session is titled "<topic name> · <DSH title>" and a rename moves only the prefix', async () => {
   const run = await start()
   try {
     const agent = await openSessionTopic(run)
     const state = await run.readState()
-    assert.equal(agent.session.title, `TG · ${state.topicNames['100:7001']}`)
+    const first = state.topicNames['100:7001']
+    assert.equal(agent.session.title, first, 'the bare topic name before any conversation title')
+    const titles = run.host.ctx.get('sessionTitle')
+
+    // A model request with no typed message yet does not ask for a title.
+    agent.session.append('request/header', { header: {} })
+    await wait(20)
+    assert.deepEqual(titles.refreshed, [])
+
+    // The first model request after a typed message asks DSH for the title.
+    agent.session.append('user/message', { id: 'u1', role: 'user', content: [{ type: 'text', text: 'fix the empty sessions' }], source: { kind: 'user' } })
+    agent.session.append('request/header', { header: {} })
+    await wait(50)
+    assert.deepEqual(titles.refreshed, [agent.id])
+    assert.equal(agent.session.title, `${first} · Generated task`)
+    assert.equal(agent.session.titleSource.kind, 'provider', 'the prefixed title keeps the provider source, so automatic titling continues')
+
+    // Later generated titles get the prefix too, once.
+    agent.session.append('session/title', { title: 'Better task', messageSeqs: [1], source: { kind: 'provider', provider: 'fake' } })
+    await wait(50)
+    assert.equal(agent.session.title, `${first} · Better task`)
+    assert.equal(agent.session.events.filter((event) => event.type === 'session/title' && event.data.title === `${first} · Better task`).length, 1)
+
+    // A topic rename moves only the prefix and leaves a searchable note.
     run.telegram.push({ message_thread_id: 7001, forum_topic_edited: { name: 'Ops' } })
-    await wait(100)
-    assert.equal(agent.session.title, 'TG · Ops')
-    agent.session.title = 'My own title'
+    await wait(150)
+    assert.equal(agent.session.title, 'Ops · Better task')
+    const notes = agent.session.events.filter((event) => event.type === 'user/message' && event.data.source.kind === 'telegram-topic')
+    assert.equal(notes.length, 1)
+    assert.equal(notes[0].data.content[0].text, `Telegram topic renamed: "${first}" -> "Ops" (thread 7001)`)
+    assert.equal(notes[0].data.source.form, 'notice')
+    assert.equal(run.telegram.calls.filter((call) => String(call.body?.text ?? '').includes('topic renamed')).length, 0, 'the note is not mirrored into the topic')
+
+    // A title someone typed is left alone.
+    agent.session.append('session/title', { title: 'My own title', messageSeqs: [], source: { kind: 'user' } })
     run.telegram.push({ message_thread_id: 7001, forum_topic_edited: { name: 'Ops 2' } })
-    await wait(100)
+    await wait(150)
     assert.equal(agent.session.title, 'My own title')
     assert.equal(run.telegram.calls.filter((call) => call.method === 'editForumTopic').length, 0, 'the topic itself is never renamed')
+  } finally {
+    run.stop()
+  }
+})
+
+test('a topic rename while its session is busy queues the note, and an unopened session is opened for it', async () => {
+  const run = await start({}, notifyState)
+  try {
+    const agent = run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    agent.status = 'running'
+    run.telegram.push({ message_thread_id: 7100, forum_topic_edited: { name: 'Alerts' } })
+    await wait(150)
+    assert.equal(agent.injected.length, 1)
+    assert.equal(agent.injected[0].source.kind, 'telegram-topic')
+    assert.match(agent.injected[0].content[0].text, /^Telegram topic renamed: "Notify" -> "Alerts" \(thread 7100\)$/u)
+  } finally {
+    run.stop()
+  }
+  const cold = await start({}, notifyState)
+  try {
+    cold.telegram.push({ message_thread_id: 7100, forum_topic_edited: { name: 'Alerts' } })
+    await wait(150)
+    const opened = cold.host.live.get('session-notify')
+    assert.ok(opened, 'the bound session was opened to record the note')
+    assert.equal(opened.session.events.filter((event) => event.type === 'user/message').length, 1)
+  } finally {
+    cold.stop()
+  }
+})
+
+test('an old "TG · <name>" title becomes the topic name when the session is next used', async () => {
+  const run = await start({}, notifyState)
+  try {
+    const agent = run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    agent.session.title = 'TG · Notify'
+    run.telegram.push({ message_thread_id: 7100, text: 'ping' })
+    await wait(250)
+    assert.equal(agent.session.title, 'Notify')
   } finally {
     run.stop()
   }
@@ -999,4 +1080,17 @@ test('a voice message that cannot be transcribed still passes the file and says 
   } finally {
     run.stop()
   }
+})
+
+test('topic title helpers split and join the topic prefix', () => {
+  assert.equal(topicTitle('Chat-1', ''), 'Chat-1')
+  assert.equal(topicTitle('Chat-1', '修 Telegram 空会话'), 'Chat-1 · 修 Telegram 空会话')
+  assert.equal(topicTask('Chat-1 · Fix it', ['Chat-1']), 'Fix it')
+  assert.equal(topicTask('Old · Fix it', ['New', 'Old']), 'Fix it')
+  assert.equal(topicTask('Chat · 2 · Fix', ['Chat', 'Chat · 2']), 'Fix', 'the longest name wins')
+  assert.equal(topicTask('Fix it', ['Chat-1']), 'Fix it')
+  assert.equal(topicTask('TG · Chat-1', ['Chat-1']), '')
+  assert.equal(isPlaceholderTitle('TG · Anything', []), true)
+  assert.equal(isPlaceholderTitle('topic 7', ['Chat', 'topic 7']), true)
+  assert.equal(isPlaceholderTitle('My title', ['Chat']), false)
 })

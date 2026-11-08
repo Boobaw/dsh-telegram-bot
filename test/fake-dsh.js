@@ -28,15 +28,31 @@ export function followupThroughGate(agent, events, message) {
 }
 
 /**
- * Fake `sessionTitle` service: titles live on the session object.
+ * Fake `sessionTitle` service: the latest title lives on the session object
+ * (`title`, `titleSource`, `titleSeqs`). Titles are written through
+ * `session.append('session/title', ...)` when the fake session has one, so
+ * listeners see the event as in DSH. `refresh` stands in for the title model.
  * @returns the service.
  */
 export function makeTitleService() {
-  return {
-    get: (session) => (typeof session.title === 'string' ? { title: session.title, source: { kind: 'user' } } : undefined),
+  const write = (session, data) => {
+    if (typeof session.append === 'function' && Array.isArray(session.events)) session.append('session/title', data)
+    else Object.assign(session, { title: data.title, titleSource: data.source, titleSeqs: data.messageSeqs })
+  }
+  const service = {
+    refreshed: [],
+    get: (session) => (typeof session.title === 'string'
+      ? { title: session.title, source: session.titleSource ?? { kind: 'user' }, messageSeqs: session.titleSeqs ?? [] }
+      : undefined),
     rename: (session, title) => {
-      session.title = title
-      return { title, source: { kind: 'user' } }
+      write(session, { title, messageSeqs: [], source: { kind: 'user' } })
+      return service.get(session)
+    },
+    async refresh(session) {
+      service.refreshed.push(session.id)
+      write(session, { title: session.nextGeneratedTitle ?? 'Generated task', messageSeqs: [1], source: { kind: 'provider', provider: 'fake' } })
+      return service.get(session)
     },
   }
+  return service
 }
