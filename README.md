@@ -26,7 +26,8 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Then enable **Disallow
 - Telegram mirrors only turns initiated from Telegram; turns started in the Web UI stay in Web.
 - `/sessions` lists workspaces and existing sessions, and can create a new session in a selected workspace.
 - Assistant answers stream into the topic with Telegram Markdown formatting. Messages sent while the agent is working are queued and processed after the current turn; `/clear` removes that queue without stopping the current answer.
-- Reasoning and tool calls are shown as temporary messages and removed after the answer. Each tool-call entry is capped at two lines.
+- Replies, quotes and forwards keep their context. Ordinary messages are passed unchanged; only replies, quoted parts and forwarded messages get a short context block. A replied-to photo or document is attached when Telegram allows the bot to download it.
+- Reasoning and tool calls are shown as temporary messages and removed as soon as the final answer is ready. Each tool-call entry is capped at three mobile lines.
 - Inline controls for model, reasoning effort, permission mode and context usage.
 - Tool approvals with **Deny** / **Allow** buttons.
 - `ask_user_question` support: options, multi-select, custom answers and plan review.
@@ -91,7 +92,30 @@ An ordinary message in **All** creates a new session topic in the default worksp
 
 If users are allowed to create threads, Telegram creates a topic before the bot receives the message; the bot then warns about the BotFather setting on startup.
 
+## Send into a topic
+
+Scripts, scheduled jobs, other plugins and agents can post into a topic by name or thread id. The message is also recorded in the session bound to that topic, without starting a turn; whoever answers there next sees it.
+
+CLI from the package:
+
+```bash
+dsh-telegram-send --topic "Release" "Build finished"
+dsh-telegram-send --topic 54553 --file /tmp/report.pdf "Report attached"
+dsh-telegram-send --topic "Release" --no-wait "Queued notification"
+```
+
+The request goes through a file spool under `$DSH_HOME/telegram/outbox`, so it needs no bot token and waits while DSH is stopped. Topic names ignore case; an unknown or ambiguous name is an error, and nothing is created.
+
+Host plugins can call:
+
+```js
+await ctx.get('telegramTopics').send('Release', 'Build finished')
+```
+
+The model-facing tool is `telegram_send`.
+
 ## Troubleshooting topics
+
 
 If every message in **All** creates a new topic, enable this BotFather option:
 
@@ -175,7 +199,7 @@ node --check client.js
 npm test
 ```
 
-`src/app.js` is the Host runtime: Telegram polling, topic routing and the session bridge. `src/update-ledger.js` persists Telegram update cursors, `src/admission.js` uses the native DSH session queue. `src/formatting.js`, `src/state.js`, `src/status.js`, `src/utils.js`, `src/errors.js`, `src/config.js` and `src/constants.js` hold the supporting layers. `src/index.js` is the public entry point; root `index.js` is the loader-compatible wrapper. Root `client.js` is the loader-compatible client bundle. `src/client.js` contains the client source. The plugin adds no model-facing tools or system-prompt text; it connects Telegram to the existing DSH agent.
+`src/app.js` is the Host runtime: Telegram polling, topic routing and the session bridge. `src/update-ledger.js` persists Telegram update cursors, `src/admission.js` uses the native DSH session queue. `src/formatting.js`, `src/state.js`, `src/status.js`, `src/utils.js`, `src/errors.js`, `src/config.js` and `src/constants.js` hold the supporting layers. `src/message-context.js` builds reply/quote/forward context, `src/topics.js` resolves topic names and `src/outbox.js` powers `dsh-telegram-send`. `src/index.js` is the public entry point; root `index.js` is the loader-compatible wrapper. Root `client.js` is the loader-compatible client bundle. `src/client.js` contains the client source. The plugin registers the model-facing `telegram_send` tool for posting into a Telegram topic.
 
 ## License
 

@@ -13,6 +13,7 @@
     ".\"": "./index.js"
   },
   "files": [
+    "bin",
     "client.js",
     "index.js",
     "cordis.patch.yml",
@@ -63,5 +64,8 @@
   },
   "scripts": {
     "test": "NODE_ENV=test DSH_HOME=\"$(mktemp -d)\" node --test --test-concurrency=1"
+  },
+  "bin": {
+    "dsh-telegram-send": "./bin/dsh-telegram-send.js"
   }
 }
