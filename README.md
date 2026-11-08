@@ -2,7 +2,7 @@
 
 [![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/boobaw/dsh-telegram-bot)
 
-> This is a maintained fork of [Boobaw/dsh-telegram-bot](https://github.com/Boobaw/dsh-telegram-bot) with `/new`, user-created topics with a workspace picker, two-way sync, sending into topics by name, and reply, quote and forward context. See [MAINTAINING.md](MAINTAINING.md) for what differs and how upstream changes are merged in.
+> This is a maintained fork of [Boobaw/dsh-telegram-bot](https://github.com/Boobaw/dsh-telegram-bot) with `/new`, user-created topics with a workspace picker, two-way sync, sending into topics by thread id, and reply, quote and forward context. See [MAINTAINING.md](MAINTAINING.md) for what differs and how upstream changes are merged in.
 
 Telegram client for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). It connects a DSH profile to a Telegram bot and keeps the same DSH sessions available in both interfaces.
 
@@ -27,6 +27,9 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Leave **Disallow users
 - One Telegram topic per DSH session; Web and Telegram use the same session.
 - You create the topics. A new topic asks which workspace to use, then whether to start a new session or continue an existing one from that workspace. The message that opened the topic runs once the session is chosen.
 - Topic names are yours: the bot never renames a topic after the session title. `/rename` renames it on request.
+- A session the bot creates for a topic is titled `TG · <topic name>` in DSH, so it is easy to spot in the Web UI. The title follows later renames of the topic until someone gives the session another title. Sessions you bind from the picker keep their own titles.
+- A session the bot creates for a topic is never handed out as a blank session. DSH's **New conversation** reuses a session that has not started a turn yet; the bot therefore starts one empty turn as soon as it creates a session, and stops it before any model request. Without this, a topic session waiting for its first message could be picked up by the Web UI, and that Web chat would be mirrored into the topic.
+- Deleted topics clean themselves up: when Telegram answers any call for a topic with "message thread not found", `TOPIC_ID_INVALID` or `TOPIC_DELETED`, the bot drops that topic's session binding and name and logs it. The session stays in DSH. A closed topic keeps its binding, since it can be reopened.
 - `/workspace` moves the topic to another workspace: pick the workspace, then a new or existing session there. A session's working directory is fixed when it is created, so the previous session is not continued in this topic; it stays in DSH and can be bound again later as an existing session.
 - Two-way sync: turns started anywhere else (Web UI, scheduled tasks, other plugins) also appear in the session's topic. The prompt is shown with a **From Web** or **Scheduled task** label, followed by the streamed answer. Messages sent from Telegram are not echoed back, and context that plugins add on their own (time, runtime notes) is not shown. A Telegram message sent while such a turn runs waits for it. Approvals and questions from those turns are answered where the turn started. Turn this off with **Show turns from other clients**.
 - `/sessions` lists workspaces and existing sessions, and can create a new session in a selected workspace.
@@ -115,42 +118,42 @@ A correct configuration contains:
 
 ## Send to a topic
 
-Scripts, scheduled jobs, other plugins and agents can post into a topic by its name or thread id. The message (text and files) appears in the topic and is also recorded in the session bound to that topic, without starting a turn: it is queued as context for that session's next turn, labelled with who sent it. A name that matches no topic, or more than one, is an error; nothing is created. A topic with no session only shows the message, and the result says so (`note`); if the session cannot take the record, the message is still sent and the result carries `recordError`.
+Scripts, scheduled jobs, other plugins and agents can post into a topic by its numeric thread id (`/id` in the topic shows it). The message (text and files) appears in the topic and is also recorded in the session bound to that topic, without starting a turn: it is queued as context for that session's next turn, labelled with who sent it. A thread id the bot does not know (no binding and no known name in its chat) is an error; nothing is created. Topic names are only labels, never addresses. A topic with no session only shows the message, and the result says so (`note`); if the session cannot take the record, the message is still sent and the result carries `recordError`.
 
 The bot also remembers each such send (`$DSH_HOME/telegram/sent-messages.json`: the last 1,000 sends from the past 180 days, text up to 20,000 characters). When someone replies to or quotes one of those messages, the agent gets the whole original text, however many Telegram messages it was split into, with its send time, job name and sending session, and a hint to open that session for more context. This works after `/new` too, when the current session never saw the message.
 
-Names ignore case. The bot learns a topic's name when it creates the topic, when Telegram reports a topic being created or renamed, and on `/rename`. Topics bound by an earlier version start with their last title. `/id` in a topic shows its thread id.
+The bot learns a topic's name when it creates the topic, when Telegram reports a topic being created or renamed, and on `/rename`, and uses it in the labels of recorded messages and in session titles.
 
 From a shell (no bot token needed):
 
 ```bash
-dsh-telegram-send --topic notify "Backup finished"
-some-report | dsh-telegram-send --topic notify --job nightly-report
-dsh-telegram-send --topic 7100 --file /tmp/report.pdf "Monthly report"
+dsh-telegram-send --thread 12345 "Backup finished"
+some-report | dsh-telegram-send --thread 12345 --job nightly-report
+dsh-telegram-send --thread 12345 --file /tmp/report.pdf "Monthly report"
 ```
 
 Who sent it: `--job <name>` names the job or script, and `--from-session <id>` the DSH session. Inside a DSH session `--from-session` defaults to `$DSH_SESSION_ID`; pass `--from-session ''` to leave it out. `--from <label>` is a free-form label for senders that are neither. When the sending session is the one bound to the topic, it gets no second copy.
 
 Long text is split into several Telegram messages. Every `--file` is sent after the text, one message per file.
 
-The command writes the request into `$DSH_HOME/telegram/outbox/` and waits up to `--timeout` seconds (default 30) for the plugin's answer. Exit codes: `0` sent, `1` failed (the error is printed, for example an unknown topic), `2` bad arguments, `3` still queued (the bot sends it once it runs). `--no-wait` returns right after queueing. The spool keeps requests while DSH is stopped, which is why it is a directory and not a socket; a request interrupted by a restart is sent again. The command is installed as the package's `bin`; link it onto your `PATH` if needed (`node_modules/.bin/dsh-telegram-send` in the profile).
+The command writes the request into `$DSH_HOME/telegram/outbox/` and waits up to `--timeout` seconds (default 30) for the plugin's answer. Exit codes: `0` sent, `1` failed (the error is printed, for example an unknown thread id), `2` bad arguments, `3` still queued (the bot sends it once it runs). `--no-wait` returns right after queueing. The spool keeps requests while DSH is stopped, which is why it is a directory and not a socket; a request interrupted by a restart is sent again. The command is installed as the package's `bin`; link it onto your `PATH` if needed (`node_modules/.bin/dsh-telegram-send` in the profile).
 
 From another Host plugin:
 
 ```js
 const result = await ctx.get('telegramTopics').send({
-  to: 'notify',                 // topic name (any case) or thread id
+  to: '12345',                  // the topic's thread id
   text: 'Backup **finished**',
   files: ['/tmp/report.pdf'],   // absolute paths, optional
   from: { job: 'backup', sessionId: 'session-…' }, // optional; `label` for other senders
 })
 // { chatId, threadId, topic, sessionId, recorded, messageIds }, plus note or recordError when it was not recorded
-ctx.get('telegramTopics').topics() // [{ threadId, name, sessionId }]
+ctx.get('telegramTopics').topics() // [{ threadId, name, sessionId }]: known topics, name may be null
 ```
 
-`send` rejects when the message was not sent. Errors that a retry cannot fix (an unknown topic, a missing or oversized file, nothing to send, or a failure after part of a long message already went out) carry `retryable: false`; others, such as the bot not running yet, are worth trying again. This is the shape [dsh-cron-jobs](https://github.com/soffits/dsh-cron-jobs) expects from a delivery channel, so `deliver: { via: telegramTopics, to: notify }` sends scheduled job results into the topic, with the job and its session named as the sender.
+`send` rejects when the message was not sent. Errors that a retry cannot fix (an unknown thread id, a topic that was deleted, a missing or oversized file, nothing to send, or a failure after part of a long message already went out) carry `retryable: false`; others, such as the bot not running yet, are worth trying again. This is the shape [dsh-cron-jobs](https://github.com/soffits/dsh-cron-jobs) expects from a delivery channel, so `deliver: { via: telegramTopics, to: 12345 }` sends scheduled job results into the topic, with the job and its session named as the sender.
 
-From an agent: the `telegram_send` tool takes `topic`, `text` and `files` (absolute paths). The calling session is named as the sender and does not get a copy of its own message.
+From an agent: the `telegram_send` tool takes `thread` (the thread id), `text` and `files` (absolute paths). The calling session is named as the sender and does not get a copy of its own message.
 
 Text is Markdown, converted for Telegram like assistant answers. JPEG, PNG and WebP files up to 10 MB are sent as photos, other files as documents (up to 50 MB).
 

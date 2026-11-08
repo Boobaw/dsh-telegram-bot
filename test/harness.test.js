@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import https from 'node:https'
 import { STATUS_DIR } from '../src/constants.js'
+import { followupThroughGate } from './fake-dsh.js'
 
 /**
  * One fake DSH agent that settles a Telegram turn without model streaming.
@@ -17,7 +18,7 @@ function makeAgent(id, cwd) {
     ctx: { on: (...args) => events.on(...args) },
     status: 'idle',
     received: [],
-    followup(message) { this.received.push(message) },
+    followup(message) { followupThroughGate(this, events, message) },
     whenIdle() { return new Promise((resolve) => setTimeout(resolve, 20)) },
     cancel() {},
   }

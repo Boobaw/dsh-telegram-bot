@@ -37,7 +37,7 @@ import { loadState, loadTopics, STATE_PATH, TOPICS_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
 import { createOutbox } from './outbox.js'
-import { isAutoCommandTopic, resolveTopicTarget, topicNameOf } from './topics.js'
+import { isAutoCommandTopic, isTopicGone, resolveThreadTarget, topicNameOf } from './topics.js'
 import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference, senderLabel } from './message-context.js'
 import { createSentLog } from './sent-log.js'
 import {
@@ -771,6 +771,8 @@ export function apply(ctx, config) {
         if (error?.telegram === true) {
           if (payload !== null && typeof payload === 'object' && payload.chat_id !== undefined) {
             noteRateLimit(payload.chat_id, error.retryAfter)
+            // Any call into a deleted topic means its binding is dead for good.
+            if (isTopicGone(error.message)) forgetGoneTopic(payload.chat_id, payload.message_thread_id, method)
           }
           // Telegram asks the caller to back off explicitly. Retrying a few
           // times keeps a final answer from being lost during bursts of edits.
@@ -1703,6 +1705,56 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Make a session the bot just created for a topic its own: give it the
+   * topic's title and end its blank state.
+   *
+   * DSH reuses a "blank" session (one that has never started a turn) for the
+   * next New conversation in the Web UI, and only a `turn/start` event ends
+   * that state; titles and queued messages do not. A topic session that waits
+   * for its first Telegram message would otherwise be handed to whoever clicks
+   * New in the Web UI, and their chat would be mirrored into the topic. So the
+   * bot runs one empty turn right away: it queues a marker message and rejects
+   * it at `agent/pre-step`, before any model request (the same gate DSH uses to
+   * stop turns in archived sessions). The turn ends as `blocked` and the marker
+   * is never recorded as a message.
+   * Call it before the session is bound, so the mirror ignores this turn.
+   * @param agent - the new session's agent.
+   * @param chat - topic state.
+   */
+  async function claimForTopic(agent, chat) {
+    const session = agent?.session
+    if (session !== undefined && currentSessionTitle(session) === undefined) {
+      const name = state.topicNames?.[chat.key]
+      setSessionTitle(session, boundTitle(typeof name === 'string' && name.length > 0 ? name : `topic ${chat.threadId}`))
+    }
+    if (typeof agent?.followup !== 'function' || typeof agent?.ctx?.on !== 'function') {
+      warn(`session ${session?.id ?? agent?.id} cannot run an empty turn; DSH may treat it as blank`)
+      return
+    }
+    const id = randomUUID()
+    const dispose = agent.ctx.on('agent/pre-step', (payload, next) => {
+      const messages = Array.isArray(payload?.messages) ? payload.messages : []
+      if (messages.length > 0 && messages.every((message) => message?.id === id)) return Promise.resolve({ kind: 'reject' })
+      return next()
+    })
+    agent.followup({
+      id,
+      role: 'user',
+      content: [{ type: 'text', text: `[This session belongs to the Telegram topic ${chat.threadId}]` }],
+      source: { kind: 'user', rpcId: `telegram-claim:${id}` },
+    })
+    // The gate stays until the turn is over, so the marker can never reach a model.
+    const idle = typeof agent.whenIdle === 'function' ? agent.whenIdle() : Promise.resolve()
+    void idle.catch(() => undefined).finally(() => { if (typeof dispose === 'function') dispose() })
+    let timer
+    await Promise.race([
+      idle.catch(() => undefined),
+      new Promise((resolveWait) => { timer = setTimeout(resolveWait, 10_000) }),
+    ])
+    clearTimeout(timer)
+  }
+
+  /**
    * Create or resume the DSH agent for one Telegram chat.
    * @param chat - chat bridge state.
    * @returns the live agent.
@@ -1767,6 +1819,7 @@ export function apply(ctx, config) {
         })
         const agent = created?.agent ?? created
         const sessionId = agent.session?.id ?? agent.id
+        await claimForTopic(agent, chat)
         await bindSession(chat, sessionId, '', targetCwd)
         await attachToWorkspace(sessionId, targetCwd)
         attachAgent(agent, chat)
@@ -1782,6 +1835,7 @@ export function apply(ctx, config) {
     const meta = { cwd: targetCwd }
     if (preset !== undefined && ctx.get('agentPresets') !== undefined) meta.agentPreset = preset
     const handle = await agents.create({ sessionId, meta, ...agentOptions, setup })
+    await claimForTopic(handle.agent, chat)
     await bindSession(chat, sessionId, '', targetCwd)
     await attachToWorkspace(sessionId, meta.cwd)
     attachAgent(handle.agent, chat)
@@ -2592,7 +2646,9 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Remember a topic's name so senders can address it by name.
+   * Remember a topic's name, for labels and the titles of bound sessions.
+   * When the bound session still carries the title the bot gave it, the title
+   * follows the new name; a title someone chose is left alone.
    * @param chatId - chat holding the topic.
    * @param threadId - topic thread.
    * @param name - topic name.
@@ -2603,9 +2659,53 @@ export function apply(ctx, config) {
     const key = `${chatId}:${threadId}`
     state.topicNames ??= {}
     if (!authoritative && state.topicNames[key] !== undefined) return
-    if (state.topicNames[key] === name) return
+    const previous = state.topicNames[key]
+    if (previous === name) return
     state.topicNames[key] = name
     void persistState()
+    const sessionId = state.threads[key]
+    const session = typeof sessionId === 'string' ? ctx.get('agents')?.get(sessionId)?.session : undefined
+    if (session === undefined) return
+    const current = currentSessionTitle(session)
+    if (current === boundTitle(previous ?? `topic ${threadId}`) || current === boundTitle(`topic ${threadId}`)) {
+      setSessionTitle(session, boundTitle(name))
+    }
+  }
+
+  /**
+   * The DSH title of a session bound to a topic.
+   * @param topicName - the topic's name.
+   * @returns the session title.
+   */
+  function boundTitle(topicName) {
+    return `TG · ${topicName}`
+  }
+
+  /**
+   * Read a live session's DSH title.
+   * @param session - live session.
+   * @returns the title, or undefined when it has none or no title service runs.
+   */
+  function currentSessionTitle(session) {
+    try {
+      const title = ctx.get('sessionTitle')?.get(session)
+      return typeof title?.title === 'string' ? title.title : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Set a live session's DSH title. Telegram topics are never renamed here.
+   * @param session - live session.
+   * @param title - new title.
+   */
+  function setSessionTitle(session, title) {
+    try {
+      ctx.get('sessionTitle')?.rename(session, title)
+    } catch (error) {
+      warn(`session title not set for ${session?.id}: ${messageOf(error)}`)
+    }
   }
 
   /** File types Telegram shows inline as photos. */
@@ -2635,7 +2735,8 @@ export function apply(ctx, config) {
       file.data,
       Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
     ])
-    return call(method, { chat_id: chatId }, signal, 120_000, { body, contentType: `multipart/form-data; boundary=${boundary}` })
+    // The JSON payload only names the chat and topic for pacing and error handling.
+    return call(method, { chat_id: chatId, message_thread_id: threadId }, signal, 120_000, { body, contentType: `multipart/form-data; boundary=${boundary}` })
   }
 
   /** Messages sent through sendToTopic, for the context of later replies. */
@@ -2670,12 +2771,23 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Send text and files into a topic, addressed by name or thread id, and
+   * Thread ids the bot knows in a chat: bound topics and named ones.
+   * @param chatId - chat to list.
+   * @returns the thread ids.
+   */
+  function knownThreads(chatId) {
+    const prefix = `${chatId}:`
+    const keys = [...Object.keys(state.threads), ...Object.keys(state.topicNames ?? {})]
+    return new Set(keys.filter((key) => key.startsWith(prefix)).map((key) => Number(key.slice(prefix.length))).filter((id) => !isAllThread(id)))
+  }
+
+  /**
+   * Send text and files into a topic, addressed by its thread id, and
    * record them in the session bound to that topic without starting a turn.
    * The Host service, the agent tool and the file spool all use this.
-   * Errors a retry cannot fix (an unknown topic, a bad file, a send that
+   * Errors a retry cannot fix (an unknown thread id, a bad file, a send that
    * already reached Telegram in part) carry `retryable: false`.
-   * @param request - `{ to, text, files, from }`; `to` is a topic name or
+   * @param request - `{ to, text, files, from }`; `to` is the topic's
    *   thread id; `from` may hold `label` (who sent it), `job` (a job name)
    *   and `sessionId` (the sender session; when it is the bound session
    *   itself, no copy is recorded).
@@ -2690,13 +2802,13 @@ export function apply(ctx, config) {
     const paths = Array.isArray(request?.files) ? request.files.map(String) : []
     if (text.trim().length === 0 && paths.length === 0) throw finalError('Nothing to send: give text or files.')
     const chatId = topics.chatId
-    let target
+    let threadId
     try {
-      target = resolveTopicTarget(state.topicNames, chatId, request?.to)
+      threadId = resolveThreadTarget(knownThreads(chatId), request?.to)
     } catch (error) {
       throw finalError(error)
     }
-    const threadId = target.threadId
+    const target = { threadId, name: state.topicNames?.[`${chatId}:${threadId}`] }
     // Read every file first, so a bad path fails before anything is sent.
     const files = []
     for (const path of paths) {
@@ -2724,10 +2836,9 @@ export function apply(ctx, config) {
         if (result?.message_id !== undefined) messageIds.push(result.message_id)
       }
     } catch (error) {
-      if (/thread not found|topic.*not found/iu.test(messageOf(error))) {
-        delete state.topicNames[`${chatId}:${threadId}`]
-        await persistState()
-        throw finalError(`Telegram topic ${target.name === undefined ? threadId : `"${target.name}"`} no longer exists.`)
+      // call() has already dropped the topic's binding and name.
+      if (isTopicGone(messageOf(error))) {
+        throw finalError(`Telegram thread ${threadId} no longer exists; the bot forgot it.`)
       }
       // Part of it is in Telegram already; sending again would repeat that part.
       throw messageIds.length > 0 ? finalError(`${messageOf(error)} (after ${messageIds.length} message(s) were sent)`) : error
@@ -3437,6 +3548,37 @@ export function apply(ctx, config) {
         other.permission = undefined
       }
     }
+  }
+
+  /**
+   * Drop everything the bot keeps about a topic Telegram says no longer exists
+   * (its session binding, its name and its live bridge state), so stale topics
+   * clean themselves up instead of failing on every later call. The session
+   * stays in DSH and can be bound to another topic.
+   * @param chatId - chat that held the topic.
+   * @param threadId - the deleted topic's thread id.
+   * @param method - Bot API method that reported it, for the log.
+   * @returns whether anything was dropped.
+   */
+  function forgetGoneTopic(chatId, threadId, method) {
+    if (typeof threadId !== 'number' || isAllThread(threadId)) return false
+    const key = `${chatId}:${threadId}`
+    const sessionId = state.threads[key]
+    const chat = chats.get(key)
+    const named = state.topicNames?.[key] !== undefined
+    const records = Object.entries(state.sessions).filter(([, record]) => String(record?.chatId) === String(chatId) && record?.threadId === threadId)
+    if (sessionId === undefined && chat === undefined && !named && records.length === 0) return false
+    if (chat !== undefined) {
+      releaseTopic(chat, false)
+      chat.bindPrompts = []
+      chats.delete(key)
+    }
+    delete state.threads[key]
+    for (const [id] of records) delete state.sessions[id]
+    delete state.topicNames?.[key]
+    info(`Telegram topic ${threadId} no longer exists (${method}); dropped its binding${typeof sessionId === 'string' ? ` to ${sessionId}` : ''} and name`)
+    void persistState()
+    return true
   }
 
   /**
@@ -4522,40 +4664,43 @@ export function apply(ctx, config) {
   /** Topic sending for other plugins: `ctx.get('telegramTopics').send(...)`. */
   const topicService = {
     /**
-     * @param request - `{ to, text, files, from }`: `to` is a topic name (any
-     *   case) or thread id, `text` Markdown, `files` absolute paths, `from`
+     * @param request - `{ to, text, files, from }`: `to` is the topic's
+     *   thread id, `text` Markdown, `files` absolute paths, `from`
      *   `{ job, sessionId, label }` naming the sender.
      */
     send: ({ to, text, files = [], from } = {}) => sendToTopic({ to, text, files, from }),
-    /** @returns known topic names and thread ids in the bot's chat. */
-    topics: () => Object.entries(state.topicNames ?? {})
-      .filter(([key]) => key.startsWith(`${topics.chatId}:`))
-      .map(([key, name]) => ({ threadId: Number(key.split(':')[1]), name, sessionId: state.threads[key] ?? null })),
+    /** @returns the topics the bot knows in its chat: thread id, last known name, bound session. */
+    topics: () => [...knownThreads(topics.chatId)]
+      .sort((left, right) => left - right)
+      .map((threadId) => {
+        const key = `${topics.chatId}:${threadId}`
+        return { threadId, name: state.topicNames?.[key] ?? null, sessionId: state.threads[key] ?? null }
+      }),
   }
   if (typeof ctx.provide === 'function') ctx.provide('telegramTopics', topicService)
 
   /** Model-facing tool for sending into a topic; see sendToTopic. */
   const sendTool = {
     name: 'telegram_send',
-    description: 'Send a message, and optionally files, into a Telegram topic of the DSH Telegram bot, addressed by topic name or thread id. The message appears in the topic and is recorded in the session bound to that topic, which sees it on its next turn; no turn is started. Use it to notify the user on Telegram. Fails on an unknown or ambiguous topic name.',
+    description: 'Send a message, and optionally files, into a Telegram topic of the DSH Telegram bot, addressed by its numeric thread id. The message appears in the topic and is recorded in the session bound to that topic, which sees it on its next turn; no turn is started. Use it to notify the user on Telegram. Fails on a thread id the bot does not know.',
     parameters: {
       type: 'object',
       properties: {
-        topic: { type: 'string', description: 'Topic name (case does not matter) or numeric thread id.' },
+        thread: { type: 'string', description: 'Numeric Telegram thread id of the topic (/id in the topic shows it).' },
         text: { type: 'string', description: 'Message text; Markdown is converted for Telegram.' },
         files: { type: 'array', items: { type: 'string' }, description: 'Absolute paths of files to attach.' },
       },
-      required: ['topic'],
+      required: ['thread'],
     },
     output: {
       schema: {},
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
     async execute(args, exec) {
-      if (typeof args?.topic !== 'string' && typeof args?.topic !== 'number') throw new Error('topic is required')
+      if (typeof args?.thread !== 'string' && typeof args?.thread !== 'number') throw new Error('thread is required')
       const sessionId = exec?.agent?.id ?? exec?.agent?.session?.id
       return sendToTopic({
-        to: args.topic,
+        to: args.thread,
         text: typeof args.text === 'string' ? args.text : '',
         files: Array.isArray(args.files) ? args.files : [],
         from: typeof sessionId === 'string' ? { label: `session ${sessionId}`, sessionId } : undefined,

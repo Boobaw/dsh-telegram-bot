@@ -10,21 +10,22 @@ import { resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import { enqueue, waitForResult } from '../src/outbox.js'
 
-const usage = `Usage: dsh-telegram-send --topic <name|thread-id> [--file <path>]...
+const usage = `Usage: dsh-telegram-send --thread <thread-id> [--file <path>]...
                          [--job <name>] [--from-session <id>] [--from <label>]
                          [--no-wait] [--timeout <seconds>] [text...]
 
 Sends text (from the arguments, or from stdin when none are given) and files
-into a topic of the running DSH Telegram bot. The message is also recorded in
-the session bound to that topic, without starting a turn. Topic names ignore
-case. Long text is split into several Telegram messages.
+into a topic of the running DSH Telegram bot, addressed by its numeric thread
+id (/id in the topic shows it). The message is also recorded in the session
+bound to that topic, without starting a turn. Long text is split into several
+Telegram messages.
 
   --job <name>           name of the job or script sending it
   --from-session <id>    DSH session sending it; defaults to $DSH_SESSION_ID
                          (set inside DSH sessions), --from-session '' for none
   --from <label>         free-form sender label, used when neither is given
 
-Exit codes: 0 sent, 1 failed (for example an unknown topic), 2 bad arguments,
+Exit codes: 0 sent, 1 failed (for example an unknown thread id), 2 bad arguments,
 3 still queued after the timeout (the bot sends it once it runs).`
 
 let options
@@ -32,7 +33,7 @@ try {
   options = parseArgs({
     allowPositionals: true,
     options: {
-      topic: { type: 'string', short: 't' },
+      thread: { type: 'string', short: 't' },
       file: { type: 'string', short: 'f', multiple: true },
       from: { type: 'string' },
       job: { type: 'string', short: 'j' },
@@ -51,8 +52,8 @@ if (values.help) {
   process.stdout.write(`${usage}\n`)
   process.exit(0)
 }
-if (values.topic === undefined || values.topic.trim().length === 0) {
-  process.stderr.write(`--topic is required.\n\n${usage}\n`)
+if (values.thread === undefined || !/^\d+$/u.test(values.thread.trim())) {
+  process.stderr.write(`--thread takes the topic's numeric thread id.\n\n${usage}\n`)
   process.exit(2)
 }
 
@@ -78,7 +79,7 @@ const sessionId = sessionIdOf(values['from-session'] ?? process.env.DSH_SESSION_
 if (sessionId !== undefined) from.sessionId = sessionId
 
 const id = await enqueue({
-  to: values.topic,
+  to: values.thread.trim(),
   text,
   files,
   ...(Object.keys(from).length === 0 ? {} : { from }),

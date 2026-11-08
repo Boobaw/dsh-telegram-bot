@@ -1,4 +1,4 @@
-/** Topic names known to the bot and how send targets resolve to threads. */
+/** Topic names known to the bot, send targets and topic errors. */
 
 /**
  * Pick the topic name a Telegram message announces, if any.
@@ -43,29 +43,27 @@ export function isAutoCommandTopic(command, text, topicName, fresh) {
 }
 
 /**
- * Resolve a send target: a numeric thread id, or a topic name compared
- * without regard to case.
- * @param names - `{ "<chatId>:<threadId>": name }`.
- * @param chatId - chat the topics live in.
- * @param target - topic name or thread id.
- * @returns `{ threadId, name }`.
+ * Resolve a send target to a thread the bot knows in this chat. Only numeric
+ * thread ids are accepted; topic names are display text, not addresses.
+ * @param known - thread ids the bot knows in the chat.
+ * @param target - thread id, as a number or a string of digits.
+ * @returns the thread id.
  */
-export function resolveTopicTarget(names, chatId, target) {
+export function resolveThreadTarget(known, target) {
   const raw = typeof target === 'number' ? String(target) : String(target ?? '').trim()
-  if (raw.length === 0) throw new Error('A topic name or thread id is required.')
-  const known = Object.entries(names ?? {})
-    .filter(([key]) => key.startsWith(`${chatId}:`))
-    .map(([key, name]) => ({ threadId: Number(key.slice(String(chatId).length + 1)), name: String(name) }))
-  if (/^\d+$/u.test(raw)) {
-    const threadId = Number(raw)
-    return { threadId, name: known.find((entry) => entry.threadId === threadId)?.name }
-  }
-  const wanted = raw.toLocaleLowerCase()
-  const matches = known.filter((entry) => entry.name.trim().toLocaleLowerCase() === wanted)
-  if (matches.length === 1) return matches[0]
-  if (matches.length > 1) {
-    throw new Error(`Several topics are named "${raw}" (thread ids ${matches.map((entry) => entry.threadId).join(', ')}). Send to a thread id instead.`)
-  }
-  const list = known.map((entry) => `"${entry.name}" (${entry.threadId})`).join(', ')
-  throw new Error(`Unknown Telegram topic "${raw}". ${list.length > 0 ? `Known topics: ${list}.` : 'The bot knows no topic names yet.'} Rename the topic in Telegram or with /rename so the bot learns its name, or send to its thread id (/id in the topic).`)
+  if (raw.length === 0) throw new Error('A Telegram thread id is required.')
+  if (!/^\d+$/u.test(raw)) throw new Error(`"${raw}" is not a Telegram thread id. Topics are addressed by their numeric thread id; /id in a topic shows it.`)
+  const threadId = Number(raw)
+  if (!known.has(threadId)) throw new Error(`Unknown thread id ${threadId}: the bot knows no topic with that id in its chat. /id in a topic shows its thread id.`)
+  return threadId
+}
+
+/**
+ * Whether a Bot API error means the topic itself no longer exists, so its
+ * binding can never work again. A closed topic is not gone: it can be reopened.
+ * @param description - Telegram's error description.
+ * @returns true for a deleted or invalid topic.
+ */
+export function isTopicGone(description) {
+  return /message thread not found|TOPIC_ID_INVALID|TOPIC_DELETED/iu.test(String(description ?? ''))
 }

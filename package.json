@@ -1,6 +1,6 @@
 {
   "name": "dsh-telegram-bot",
-  "version": "0.2.2-fork.5",
+  "version": "0.2.2-fork.6",
   "description": "Telegram sessions, topics, model controls and approvals for DeepSeek Harness.",
   "type": "module",
   "main": "./index.js",

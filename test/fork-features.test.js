@@ -5,9 +5,10 @@ import { join } from 'node:path'
 import test from 'node:test'
 import https from 'node:https'
 import { STATUS_DIR } from '../src/constants.js'
+import { followupThroughGate, makeTitleService } from './fake-dsh.js'
 import { senderLabel } from '../src/message-context.js'
 import { enqueue, waitForResult } from '../src/outbox.js'
-import { isAutoCommandTopic, resolveTopicTarget, topicNameOf } from '../src/topics.js'
+import { isAutoCommandTopic, isTopicGone, resolveThreadTarget, topicNameOf } from '../src/topics.js'
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -38,7 +39,7 @@ function makeHost() {
       ctx: { on: (name, fn) => { events.on(name, fn); return () => events.off(name, fn) } },
       status: 'idle',
       received: [],
-      followup(message) { this.received.push(message) },
+      followup(message) { followupThroughGate(this, events, message) },
       injected: [],
       inject(message) { this.injected.push(message) },
       whenIdle() { return wait(20) },
@@ -85,6 +86,7 @@ function makeHost() {
       async saveFile({ data, name }) { return { attachmentId: `file-${name}`, name, bytes: data.length } },
       async saveImage({ data, name, mediaType }) { return { attachmentId: `image-${name}`, name, bytes: data.length, mediaType, width: 1, height: 1 } },
     },
+    sessionTitle: makeTitleService(),
     tools: { register(definition) { tools.set(definition.name, definition); return () => tools.delete(definition.name) } },
   }
   const provided = {}
@@ -106,6 +108,8 @@ function makeTelegram() {
   const calls = []
   const pending = []
   const missingThreads = new Set()
+  /** Thread id -> Bot API error for every call into that topic. */
+  const goneThreads = new Map()
   const undeletable = new Set()
   let messageId = 0
   let topicId = 7000
@@ -150,6 +154,7 @@ function makeTelegram() {
       }
       if (method === 'getUpdates') return deliver({ ok: true, result: pending.splice(0) }, 15)
       calls.push({ method, body })
+      if (goneThreads.has(body?.message_thread_id)) return deliver({ ok: false, description: goneThreads.get(body.message_thread_id) })
       if (method === 'createForumTopic') {
         topicId += 1
         return deliver({ ok: true, result: { message_thread_id: topicId, name: body.name } })
@@ -191,7 +196,7 @@ function makeTelegram() {
     messageId += 1
     pending.push({ update_id: updateId, message: { message_id: messageId, date: 1, chat: { id: 100, type: 'private' }, from: { id: 42 }, ...message } })
   }
-  return { fake, calls, push, pushCallback, missingThreads, undeletable }
+  return { fake, calls, push, pushCallback, missingThreads, goneThreads, undeletable }
 }
 
 /** Start the plugin against fresh fakes and an optional initial state. */
@@ -469,15 +474,19 @@ test('a Telegram message during a Web turn waits for that turn', async () => {
 })
 
 
-test('topic targets resolve by name without case, or by thread id', () => {
-  const names = { '100:7001': 'Notify', '100:7002': 'chat', '100:7003': 'Chat', '200:9': 'notify' }
-  assert.deepEqual(resolveTopicTarget(names, 100, 'NOTIFY'), { threadId: 7001, name: 'Notify' })
-  assert.deepEqual(resolveTopicTarget(names, 100, '7002'), { threadId: 7002, name: 'chat' })
-  assert.deepEqual(resolveTopicTarget(names, 100, 4242), { threadId: 4242, name: undefined })
-  assert.throws(() => resolveTopicTarget(names, 100, 'chat'), /Several topics are named "chat" \(thread ids 7002, 7003\)/)
-  assert.throws(() => resolveTopicTarget(names, 100, 'missing'), /Unknown Telegram topic "missing"/)
+test('send targets are thread ids the bot knows; names are not addresses', () => {
+  const known = new Set([7001, 7002])
+  assert.equal(resolveThreadTarget(known, '7002'), 7002)
+  assert.equal(resolveThreadTarget(known, 7001), 7001)
+  assert.throws(() => resolveThreadTarget(known, 'Notify'), /"Notify" is not a Telegram thread id/)
+  assert.throws(() => resolveThreadTarget(known, 4242), /Unknown thread id 4242/)
+  assert.throws(() => resolveThreadTarget(known, ' '), /thread id is required/)
   assert.equal(topicNameOf({ forum_topic_edited: { name: 'Alerts' } }).name, 'Alerts')
   assert.equal(topicNameOf({ reply_to_message: { forum_topic_created: { name: 'Old' } } }).authoritative, false)
+  assert.equal(isTopicGone('Bad Request: message thread not found'), true)
+  assert.equal(isTopicGone('Bad Request: TOPIC_ID_INVALID'), true)
+  assert.equal(isTopicGone('Bad Request: TOPIC_DELETED'), true)
+  assert.equal(isTopicGone('Bad Request: TOPIC_CLOSED'), false, 'a closed topic can be reopened')
 })
 
 /** State with one topic named "Notify" bound to session-notify. */
@@ -486,13 +495,13 @@ const notifyState = {
   threads: { '100:7100': 'session-notify' },
 }
 
-test('the Host service posts into a named topic and records it in the bound session', async () => {
+test('the Host service posts into a topic by thread id and records it in the bound session', async () => {
   const run = await start({}, notifyState)
   try {
     const agent = run.host.makeAgent('session-notify', '/tmp/default-workspace')
     const file = join(STATUS_DIR, 'report.txt')
     await writeFile(file, 'report body')
-    const result = await run.host.provided.telegramTopics.send({ to: 'notify', text: 'Backup **done**', files: [file], from: { label: 'backup job' } })
+    const result = await run.host.provided.telegramTopics.send({ to: 7100, text: 'Backup **done**', files: [file], from: { label: 'backup job' } })
     assert.equal(result.threadId, 7100)
     assert.equal(result.recorded, true)
     assert.ok(sent(run.telegram.calls, 7100).some((call) => call.body.text.includes('Backup')))
@@ -503,9 +512,10 @@ test('the Host service posts into a named topic and records it in the bound sess
     assert.match(content[0].text, /^\[Sent to the Telegram topic "Notify" by backup job\]\nBackup \*\*done\*\*/)
     assert.equal(content[1].type, 'file')
     assert.match(agent.injected[0].source.rpcId, /^telegram-post:/)
-    await assert.rejects(run.host.provided.telegramTopics.send({ to: 'nope', text: 'x' }), (error) => /Unknown Telegram topic "nope"/.test(error.message) && error.retryable === false)
-    await assert.rejects(run.host.provided.telegramTopics.send({ to: 'notify', text: 'x', files: [join(STATUS_DIR, 'missing.txt')] }), (error) => error.retryable === false)
-    await assert.rejects(run.host.provided.telegramTopics.send({ to: 'notify', text: ' ' }), (error) => /Nothing to send/.test(error.message) && error.retryable === false)
+    await assert.rejects(run.host.provided.telegramTopics.send({ to: 4242, text: 'x' }), (error) => /Unknown thread id 4242/.test(error.message) && error.retryable === false)
+    await assert.rejects(run.host.provided.telegramTopics.send({ to: 'notify', text: 'x' }), (error) => /not a Telegram thread id/.test(error.message) && error.retryable === false)
+    await assert.rejects(run.host.provided.telegramTopics.send({ to: 7100, text: 'x', files: [join(STATUS_DIR, 'missing.txt')] }), (error) => error.retryable === false)
+    await assert.rejects(run.host.provided.telegramTopics.send({ to: 7100, text: ' ' }), (error) => /Nothing to send/.test(error.message) && error.retryable === false)
   } finally {
     run.stop()
   }
@@ -524,19 +534,19 @@ test('send({ to, text, files, from }) takes a thread id and names the job and it
   }
 })
 
-test('a renamed topic is found by its new name and keeps its target after /new', async () => {
+test('a renamed topic keeps its thread id after /new, and the name only labels it', async () => {
   const run = await start({}, notifyState)
   try {
     run.host.makeAgent('session-notify', '/tmp/default-workspace')
     run.telegram.push({ message_thread_id: 7100, forum_topic_edited: { name: 'Alerts' } })
     await wait(100)
-    await assert.rejects(run.host.provided.telegramTopics.send({ to: 'notify', text: 'x' }), /Unknown Telegram topic/)
     run.telegram.push({ message_thread_id: 7100, text: '/new' })
     await wait(200)
-    const result = await run.host.provided.telegramTopics.send({ to: 'ALERTS', text: 'after new' })
+    const result = await run.host.provided.telegramTopics.send({ to: '7100', text: 'after new' })
     assert.equal(result.threadId, 7100)
     assert.equal(result.sessionId, 'session-1')
-    assert.equal(run.host.live.get('session-1').injected.length, 1)
+    assert.match(run.host.live.get('session-1').injected[0].content[0].text, /^\[Sent to the Telegram topic "Alerts"\]/u)
+    assert.deepEqual(run.host.provided.telegramTopics.topics(), [{ threadId: 7100, name: 'Alerts', sessionId: 'session-1' }])
   } finally {
     run.stop()
   }
@@ -548,17 +558,17 @@ test('the agent tool and the file spool use the same path', async () => {
     const agent = run.host.makeAgent('session-notify', '/tmp/default-workspace')
     const tool = run.host.tools.get('telegram_send')
     assert.ok(tool, 'tool registered')
-    const own = await tool.execute({ topic: 'Notify', text: 'from my own session' }, { agent: { id: 'session-notify' } })
+    const own = await tool.execute({ thread: '7100', text: 'from my own session' }, { agent: { id: 'session-notify' } })
     assert.equal(own.recorded, false, 'the sending session gets no copy of its own message')
-    const other = await tool.execute({ topic: 'Notify', text: 'from elsewhere' }, { agent: { id: 'session-other' } })
+    const other = await tool.execute({ thread: '7100', text: 'from elsewhere' }, { agent: { id: 'session-other' } })
     assert.equal(other.recorded, true)
-    const id = await enqueue({ to: 'notify', text: 'from cron', from: { label: 'cron' } })
+    const id = await enqueue({ to: '7100', text: 'from cron', from: { label: 'cron' } })
     const result = await waitForResult(id, 3000)
     assert.equal(result?.ok, true, JSON.stringify(result))
     assert.equal(result.result.threadId, 7100)
-    const bad = await waitForResult(await enqueue({ to: 'missing', text: 'x' }), 3000)
+    const bad = await waitForResult(await enqueue({ to: '4242', text: 'x' }), 3000)
     assert.equal(bad.ok, false)
-    assert.match(bad.error, /Unknown Telegram topic/)
+    assert.match(bad.error, /Unknown thread id 4242/)
     assert.equal(agent.injected.length, 2)
   } finally {
     run.stop()
@@ -570,7 +580,7 @@ test('a long send from a job is recorded with its sender, and a reply after /new
   try {
     const old = run.host.makeAgent('session-notify', '/tmp/default-workspace')
     const long = Array.from({ length: 900 }, (_, index) => `word${index}`).join(' ')
-    const id = await enqueue({ to: 'notify', text: long, from: { job: 'Morning digest', sessionId: 'session-cron' } })
+    const id = await enqueue({ to: '7100', text: long, from: { job: 'Morning digest', sessionId: 'session-cron' } })
     const result = (await waitForResult(id, 3000)).result
     assert.ok(result.messageIds.length >= 2, 'split into several messages')
     assert.equal(result.recorded, true)
@@ -606,7 +616,7 @@ test('a long send from a job is recorded with its sender, and a reply after /new
 test('a topic without a session, or a session that cannot record, still gets the message', async () => {
   const run = await start({}, { threads: {}, topicNames: { '100:7200': 'Loose' } })
   try {
-    const unbound = await run.host.provided.telegramTopics.send({ to: 'loose', text: 'hello', files: [], from: { job: 'probe' } })
+    const unbound = await run.host.provided.telegramTopics.send({ to: '7200', text: 'hello', files: [], from: { job: 'probe' } })
     assert.equal(unbound.recorded, false)
     assert.match(unbound.note, /no bound session/u)
     assert.equal(sent(run.telegram.calls, 7200).length, 1)
@@ -617,7 +627,7 @@ test('a topic without a session, or a session that cannot record, still gets the
   try {
     const agent = broken.host.makeAgent('session-notify', '/tmp/default-workspace')
     agent.inject = () => { throw new Error('session closed') }
-    const result = await broken.host.provided.telegramTopics.send({ to: 'notify', text: 'still sent' })
+    const result = await broken.host.provided.telegramTopics.send({ to: '7100', text: 'still sent' })
     assert.equal(result.recorded, false)
     assert.equal(result.recordError, 'session closed')
     assert.ok(sent(broken.telegram.calls, 7100).some((call) => call.body.text.includes('still sent')))
@@ -864,6 +874,86 @@ test('every Telegram prompt says who wrote it, once per forwarded batch', async 
     const text = promptText(agent.received.at(-1))
     assert.equal(text.match(/\[Telegram message from/gu).length, 1, 'one label for the batch')
     assert.ok(text.startsWith(SENDER))
+  } finally {
+    run.stop()
+  }
+})
+
+test('a session opened for a topic is never blank and carries the topic title', async () => {
+  const run = await start({}, notifyState)
+  try {
+    run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    run.telegram.push({ message_thread_id: 7100, forum_topic_edited: { name: 'Alerts' } })
+    await wait(100)
+    run.telegram.push({ message_thread_id: 7100, text: '/new' })
+    await wait(250)
+    const fresh = run.host.live.get('session-1')
+    // DSH reuses a session for the Web UI's New conversation until it has
+    // started a turn; the bot runs one at once, rejected before any model call.
+    assert.equal(fresh.turns, 1, 'one turn started right after creation')
+    assert.equal(fresh.received.length, 0, 'nothing reached the model')
+    assert.equal(fresh.rejected.length, 1)
+    assert.match(fresh.rejected[0].source.rpcId, /^telegram-claim:/u)
+    assert.equal(fresh.session.title, 'TG · Alerts')
+    const before = run.telegram.calls.length
+    run.telegram.push({ message_thread_id: 7100, text: 'real question' })
+    await wait(200)
+    assert.equal(fresh.received.at(-1).content[0].text, `${SENDER}real question`, 'later prompts pass the gate')
+    assert.equal(run.telegram.calls.slice(before).filter((call) => String(call.body?.text ?? '').includes('belongs to the Telegram topic')).length, 0, 'the marker is not shown in the topic')
+  } finally {
+    run.stop()
+  }
+})
+
+test('the session title follows a topic rename unless someone chose another title', async () => {
+  const run = await start()
+  try {
+    const agent = await openSessionTopic(run)
+    const state = await run.readState()
+    assert.equal(agent.session.title, `TG · ${state.topicNames['100:7001']}`)
+    run.telegram.push({ message_thread_id: 7001, forum_topic_edited: { name: 'Ops' } })
+    await wait(100)
+    assert.equal(agent.session.title, 'TG · Ops')
+    agent.session.title = 'My own title'
+    run.telegram.push({ message_thread_id: 7001, forum_topic_edited: { name: 'Ops 2' } })
+    await wait(100)
+    assert.equal(agent.session.title, 'My own title')
+    assert.equal(run.telegram.calls.filter((call) => call.method === 'editForumTopic').length, 0, 'the topic itself is never renamed')
+  } finally {
+    run.stop()
+  }
+})
+
+test('a send into a deleted topic drops its binding and name', async () => {
+  const run = await start({}, { ...notifyState, topicNames: { '100:7100': 'Notify', '100:7200': 'Other' } })
+  try {
+    run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    run.telegram.goneThreads.set(7100, 'Bad Request: message thread not found')
+    await assert.rejects(run.host.provided.telegramTopics.send({ to: 7100, text: 'x' }), (error) => /no longer exists/.test(error.message) && error.retryable === false)
+    await wait(50)
+    const state = await run.readState()
+    assert.equal(state.threads['100:7100'], undefined)
+    assert.equal(state.sessions['session-notify'], undefined)
+    assert.equal(state.topicNames['100:7100'], undefined)
+    assert.equal(state.topicNames['100:7200'], 'Other', 'other topics are kept')
+    assert.ok(run.host.logs.some((line) => line.includes('topic 7100 no longer exists') && line.includes('session-notify')))
+    await assert.rejects(run.host.provided.telegramTopics.send({ to: 7100, text: 'x' }), /Unknown thread id 7100/)
+  } finally {
+    run.stop()
+  }
+})
+
+test('any Telegram call into a deleted topic, such as a mirrored turn, drops its binding', async () => {
+  const run = await start()
+  try {
+    const agent = await openSessionTopic(run)
+    run.telegram.goneThreads.set(7001, 'Bad Request: TOPIC_ID_INVALID')
+    await playExternalTurn(agent, 2, { id: 'web-9', role: 'user', content: [{ type: 'text', text: 'from web' }], source: { kind: 'user', rpcId: 'rpc-web-9' } }, 'web answer')
+    await wait(100)
+    const state = await run.readState()
+    assert.equal(state.threads['100:7001'], undefined)
+    assert.equal(state.sessions['session-1'], undefined)
+    assert.equal(state.topicNames['100:7001'], undefined)
   } finally {
     run.stop()
   }

@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import https from 'node:https'
 import { STATUS_DIR } from '../src/constants.js'
+import { followupThroughGate } from './fake-dsh.js'
 
 function makeAgent(id, cwd, idleMs) {
   const events = new EventEmitter()
@@ -15,8 +16,12 @@ function makeAgent(id, cwd, idleMs) {
     events,
     status: 'idle',
     received: [],
-    followup(message) { this.received.push(message) },
-    whenIdle() { return new Promise((resolve) => setTimeout(resolve, idleMs)) },
+    followup(message) { followupThroughGate(this, events, message) },
+    // A turn whose message was rejected before the model ends at once.
+    whenIdle() {
+      return new Promise((resolve) => setImmediate(resolve))
+        .then(() => (this.received.length === 0 ? undefined : new Promise((resolve) => setTimeout(resolve, idleMs))))
+    },
     cancel() {},
   }
 }
