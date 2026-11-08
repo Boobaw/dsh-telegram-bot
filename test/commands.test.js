@@ -220,7 +220,7 @@ test('fork creates one new topic with the requested name', async () => {
   }
 })
 
-test('a provider title event renames the existing topic', async () => {
+test('a provider title event leaves the topic name alone', async () => {
   const result = await runScenario([all('hello')], 20, 350, async ({ agent }) => {
     agent.events.emit('session/event', { id: 'session-one' }, {
       type: 'session/title',
@@ -230,8 +230,7 @@ test('a provider title event renames the existing topic', async () => {
   })
   try {
     const edits = result.calls.filter((call) => call.method === 'editForumTopic')
-    assert.equal(edits.length > 0, true)
-    assert.equal(edits.at(-1).body.name, 'Provider title')
+    assert.equal(edits.length, 0, 'topic names belong to the user')
   } finally {
     result.cleanup()
   }

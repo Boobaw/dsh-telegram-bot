@@ -1540,9 +1540,6 @@ export function apply(ctx, config) {
           chat.activeTurn = undefined
           finalizeSafely(chat)
         }
-        if (event.type === 'session/title' && typeof event.data?.title === 'string') {
-          fireAndForget('title-event', () => applyTopicTitle(chat, event.data.title))
-        }
       } catch (error) {
         reportError('session-event', error)
       }
@@ -1964,42 +1961,6 @@ export function apply(ctx, config) {
     }
   }
 
-  /**
-   * Rename the session topic to the latest DSH session title.
-   * @param chat - chat bridge state.
-   */
-  async function applyTopicTitle(chat, title) {
-    if (typeof title !== 'string' || title.trim().length === 0) return
-    if (typeof chat.sessionId !== 'string' || chat.threadId === undefined) return
-    const record = state.sessions[chat.sessionId]
-    if (record?.titleLocked === true) return
-    const clean = title.trim()
-    if (record !== undefined && record.title === clean) return
-    try {
-      await publishStatus({ lastTopicRename: { threadId: chat.threadId, name: shortLabel(clean, 120), source: 'title' } })
-      await call('editForumTopic', {
-        chat_id: chat.chatId,
-        message_thread_id: chat.threadId,
-        name: shortLabel(clean, 120),
-      }, bridgeAbort.signal)
-      if (record !== undefined) {
-        record.title = clean
-        await persistState()
-      }
-    } catch (error) {
-      if (!bridgeAbort.signal.aborted) warn(`editForumTopic failed: ${messageOf(error)}`)
-    }
-  }
-
-  async function refreshTopicTitle(chat) {
-    if (typeof chat.sessionId !== 'string' || chat.threadId === undefined) return
-    const record = state.sessions[chat.sessionId]
-    if (record?.titleLocked === true) return
-    // Read the current title once. The title provider's later session/title
-    // event updates the topic without timers or retry loops.
-    await applyTopicTitle(chat, await sessionTitle(chat.sessionId))
-  }
-
   /** Finalize one turn and surface a finalization failure instead of hanging. */
   function finalizeSafely(chat) {
     fireAndForget('finalize', async () => {
@@ -2053,7 +2014,6 @@ export function apply(ctx, config) {
     if (next !== undefined) {
       await runAgent(chat, next.text, bridgeAbort.signal, next.attachments ?? [], next.messageId)
     }
-    fireAndForget('topic-title', () => refreshTopicTitle(chat))
     await publishStatus({ lastOutcome: 'agent-replied' })
   }
 
@@ -2752,16 +2712,7 @@ export function apply(ctx, config) {
     }
     const registry = ctx.get('workspaceRegistry')
     const workspace = workspaceRef === 'all' || workspaceRef === undefined ? undefined : registry?.get(workspaceRef)
-    const archived = new Set(registry?.archivedSessionIds ?? [])
-    const records = await query.listSessions(signal)
-    const matching = records
-      .filter((record) => !archived.has(record.header.id))
-      .filter((record) => record.header?.origin !== 'subagent')
-      .filter((record) => workspace === undefined
-        || workspace.sessionIds.includes(record.header.id)
-        || record.header.cwd === workspace.path)
-      .sort((left, right) => (right.header.createdAt ?? 0) - (left.header.createdAt ?? 0))
-      .slice(0, 12)
+    const matching = await sessionsInWorkspace(workspace, signal, 12)
     const rows = []
     if (workspace !== undefined) {
       rows.push([{ text: tr('➕ New session in this workspace', '➕ Новая сессия в этом workspace'), callback_data: `n:${workspace.id}` }])
@@ -2913,6 +2864,30 @@ export function apply(ctx, config) {
         await sendMenu(chat.id, threadId, chatState, signal, query.message.message_id)
         return
       }
+      if (prefix === 'tw' || prefix === 'tr' || prefix === 'tn' || prefix === 'tb') {
+        const chatState = await chatFor(chat.id, threadId)
+        if (isAllThread(threadId)) return
+        if (chatState.busy) {
+          await send(chat.id, tr('Stop the current task first.', 'Сначала останови текущую задачу.'), signal, threadId)
+          return
+        }
+        if (prefix === 'tr') {
+          await showTopicWorkspacePicker(chatState, signal, query.message.message_id)
+          return
+        }
+        if (prefix === 'tb') {
+          await bindTopic(chatState, { sessionId: ref }, signal, query.message.message_id)
+          return
+        }
+        const workspace = ctx.get('workspaceRegistry')?.get(ref)
+        if (typeof workspace?.path !== 'string' || workspace.path.length === 0) {
+          await send(chat.id, tr('Workspace not found. Send /workspace again.', 'Workspace не найден. Отправь /workspace снова.'), signal, threadId)
+          return
+        }
+        if (prefix === 'tw') await showTopicSessionPicker(chatState, workspace, signal, query.message.message_id)
+        else await bindTopic(chatState, { cwd: workspace.path }, signal, query.message.message_id)
+        return
+      }
       if (prefix === 'w') {
         if (ref === 'root') await showWorkspaces(chat.id, threadId, signal, query.message.message_id)
         else if (ref === 'all') await showSessions(chat.id, threadId, 'all', signal, query.message.message_id)
@@ -3022,51 +2997,73 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Bind a new DSH session to the current topic without creating another topic.
-   * @param chatState - current topic state.
-   * @param cwd - workspace path.
-   * @param initialText - first prompt, if any.
-   * @param signal - request lifetime.
+   * Detach the current session from a topic. The session stays in DSH and can
+   * be bound again later from the session picker.
+   * @param chatState - topic state.
+   * @param keepSelection - keep the model/effort/access choice for the next session.
+   * @returns the detached session id, if any.
    */
-  async function createSessionInCurrentTopic(chatState, cwd, initialText, signal, initialAttachments = [], messageId) {
-    if (typeof cwd === 'string' && cwd.length > 0) chatState.cwd = cwd
-    await ensureAgent(chatState)
-    await sendMenu(chatState.chatId, chatState.threadId, chatState, signal)
-    if (initialText.trim().length > 0 || initialAttachments.length > 0) await runAgent(chatState, initialText, signal, initialAttachments, messageId)
-  }
-
-  /**
-   * Bind a fresh DSH session to an existing topic. The previous session stays
-   * in DSH as history; only the topic binding moves. The topic keeps its name.
-   * @param chatState - current topic state.
-   * @param signal - request lifetime.
-   */
-  async function startNewSessionInTopic(chatState, signal) {
+  function releaseTopic(chatState, keepSelection) {
     const previousId = chatState.sessionId
-    const previous = typeof previousId === 'string' ? state.sessions[previousId] : undefined
-    const cwd = chatState.cwd ?? previous?.cwd ?? defaultWorkspaceCwd()
-    const title = previous?.title
     cancelQuestionsForChat(chatState)
     chatState.pendingPrompts = []
     // Old agent listeners check boundAgent and go quiet once it changes.
     chatState.boundAgent = undefined
     chatState.sessionId = undefined
     chatState.panelMessageId = undefined
-    // Keep the topic's model choice, but not the object the old agent reads.
-    if (chatState.selection !== undefined) {
+    if (keepSelection && chatState.selection !== undefined) {
+      // Keep the choice, but not the object the old agent still reads.
       chatState.selection = { current: { ...chatState.selection.current }, assembled: undefined }
+    } else {
+      chatState.selection = undefined
+      chatState.permission = undefined
     }
-    chatState.cwd = cwd
     delete state.threads[chatState.key]
     // The old record would otherwise still point at this topic, and
     // "Continue in Telegram" would reopen it here.
-    if (typeof previousId === 'string') delete state.sessions[previousId]
+    if (typeof previousId === 'string' && state.sessions[previousId]?.threadId === chatState.threadId) {
+      delete state.sessions[previousId]
+    }
+    return previousId
+  }
+
+  /**
+   * Remove a session's binding to any topic other than `exceptKey`, so one
+   * session is never mirrored into two topics.
+   * @param sessionId - session that moves.
+   * @param exceptKey - topic key that keeps it.
+   */
+  function releaseSessionElsewhere(sessionId, exceptKey) {
+    for (const [key, bound] of Object.entries(state.threads)) {
+      if (bound !== sessionId || key === exceptKey) continue
+      delete state.threads[key]
+      const other = chats.get(key)
+      if (other !== undefined) {
+        other.sessionId = undefined
+        other.boundAgent = undefined
+        other.selection = undefined
+        other.permission = undefined
+      }
+    }
+  }
+
+  /**
+   * Bind a fresh DSH session to an existing topic in the same workspace. The
+   * previous session stays in DSH as history.
+   * @param chatState - current topic state.
+   * @param signal - request lifetime.
+   */
+  async function startNewSessionInTopic(chatState, signal) {
+    const previous = typeof chatState.sessionId === 'string' ? state.sessions[chatState.sessionId] : undefined
+    const cwd = chatState.cwd ?? previous?.cwd ?? defaultWorkspaceCwd()
+    const title = previous?.title
+    const previousId = releaseTopic(chatState, true)
+    chatState.cwd = cwd
     await persistState()
     await ensureAgent(chatState)
     const record = state.sessions[chatState.sessionId]
     if (record !== undefined && typeof title === 'string' && title.length > 0) {
       record.title = title
-      record.titleLocked = true
       await persistState()
     }
     await send(
@@ -3079,6 +3076,165 @@ export function apply(ctx, config) {
       chatState.threadId,
     )
     await sendMenu(chatState.chatId, chatState.threadId, chatState, signal)
+  }
+
+  /** @returns the registered Workspaces, or an empty list. */
+  function listWorkspaces() {
+    try {
+      return ctx.get('workspaceRegistry')?.list() ?? []
+    } catch {
+      return []
+    }
+  }
+
+  /**
+   * List recent ordinary sessions that belong to one workspace.
+   * @param workspace - workspace record, or undefined for all sessions.
+   * @param signal - request lifetime.
+   * @param limit - maximum number of sessions.
+   * @returns newest-first session records.
+   */
+  async function sessionsInWorkspace(workspace, signal, limit) {
+    const query = ctx.get('sessionQuery')
+    if (query === undefined) return []
+    const archived = new Set(ctx.get('workspaceRegistry')?.archivedSessionIds ?? [])
+    const records = await query.listSessions(signal)
+    return records
+      .filter((record) => !archived.has(record.header.id))
+      .filter((record) => record.header?.origin !== 'subagent')
+      .filter((record) => workspace === undefined
+        || (workspace.sessionIds ?? []).includes(record.header.id)
+        || record.header.cwd === workspace.path)
+      .sort((left, right) => (right.header.createdAt ?? 0) - (left.header.createdAt ?? 0))
+      .slice(0, limit)
+  }
+
+  /**
+   * Ask which workspace an unbound topic (or /workspace) should use.
+   * @param chatState - topic state.
+   * @param signal - request lifetime.
+   * @param messageId - picker message to edit, if any.
+   */
+  async function showTopicWorkspacePicker(chatState, signal, messageId) {
+    const workspaces = listWorkspaces().slice(0, 10)
+    const currentCwd = typeof chatState.sessionId === 'string' ? chatState.cwd : undefined
+    const rows = workspaces.map((workspace) => [{
+      text: `${workspace.path === currentCwd ? '✅' : '📁'} ${shortLabel(workspace.title || basename(workspace.path), 44)}`,
+      callback_data: `tw:${workspace.id}`,
+    }])
+    await renderMenu(
+      chatState.chatId,
+      chatState.threadId,
+      messageId,
+      `<b>${tr('Which workspace should this topic use?', 'Какой workspace использовать в этом топике?')}</b>`,
+      rows,
+      signal,
+    )
+  }
+
+  /**
+   * Ask whether to start a new session in a workspace or bind an existing one.
+   * @param chatState - topic state.
+   * @param workspace - chosen workspace.
+   * @param signal - request lifetime.
+   * @param messageId - picker message to edit.
+   */
+  async function showTopicSessionPicker(chatState, workspace, signal, messageId) {
+    const records = await sessionsInWorkspace(workspace, signal, 8)
+    const rows = [[{ text: tr('🆕 New session', '🆕 Новая сессия'), callback_data: `tn:${workspace.id}` }]]
+    for (const record of records) {
+      const id = record.header.id
+      const title = state.sessions[id]?.title || await sessionTitle(id, record.header)
+      const boundHere = chatState.sessionId === id
+      const boundElsewhere = !boundHere && Object.entries(state.threads).some(([key, bound]) => bound === id && key !== chatState.key)
+      const mark = boundHere ? '✅' : boundElsewhere ? '🔗' : record.live ? '🟢' : '⚪'
+      rows.push([{ text: `${mark} ${shortLabel(title, 44)}`, callback_data: `tb:${id}` }])
+    }
+    rows.push([{ text: tr('⬅️ Back', '⬅️ Назад'), callback_data: 'tr:' }])
+    await renderMenu(
+      chatState.chatId,
+      chatState.threadId,
+      messageId,
+      `<b>${escapeHtml(workspace.title || basename(workspace.path))}</b>\n\n` +
+        tr('Start a new session, or continue an existing one in this topic.', 'Начни новую сессию или продолжи существующую в этом топике.') +
+        (records.some((record) => Object.entries(state.threads).some(([key, bound]) => bound === record.header.id && key !== chatState.key))
+          ? `\n🔗 ${tr('is bound to another topic and moves here.', 'привязана к другому топику и переедет сюда.')}`
+          : ''),
+      rows,
+      signal,
+    )
+  }
+
+  /**
+   * Remember a message sent before the topic has a session and ask for the
+   * workspace once. The message runs after the topic is bound.
+   * @param chatState - unbound topic state.
+   * @param prompt - text, attachments and Telegram message id.
+   * @param signal - request lifetime.
+   */
+  async function askTopicBinding(chatState, prompt, signal) {
+    chatState.bindPrompts ??= []
+    if (prompt !== undefined) chatState.bindPrompts.push(prompt)
+    if (listWorkspaces().length === 0) {
+      await bindTopic(chatState, { cwd: defaultWorkspaceCwd() }, signal)
+      return
+    }
+    if (chatState.bindPickerShown === true) {
+      await send(chatState.chatId, tr('Choose a workspace above first; your message is sent after that.', 'Сначала выбери workspace выше; сообщение отправится после этого.'), signal, chatState.threadId)
+      return
+    }
+    chatState.bindPickerShown = true
+    await showTopicWorkspacePicker(chatState, signal)
+  }
+
+  /**
+   * Bind a topic to a new session in a workspace or to an existing session,
+   * then send the messages that waited for the binding.
+   * @param chatState - topic state.
+   * @param target - `{ cwd }` for a new session or `{ sessionId }`.
+   * @param signal - request lifetime.
+   * @param messageId - picker message to replace with the result.
+   */
+  async function bindTopic(chatState, target, signal, messageId) {
+    if (typeof target.sessionId === 'string') {
+      const otherBusy = [...chats.values()].some((other) => other !== chatState && other.sessionId === target.sessionId && other.busy)
+      if (otherBusy) {
+        await send(chatState.chatId, tr('That session is working in another topic. Try again when it finishes.', 'Эта сессия сейчас работает в другом топике. Попробуй, когда она закончит.'), signal, chatState.threadId)
+        return
+      }
+    }
+    if (typeof target.sessionId === 'string' && target.sessionId === chatState.sessionId) {
+      if (messageId !== undefined) await editKeyboard(chatState.chatId, chatState.threadId, messageId, `✅ ${tr('This topic already uses that session.', 'Этот топик уже использует эту сессию.')}`, [], signal)
+      return
+    }
+    releaseTopic(chatState, false)
+    let label
+    if (typeof target.sessionId === 'string') {
+      const records = await ctx.get('sessionQuery')?.listSessions(signal)
+      const header = records?.find((entry) => entry.header.id === target.sessionId)?.header
+      const title = await sessionTitle(target.sessionId, header)
+      releaseSessionElsewhere(target.sessionId, chatState.key)
+      chatState.cwd = header?.cwd
+      await bindSession(chatState, target.sessionId, title, header?.cwd)
+      await ensureAgent(chatState)
+      label = title
+    } else {
+      chatState.cwd = target.cwd
+      await persistState()
+      await ensureAgent(chatState)
+      label = tr('New session', 'Новая сессия')
+    }
+    chatState.bindPickerShown = false
+    const where = typeof chatState.cwd === 'string' ? basename(chatState.cwd) : '?'
+    const text = `✅ <b>${escapeHtml(label)}</b>\n${tr('Workspace', 'Workspace')}: <code>${escapeHtml(where)}</code>`
+    if (messageId === undefined || !await editKeyboard(chatState.chatId, chatState.threadId, messageId, text, [], signal)) {
+      await send(chatState.chatId, text, signal, chatState.threadId)
+    }
+    await sendMenu(chatState.chatId, chatState.threadId, chatState, signal)
+    const waiting = (chatState.bindPrompts ?? []).splice(0)
+    for (const prompt of waiting) {
+      await runAgent(chatState, prompt.text, signal, prompt.attachments ?? [], prompt.messageId)
+    }
   }
 
   /**
@@ -3160,7 +3316,7 @@ export function apply(ctx, config) {
         if (isAllThread(threadId)) {
           await createNewSessionTopic(chat.id, threadId, signal, defaultWorkspaceCwd(), prompt, [attachment.block], message.message_id)
         } else if (!inSession) {
-          await createSessionInCurrentTopic(chatState, defaultWorkspaceCwd(), prompt, signal, [attachment.block], message.message_id)
+          await askTopicBinding(chatState, { text: prompt, attachments: [attachment.block], messageId: message.message_id }, signal)
         } else {
           await runAgent(chatState, prompt, signal, [attachment.block], message.message_id)
         }
@@ -3211,9 +3367,11 @@ export function apply(ctx, config) {
           `${tr('Topic', 'Топик')}: <code>${threadId ?? 0}</code>\n\n` +
           (inSession
             ? `${tr('Current session', 'Текущая сессия')}: <code>${chatState.sessionId}</code>\n`
-            : `${tr('Global topic. Choose a session or create a new one.', 'Глобальный чат. Выбери сессию или создай новую.')}\n`) +
+            : isAllThread(threadId)
+              ? `${tr('Create a topic in this chat and send a message there. I ask which workspace it should use, then start a new session or continue an existing one. /sessions opens existing sessions in new topics.', 'Создай топик в этом чате и напиши туда сообщение. Я спрошу, какой workspace использовать, и начну новую сессию или продолжу существующую. /sessions открывает существующие сессии в новых топиках.')}\n`
+              : `${tr('This topic has no session yet. Send a message to choose a workspace.', 'У этого топика ещё нет сессии. Напиши сообщение, чтобы выбрать workspace.')}\n`) +
           `\n<b>${tr('First run', 'Первый запуск')}:</b> @BotFather → Bot Settings → <b>Threaded mode</b> → ${tr('Enable', 'Включить')}.\n` +
-          `${tr('Commands', 'Команды')}: /sessions, /new, /current, /menu, /rename, /fork, /last, /clear, /stop, /restart, /status, /id, /ping.`,
+          `${tr('Commands', 'Команды')}: /sessions, /new, /workspace, /current, /menu, /rename, /fork, /last, /clear, /stop, /restart, /status, /id, /ping.`,
         signal,
         threadId,
       )
@@ -3251,6 +3409,19 @@ export function apply(ctx, config) {
       } catch (error) {
         await send(chat.id, `❌ ${escapeHtml(messageOf(error))}`, signal, threadId)
       }
+      return
+    }
+    if (command === '/workspace') {
+      if (isAllThread(threadId)) {
+        await send(chat.id, tr('Use /workspace inside a topic.', 'Используй /workspace внутри топика.'), signal, threadId)
+        return
+      }
+      if (chatState.busy) {
+        await send(chat.id, tr('Stop the current task before switching workspace.', 'Останови текущую задачу перед сменой workspace.'), signal, threadId)
+        return
+      }
+      chatState.bindPickerShown = true
+      await showTopicWorkspacePicker(chatState, signal)
       return
     }
 
@@ -3515,7 +3686,9 @@ export function apply(ctx, config) {
       return
     }
     if (route === 'current-topic') {
-      await createSessionInCurrentTopic(chatState, defaultWorkspaceCwd(), text, signal, [], message.message_id)
+      // A topic the user created (or Telegram created for a message sent in
+      // All) has no session yet: ask for the workspace, then run the message.
+      await askTopicBinding(chatState, { text, attachments: [], messageId: message.message_id }, signal)
       return
     }
 
@@ -3544,12 +3717,13 @@ export function apply(ctx, config) {
       )
       return
     }
-    if (usersCanCreate === true) {
+    if (usersCanCreate === false) {
+      // Topics are created by the user; each new topic asks for its workspace.
       await notifyAll(
-        `⚠️ <b>${tr('Users can create new topics', 'Пользователи могут создавать новые топики')}</b>\n` +
+        `⚠️ <b>${tr('Users cannot create topics', 'Пользователи не могут создавать топики')}</b>\n` +
           tr(
-            'Every message in All creates a new topic. In @BotFather → Bot Settings → Threaded mode, enable “Disallow users to create new threads”.',
-            'Каждое сообщение в All создаёт новый топик. В @BotFather → Bot Settings → Threaded mode включи «Disallow users to create new threads».',
+            'Create topics yourself to start sessions. In @BotFather → Bot Settings → Threaded mode, turn off “Disallow users to create new threads”.',
+            'Топики для сессий создаёшь ты. В @BotFather → Bot Settings → Threaded mode выключи «Disallow users to create new threads».',
           ),
         signal,
       )

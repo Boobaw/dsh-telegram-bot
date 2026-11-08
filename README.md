@@ -18,11 +18,14 @@ Installation, bot token, the allowlist, `/start`, `/sessions` and a test prompt.
   </a>
 </p>
 
-BotFather: **Bot Settings → Threaded mode → Enable**. Then enable **Disallow users to create new threads**, so Telegram does not create a topic for every message sent in All.
+BotFather: **Bot Settings → Threaded mode → Enable**. Leave **Disallow users to create new threads** off: you create a topic for each conversation yourself.
 
 ## Features
 
 - One Telegram topic per DSH session; Web and Telegram use the same session.
+- You create the topics. A new topic asks which workspace to use, then whether to start a new session or continue an existing one from that workspace. The message that opened the topic runs once the session is chosen.
+- Topic names are yours: the bot never renames a topic after the session title. `/rename` renames it on request.
+- `/workspace` moves the topic to another workspace: pick the workspace, then a new or existing session there. A session's working directory is fixed when it is created, so the previous session is not continued in this topic; it stays in DSH and can be bound again later as an existing session.
 - Telegram mirrors only turns initiated from Telegram; turns started in the Web UI stay in Web.
 - `/sessions` lists workspaces and existing sessions, and can create a new session in a selected workspace.
 - Assistant answers stream into the topic with Telegram Markdown formatting. Messages sent while the agent is working are queued and processed after the current turn; `/clear` removes that queue without stopping the current answer.
@@ -31,8 +34,9 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Then enable **Disallow
 - Tool approvals with **Deny** / **Allow** buttons.
 - `ask_user_question` support: options, multi-select, custom answers and plan review.
 - Documents and photos sent in a session topic are saved as DSH attachments and passed to the agent.
-- `/new`, `/last`, `/rename`, `/fork`, `/clear`, `/stop`, `/restart`, `/status` and `/menu`.
+- `/new`, `/workspace`, `/last`, `/rename`, `/fork`, `/clear`, `/stop`, `/restart`, `/status` and `/menu`.
 - `/new` in a session topic starts a fresh DSH session in the same workspace and binds it to the same topic; the previous session stays in DSH. In All it opens a new session topic.
+- One session is bound to at most one topic: binding it to a new topic releases the old one.
 - `/fork [name]` creates a DSH session fork in a new Telegram topic; without a name it uses the previous title plus the branch number.
 - The session picker also has **🔀 Continue in Telegram fork**; automatic fork topics end with `(N)`.
 - English and Russian bot messages.
@@ -42,7 +46,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Then enable **Disallow
 
 - DSH `0.2.1-rc.2` or newer, Node.js 22+.
 - A Telegram bot token from [@BotFather](https://t.me/BotFather).
-- **Threaded mode** enabled in BotFather, **Topics** enabled in the bot chat, and **Disallow users to create new threads** enabled.
+- **Threaded mode** enabled in BotFather, **Topics** enabled in the bot chat, and **Disallow users to create new threads** left off.
 
 ## Install
 
@@ -80,30 +84,25 @@ The token field only reports whether a token is configured. A token supplied thr
 ## First run
 
 1. Create a bot with @BotFather and save its token in **Settings → Telegram**.
-2. In @BotFather open **Bot Settings → Threaded mode**, enable it, and enable **Disallow users to create new threads**.
+2. In @BotFather open **Bot Settings → Threaded mode** and enable it. Leave **Disallow users to create new threads** off.
 3. Open the bot chat, tap the bot name and enable **Topics**.
 4. Send `/start` in **All**. With an empty allowlist the bot replies with your user and chat ids.
 5. Add your user id to **Allowed users** and press **Save**.
-6. Send `/sessions` in **All**, choose a workspace and open or create a session.
-7. Send a test message in the new topic.
+6. Create a topic and send a message in it. Choose a workspace, then **New session** or one of the listed sessions. Your message runs in that session.
 
-An ordinary message in **All** creates a new session topic in the default workspace. Commands such as `/sessions`, `/fork` and `/last` still work in All.
+A message sent in **All** makes Telegram create a topic for it; the bot treats it like any new topic and asks for the workspace (if Telegram delivers it to All instead, the bot opens a new topic in the default workspace). `/sessions` in **All** still opens existing sessions in new topics, and commands such as `/fork` and `/last` work as before.
 
-If users are allowed to create threads, Telegram creates a topic before the bot receives the message; the bot then warns about the BotFather setting on startup.
+Topics bound by an earlier version keep their sessions after an upgrade.
 
 ## Troubleshooting topics
 
-If every message in **All** creates a new topic, enable this BotFather option:
-
-**Bot Settings → Threaded mode → Disallow users to create new threads**
-
-The bot checks `has_topics_enabled` and `allows_users_to_create_topics` on startup, writes them to `~/.dsh/telegram/status.json`, and posts a warning in the control chat when either setting is wrong.
+The bot checks `has_topics_enabled` and `allows_users_to_create_topics` on startup, writes them to `~/.dsh/telegram/status.json`, and posts a warning in the control chat when Threaded mode is off or users cannot create topics.
 
 A correct configuration contains:
 
 ```json
 "threadedMode": true,
-"usersCanCreateTopics": false
+"usersCanCreateTopics": true
 ```
 
 ## Plugins page

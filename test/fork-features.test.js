@@ -20,6 +20,11 @@ function makeHost() {
   const logs = []
   const cleanups = []
   let sequence = 0
+  const sessionRecords = []
+  const workspaces = [
+    { id: 'workspace-default', path: '/tmp/default-workspace', title: 'default-workspace', sessionIds: [], attachSession() {} },
+    { id: 'workspace-notes', path: '/tmp/notes', title: 'notes', sessionIds: [], attachSession() {} },
+  ]
 
   function makeAgent(id, cwd) {
     const events = new EventEmitter()
@@ -60,14 +65,14 @@ function makeHost() {
       fork: async () => ({ sessionId: 'session-fork' }),
     },
     sessionQuery: {
-      listSessions: async () => [],
+      listSessions: async () => sessionRecords,
       readTitleSnapshot: async () => ({ title: { title: 'Generated title' } }),
       readSurface: async () => ({ events: [] }),
       readSession: async () => ({ events: [] }),
     },
     workspaceRegistry: {
-      list: () => [{ id: 'workspace-default', path: '/tmp/default-workspace', title: 'default-workspace', attachSession() {} }],
-      get: () => undefined,
+      list: () => workspaces,
+      get: (id) => workspaces.find((workspace) => workspace.id === id),
       create: async () => ({ id: 'workspace-new', attachSession() {} }),
     },
     llm: { listModels: async () => [], resolveModel: async () => ({ context: { contextWindow: 1_000_000 } }) },
@@ -78,7 +83,7 @@ function makeHost() {
     on(name, fn) { hostEvents.on(name, fn); return () => hostEvents.off(name, fn) },
     effect(fn) { cleanups.push(fn()) },
   }
-  return { ctx, live, created, logs, makeAgent, cleanup: () => { for (const fn of cleanups) fn?.() } }
+  return { ctx, live, created, logs, makeAgent, sessionRecords, cleanup: () => { for (const fn of cleanups) fn?.() } }
 }
 
 /**
@@ -122,18 +127,31 @@ function makeTelegram() {
       }
       if (method === 'sendMessage' || method === 'editMessageText') {
         messageId += 1
+        calls.at(-1).result = { message_id: messageId }
         return deliver({ ok: true, result: { message_id: messageId } })
       }
       return deliver({ ok: true, result: true })
     }
     return request
   }
+  const pushCallback = (threadId, data, callbackMessageId) => {
+    updateId += 1
+    pending.push({
+      update_id: updateId,
+      callback_query: {
+        id: `cb-${updateId}`,
+        from: { id: 42 },
+        data,
+        message: { message_id: callbackMessageId, chat: { id: 100, type: 'private' }, message_thread_id: threadId },
+      },
+    })
+  }
   const push = (message) => {
     updateId += 1
     messageId += 1
     pending.push({ update_id: updateId, message: { message_id: messageId, date: 1, chat: { id: 100, type: 'private' }, from: { id: 42 }, ...message } })
   }
-  return { fake, calls, push, missingThreads }
+  return { fake, calls, push, pushCallback, missingThreads }
 }
 
 /** Start the plugin against fresh fakes and an optional initial state. */
@@ -169,6 +187,18 @@ async function start(config = {}, initialState = {}, topicsFile = { chatId: 100 
   }
 }
 
+/** Find the latest message whose inline keyboard has a button with this callback prefix. */
+function picker(calls, prefix) {
+  const found = calls.filter((call) => (call.method === 'sendMessage' || call.method === 'editMessageText')
+    && (call.body.reply_markup?.inline_keyboard ?? []).flat().some((button) => String(button.callback_data).startsWith(prefix)))
+  const last = found.at(-1)
+  if (last === undefined) return undefined
+  return {
+    messageId: last.body.message_id ?? last.result?.message_id,
+    buttons: last.body.reply_markup.inline_keyboard.flat(),
+  }
+}
+
 const sent = (calls, threadId) => calls.filter((call) => call.method === 'sendMessage' && call.body.message_thread_id === threadId)
 
 test('/new binds a fresh session to the same topic and keeps the old one in DSH', async () => {
@@ -178,18 +208,14 @@ test('/new binds a fresh session to the same topic and keeps the old one in DSH'
     await wait(200)
     let state = await run.readState()
     assert.equal(state.threads['100:7001'], 'session-1')
-    run.host.live.get('session-1').emit('session/event', { id: 'session-1' }, { type: 'session/title', data: { title: 'First chat' } })
-    await wait(60)
     run.telegram.push({ message_thread_id: 7001, text: '/new' })
     await wait(200)
     state = await run.readState()
     assert.equal(state.threads['100:7001'], 'session-2', 'the topic is bound to the new session')
     assert.equal(state.sessions['session-1'], undefined, 'the old session no longer claims the topic')
     assert.equal(state.sessions['session-2'].threadId, 7001)
-    assert.equal(state.sessions['session-2'].title, 'First chat', 'the topic keeps its name')
-    assert.equal(state.sessions['session-2'].titleLocked, true)
     assert.equal(run.host.created.length, 2)
-    assert.equal(run.host.created[1].cwd, '/tmp/default-workspace')
+    assert.equal(run.host.created[1].cwd, '/tmp/default-workspace', '/new keeps the workspace')
     assert.equal(run.telegram.calls.filter((call) => call.method === 'createForumTopic').length, 1, '/new creates no topic')
     run.telegram.push({ message_thread_id: 7001, text: 'second' })
     await wait(150)
@@ -208,6 +234,92 @@ test('/new in All opens a new session topic', async () => {
     const topics = run.telegram.calls.filter((call) => call.method === 'createForumTopic')
     assert.equal(topics.length, 1)
     assert.equal(run.host.created.length, 1)
+  } finally {
+    run.stop()
+  }
+})
+
+test('a new topic asks for a workspace, then runs the waiting message in a new session', async () => {
+  const run = await start()
+  try {
+    run.telegram.push({ message_thread_id: 9001, text: 'first question' })
+    await wait(120)
+    const workspaces = picker(run.telegram.calls, 'tw:')
+    assert.ok(workspaces, 'workspace picker shown')
+    assert.deepEqual(workspaces.buttons.map((button) => button.callback_data), ['tw:workspace-default', 'tw:workspace-notes'])
+    assert.equal(run.host.created.length, 0, 'no session before the choice')
+    run.telegram.pushCallback(9001, 'tw:workspace-notes', workspaces.messageId)
+    await wait(120)
+    const sessions = picker(run.telegram.calls, 'tn:')
+    assert.ok(sessions, 'new-or-existing picker shown')
+    run.telegram.pushCallback(9001, 'tn:workspace-notes', sessions.messageId)
+    await wait(200)
+    assert.equal(run.host.created.length, 1)
+    assert.equal(run.host.created[0].cwd, '/tmp/notes')
+    const state = await run.readState()
+    assert.equal(state.threads['100:9001'], 'session-1')
+    assert.equal(run.host.live.get('session-1').received[0].content[0].text, 'first question')
+    assert.equal(run.telegram.calls.filter((call) => call.method === 'createForumTopic').length, 0)
+  } finally {
+    run.stop()
+  }
+})
+
+test('a topic can bind an existing session, which leaves its old topic', async () => {
+  const existing = {
+    'session-old': { sessionId: 'session-old', chatId: 100, threadId: 5000, title: 'Old topic', cwd: '/tmp/notes', updatedAt: 1 },
+  }
+  const run = await start({}, { sessions: existing, threads: { '100:5000': 'session-old' } })
+  try {
+    run.host.makeAgent('session-old', '/tmp/notes')
+    run.host.sessionRecords.push({ header: { id: 'session-old', cwd: '/tmp/notes', createdAt: 1 }, live: true })
+    run.telegram.push({ message_thread_id: 9002, text: 'continue here' })
+    await wait(120)
+    run.telegram.pushCallback(9002, 'tw:workspace-notes', picker(run.telegram.calls, 'tw:').messageId)
+    await wait(120)
+    const sessions = picker(run.telegram.calls, 'tb:')
+    assert.ok(sessions.buttons.some((button) => button.callback_data === 'tb:session-old'))
+    run.telegram.pushCallback(9002, 'tb:session-old', sessions.messageId)
+    await wait(200)
+    const state = await run.readState()
+    assert.equal(state.threads['100:9002'], 'session-old')
+    assert.equal(state.threads['100:5000'], undefined, 'one session is bound to one topic')
+    assert.equal(state.sessions['session-old'].threadId, 9002)
+    assert.equal(run.host.created.length, 0)
+    assert.equal(run.host.live.get('session-old').received.at(-1).content[0].text, 'continue here')
+  } finally {
+    run.stop()
+  }
+})
+
+test('/workspace switches the topic to a session in another workspace', async () => {
+  const run = await start()
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'hello' })
+    await wait(200)
+    run.telegram.push({ message_thread_id: 7001, text: '/workspace' })
+    await wait(120)
+    run.telegram.pushCallback(7001, 'tw:workspace-notes', picker(run.telegram.calls, 'tw:').messageId)
+    await wait(120)
+    run.telegram.pushCallback(7001, 'tn:workspace-notes', picker(run.telegram.calls, 'tn:').messageId)
+    await wait(200)
+    const state = await run.readState()
+    assert.equal(state.threads['100:7001'], 'session-2')
+    assert.equal(state.sessions['session-2'].cwd, '/tmp/notes')
+    assert.equal(state.sessions['session-1'], undefined)
+  } finally {
+    run.stop()
+  }
+})
+
+test('session titles never rename the topic', async () => {
+  const run = await start()
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'hello' })
+    await wait(200)
+    run.host.live.get('session-1').emit('session/event', { id: 'session-1' }, { type: 'session/title', data: { title: 'Provider title' } })
+    await wait(80)
+    assert.equal(run.telegram.calls.filter((call) => call.method === 'editForumTopic').length, 0)
   } finally {
     run.stop()
   }
