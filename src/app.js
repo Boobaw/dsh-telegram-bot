@@ -7,6 +7,7 @@ import {
   BOT_COMMANDS,
   BOT_COMMANDS_RU,
   EFFORT_CHOICES,
+  FORWARD_BATCH_MS,
   MAX_TELEGRAM_TEXT,
   MODEL_CHOICES,
   POLL_TIMEOUT_SECONDS,
@@ -37,6 +38,7 @@ import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
 import { createOutbox } from './outbox.js'
 import { resolveTopicTarget, topicNameOf } from './topics.js'
+import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage } from './message-context.js'
 import {
   allowedChatsOf,
   allowedUsersOf,
@@ -3574,7 +3576,10 @@ export function apply(ctx, config) {
       }
     }
     const hasAttachment = message.document !== undefined || (Array.isArray(message.photo) && message.photo.length > 0)
-    if (((text === undefined || text.length === 0) && !hasAttachment) || from === undefined || chat === undefined) {
+    // A forward is a prompt even when its media cannot be attached (video,
+    // voice, poll...): the agent still learns what was forwarded and from whom.
+    const forwarded = isForwarded(message)
+    if (((text === undefined || text.length === 0) && !hasAttachment && !forwarded) || from === undefined || chat === undefined) {
       await publishStatus({ lastOutcome: 'ignored' })
       return
     }
@@ -3614,26 +3619,19 @@ export function apply(ctx, config) {
     }
 
     const chatState = await chatFor(chat.id, threadId)
-    if (await consumeQuestionReply(chatState, text ?? '', signal)) return
+    // Forwarded text is content, never an answer to a pending question or a command.
+    if (!forwarded && await consumeQuestionReply(chatState, text ?? '', signal)) return
     const inSession = typeof chatState.sessionId === 'string'
-    if (hasAttachment) {
+    if (hasAttachment || forwarded) {
       // A file in All follows the same path as text: create one session topic.
-      // A file in an existing sessionless topic is adopted in place.
-      if (!inSession && !isAllThread(threadId)) {
+      if (hasAttachment && !inSession && !isAllThread(threadId)) {
         await send(chat.id, tr('Open a session first: /sessions.', 'Сначала открой сессию: /sessions.'), signal, threadId)
         return
       }
       try {
-        const attachment = await saveTelegramAttachment(message, signal)
-        const caption = typeof message.caption === 'string' ? message.caption.trim() : ''
-        const prompt = caption.length > 0 ? caption : tr('Analyze the attached file.', 'Проанализируй приложенный файл.')
-        if (isAllThread(threadId)) {
-          await createNewSessionTopic(chat.id, threadId, signal, defaultWorkspaceCwd(), prompt, [attachment.block], message.message_id)
-        } else if (!inSession) {
-          await askTopicBinding(chatState, { text: prompt, attachments: [attachment.block], messageId: message.message_id }, signal)
-        } else {
-          await runAgent(chatState, prompt, signal, [attachment.block], message.message_id)
-        }
+        const prompt = await promptFrom(message, signal)
+        if (forwarded) batchForward(chatState, chat.id, threadId, prompt, signal)
+        else await dispatchPrompt(chatState, chat.id, threadId, prompt, signal)
       } catch (error) {
         await send(chat.id, `❌ ${escapeHtml(messageOf(error))}`, signal, threadId)
       }
@@ -4000,20 +3998,107 @@ export function apply(ctx, config) {
       return
     }
 
-    const route = routeMessage({ threadId, inSession })
+    // Ordinary text becomes a prompt, with what it replies to or quotes.
+    await dispatchPrompt(chatState, chat.id, threadId, await promptFrom(message, signal), signal)
+  }
+
+  /**
+   * Build the agent prompt for one message: its text, what it replies to,
+   * quotes or forwards, its own photo or document and a replied-to one.
+   * @param message - Telegram message.
+   * @param signal - request lifetime.
+   * @returns prompt text, attachment blocks and Telegram message id.
+   */
+  async function promptFrom(message, signal) {
+    const attachments = []
+    const forwarded = isForwarded(message)
+    let ownFile = false
+    if (downloadableFile(message) !== undefined) {
+      attachments.push((await saveTelegramAttachment(message, signal)).block)
+      ownFile = true
+    }
+    // A replied-to photo or document is attached as well; a failure only
+    // changes the note, the message itself still goes through.
+    let replyFile
+    const target = forwarded ? undefined : (repliedMessage(message) ?? message.external_reply ?? undefined)
+    const file = downloadableFile(target)
+    if (file !== undefined) {
+      if (file.size !== undefined && file.size > DOWNLOAD_LIMIT_BYTES) {
+        replyFile = 'too-large'
+      } else {
+        try {
+          attachments.push((await saveTelegramAttachment(target, signal)).block)
+          replyFile = 'attached'
+        } catch (error) {
+          replyFile = 'failed'
+          warn(`replied-to file not attached: ${messageOf(error)}`)
+        }
+      }
+    }
+    let text = composePrompt(message, { botId: me?.id, ownFile, replyFile })
+    if (ownFile && !forwarded && messageBody(message).trim().length === 0) {
+      const ask = tr('Analyze the attached file.', 'Проанализируй приложенный файл.')
+      text = text.length === 0 ? ask : `${text}\n\n${ask}`
+    }
+    return { text, attachments, messageId: message.message_id }
+  }
+
+  /**
+   * Route one prompt: a new topic from All, the workspace picker in a topic
+   * without a session, or a turn in the bound session.
+   * @param chatState - topic state.
+   * @param chatId - Telegram chat.
+   * @param threadId - topic thread.
+   * @param prompt - text, attachments and Telegram message id.
+   * @param signal - runtime lifetime.
+   */
+  async function dispatchPrompt(chatState, chatId, threadId, prompt, signal) {
+    const route = routeMessage({ threadId, inSession: typeof chatState.sessionId === 'string' })
     if (route === 'new-topic') {
-      await createNewSessionTopic(chat.id, threadId, signal, defaultWorkspaceCwd(), text, [], message.message_id)
+      await createNewSessionTopic(chatId, threadId, signal, defaultWorkspaceCwd(), prompt.text, prompt.attachments, prompt.messageId)
       return
     }
     if (route === 'current-topic') {
       // A topic the user created (or Telegram created for a message sent in
       // All) has no session yet: ask for the workspace, then run the message.
-      await askTopicBinding(chatState, { text, attachments: [], messageId: message.message_id }, signal)
+      await askTopicBinding(chatState, prompt, signal)
       return
     }
+    await runAgent(chatState, prompt.text, signal, prompt.attachments, prompt.messageId)
+  }
 
-    // Ordinary text in a session topic becomes a DSH agent turn.
-    await runAgent(chatState, text, signal, [], message.message_id)
+  /** Forwards waiting to be sent as one prompt, by topic key. */
+  const forwardBatches = new Map()
+
+  /**
+   * Collect forwarded messages that arrive together in one topic and send
+   * them as one prompt once no more arrive for FORWARD_BATCH_MS.
+   * @param chatState - topic state.
+   * @param chatId - Telegram chat.
+   * @param threadId - topic thread.
+   * @param prompt - one forwarded message's prompt.
+   * @param signal - runtime lifetime.
+   */
+  function batchForward(chatState, chatId, threadId, prompt, signal) {
+    const key = `${chatId}:${threadId ?? 0}`
+    let batch = forwardBatches.get(key)
+    if (batch === undefined) {
+      batch = { prompts: [], timer: undefined }
+      forwardBatches.set(key, batch)
+    }
+    batch.prompts.push(prompt)
+    clearTimeout(batch.timer)
+    batch.timer = setTimeout(() => {
+      forwardBatches.delete(key)
+      if (signal.aborted) return
+      const prompts = batch.prompts
+      const merged = {
+        text: prompts.map((item) => item.text).filter((text) => text.length > 0).join('\n\n'),
+        attachments: prompts.flatMap((item) => item.attachments),
+        messageId: prompts[0].messageId,
+      }
+      fireAndForget('forward-batch', () => dispatchPrompt(chatState, chatId, threadId, merged, signal))
+    }, FORWARD_BATCH_MS)
   }
 
   /**

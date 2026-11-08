@@ -133,7 +133,19 @@ function makeTelegram() {
         const raw = Buffer.from(value).toString('latin1')
         body = { raw, message_thread_id: Number(/name="message_thread_id"\r\n\r\n(\d+)/u.exec(raw)?.[1]) }
       }
+      if (String(options.path).includes('/file/')) {
+        setTimeout(() => {
+          response.emit('data', Buffer.from('file-data'))
+          response.emit('end')
+          request.emit('close')
+        }, 0)
+        return
+      }
       if (method === 'getMe') return deliver({ ok: true, result: { id: 1, username: 'testbot' } })
+      if (method === 'getFile') {
+        calls.push({ method, body })
+        return deliver({ ok: true, result: { file_path: `files/${body.file_id}.jpg`, file_size: 9 } })
+      }
       if (method === 'getUpdates') return deliver({ ok: true, result: pending.splice(0) }, 15)
       calls.push({ method, body })
       if (method === 'createForumTopic') {
@@ -525,6 +537,127 @@ test('the agent tool and the file spool use the same path', async () => {
     assert.equal(bad.ok, false)
     assert.match(bad.error, /Unknown Telegram topic/)
     assert.equal(agent.injected.length, 2)
+  } finally {
+    run.stop()
+  }
+})
+
+/** Open topic 7001 bound to session-1 and wait for its first turn to end. */
+async function openSessionTopic(run) {
+  run.telegram.push({ message_thread_id: 1, text: 'hello' })
+  await wait(250)
+  return run.host.live.get('session-1')
+}
+
+const promptText = (message) => message.content.filter((block) => block.type === 'text').map((block) => block.text).join('\n')
+
+test('a reply carries the replied-to text, its author and its photo', async () => {
+  const run = await start()
+  try {
+    const agent = await openSessionTopic(run)
+    run.telegram.push({
+      message_thread_id: 7001,
+      is_topic_message: true,
+      text: 'what does this show?',
+      reply_to_message: {
+        message_id: 500,
+        date: 1_762_600_000,
+        chat: { id: 100, type: 'private' },
+        from: { id: 1, is_bot: true, first_name: 'testbot' },
+        message_thread_id: 7001,
+        caption: 'Weekly chart',
+        photo: [{ file_id: 'small', file_size: 5 }, { file_id: 'large', file_size: 9 }],
+      },
+    })
+    await wait(250)
+    const last = agent.received.at(-1)
+    const text = promptText(last)
+    assert.match(text, /^\[Replying to a message from the assistant \(this bot\) \(sent 2025-11-08 11:06 UTC; contains a photo, attached\)\]\n> Weekly chart\n\nwhat does this show\?$/u)
+    assert.equal(last.content.filter((block) => block.type === 'image').length, 1)
+    assert.ok(run.telegram.calls.some((call) => call.method === 'getFile' && call.body.file_id === 'large'))
+  } finally {
+    run.stop()
+  }
+})
+
+test('a partial quote replaces the full text, and the topic root is not a reply', async () => {
+  const run = await start()
+  try {
+    const agent = await openSessionTopic(run)
+    run.telegram.push({
+      message_thread_id: 7001,
+      is_topic_message: true,
+      text: 'plain message',
+      reply_to_message: { message_id: 7001, date: 1, chat: { id: 100 }, forum_topic_created: { name: 'hello' } },
+    })
+    await wait(250)
+    assert.equal(promptText(agent.received.at(-1)), 'plain message')
+    run.telegram.push({
+      message_thread_id: 7001,
+      is_topic_message: true,
+      text: 'is this right?',
+      quote: { text: 'the second step', position: 10 },
+      reply_to_message: {
+        message_id: 501,
+        date: 1_762_600_000,
+        chat: { id: 100 },
+        from: { id: 77, first_name: 'Sam', username: 'sam' },
+        text: 'the first step, the second step, the third step',
+      },
+    })
+    await wait(250)
+    const text = promptText(agent.received.at(-1))
+    assert.match(text, /^\[Replying to a message from Sam \(@sam\) \(sent [^)]+\); the user quoted only this part\]\n> the second step\n\nis this right\?$/u)
+    assert.doesNotMatch(text, /third step/u)
+  } finally {
+    run.stop()
+  }
+})
+
+test('a reply to a mirrored Web prompt is not shown as an assistant message', async () => {
+  const run = await start()
+  try {
+    const agent = await openSessionTopic(run)
+    run.telegram.push({
+      message_thread_id: 7001,
+      text: 'and this one too',
+      reply_to_message: { message_id: 502, date: 1, chat: { id: 100 }, from: { id: 1, is_bot: true }, text: '🖥 From Web:\nsummarize the logs' },
+    })
+    await wait(250)
+    assert.match(promptText(agent.received.at(-1)), /^\[Replying to a message from the Web UI \(a user prompt this bot mirrored into the chat, not an assistant answer\)/u)
+  } finally {
+    run.stop()
+  }
+})
+
+test('several forwarded messages become one prompt and never run as commands', async () => {
+  const run = await start()
+  try {
+    const agent = await openSessionTopic(run)
+    const before = agent.received.length
+    run.telegram.push({
+      message_thread_id: 7001,
+      text: 'Release notes are out',
+      forward_origin: { type: 'channel', chat: { id: -1001234, title: 'Project News', username: 'projnews', type: 'channel' }, message_id: 88, date: 1_762_000_000 },
+    })
+    run.telegram.push({
+      message_thread_id: 7001,
+      text: '/new',
+      forward_origin: { type: 'user', sender_user: { id: 77, first_name: 'Sam' }, date: 1_762_000_100 },
+    })
+    run.telegram.push({
+      message_thread_id: 7001,
+      video: { file_id: 'v1' },
+      caption: 'clip',
+      forward_origin: { type: 'hidden_user', sender_user_name: 'Alex', date: 1_762_000_200 },
+    })
+    await wait(1800)
+    assert.equal(agent.received.length, before + 1, 'one prompt for the whole batch')
+    const text = promptText(agent.received.at(-1))
+    assert.match(text, /\[Forwarded message from channel "Project News" \(@projnews\) \(originally sent [^;]+; https:\/\/t\.me\/projnews\/88\)\]\n> Release notes are out/u)
+    assert.match(text, /\[Forwarded message from Sam \(originally sent [^)]+\)\]\n> \/new/u)
+    assert.match(text, /\[Forwarded message from Alex \(account hidden\) \(originally sent [^;]+; contains a video, not attached\)\]\n> clip/u)
+    assert.equal(run.host.created.length, 1, 'a forwarded /new is not a command')
   } finally {
     run.stop()
   }
