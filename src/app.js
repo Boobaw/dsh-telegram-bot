@@ -227,7 +227,8 @@ export function apply(ctx, config) {
     const fallback = modelSelection()
     const provider = record?.provider ?? fallback?.provider ?? 'deepseek-official'
     const model = record?.model ?? fallback?.model ?? 'deepseek-flash'
-    const effort = record?.effort ?? fallback?.reasoningEffort ?? 'high'
+    // No forced effort: without a saved or default choice the model's own default applies.
+    const effort = record?.effort ?? fallback?.reasoningEffort
     chat.selection = {
       current: {
         provider,
@@ -272,7 +273,7 @@ export function apply(ctx, config) {
         current: {
           provider: provider ?? modelSelection()?.provider ?? 'deepseek-official',
           model: model ?? modelSelection()?.model ?? 'deepseek-flash',
-          reasoningEffort: effort ?? 'high',
+          reasoningEffort: effort ?? modelSelection()?.reasoningEffort,
         },
         assembled: undefined,
       },
@@ -309,7 +310,8 @@ export function apply(ctx, config) {
 
   /** @returns the display label for an effort id. */
   function effortLabel(effort) {
-    return EFFORT_CHOICES.find((choice) => choice.id === effort)?.label ?? 'High'
+    if (effort === undefined) return tr('Default', 'По умолчанию')
+    return EFFORT_CHOICES.find((choice) => choice.id === effort)?.label ?? String(effort)
   }
 
   /**
