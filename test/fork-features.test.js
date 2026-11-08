@@ -1386,3 +1386,47 @@ test('with mirroring off, files presented in a Telegram turn still reach the top
     await rm(files.dir, { recursive: true, force: true })
   }
 })
+
+test('each busy topic shows its own "typing…" until its turn ends', async () => {
+  const run = await start()
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'first' })
+    await wait(250)
+    run.telegram.push({ message_thread_id: 1, text: 'second' })
+    await wait(250)
+    const one = run.host.live.get('session-1')
+    const two = run.host.live.get('session-2')
+    assert.ok(one && two, 'two topic sessions')
+    const typing = (threadId) => run.telegram.calls.filter((call) => call.method === 'sendChatAction' && call.body.message_thread_id === threadId && call.body.action === 'typing').length
+    // Both earlier turns have ended: the topics are idle and stay quiet.
+    const idleOne = typing(7001)
+    const idleTwo = typing(7002)
+    await wait(300)
+    assert.equal(typing(7001), idleOne, 'an idle topic shows nothing')
+    assert.equal(typing(7002), idleTwo)
+    one.whenIdle = () => new Promise(() => {})
+    two.whenIdle = () => new Promise(() => {})
+    run.telegram.push({ message_thread_id: 7001, text: 'task one' })
+    run.telegram.push({ message_thread_id: 7002, text: 'task two' })
+    await wait(450)
+    assert.ok(typing(7001) - idleOne >= 3, `topic one refreshed: ${typing(7001) - idleOne}`)
+    assert.ok(typing(7002) - idleTwo >= 3, `topic two refreshed: ${typing(7002) - idleTwo}`)
+    one.emit('session/event', { id: 'session-1' }, { type: 'turn/start', data: { turn: 2 } })
+    one.emit('session/event', { id: 'session-1' }, { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+    await wait(250)
+    const stoppedOne = typing(7001)
+    const runningTwo = typing(7002)
+    await wait(350)
+    assert.equal(typing(7001), stoppedOne, 'the finished topic stops')
+    assert.ok(typing(7002) > runningTwo, 'the other topic keeps typing')
+    // A failed turn stops too.
+    two.emit('session/event', { id: 'session-2' }, { type: 'turn/start', data: { turn: 2 } })
+    two.emit('session/event', { id: 'session-2' }, { type: 'turn/end', data: { turn: 2, reason: { kind: 'error', error: { message: 'boom' } } } })
+    await wait(250)
+    const stoppedTwo = typing(7002)
+    await wait(300)
+    assert.equal(typing(7002), stoppedTwo, 'the failed topic stops')
+  } finally {
+    run.stop()
+  }
+})

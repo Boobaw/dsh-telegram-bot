@@ -1961,6 +1961,49 @@ export function apply(ctx, config) {
     await chat.answerEdit
   }
 
+  /**
+   * How often "typing…" is renewed; Telegram shows it for about 5 seconds.
+   * Tests use a short period, as they skip outbound pacing.
+   */
+  const TYPING_REFRESH_MS = process.env.NODE_ENV === 'test' ? 100 : 4000
+
+  /**
+   * Show "typing…" in the topic while its turn runs. Each topic has its own
+   * timer; it stops itself as soon as the topic is no longer busy, so a
+   * missed stop costs at most one extra refresh.
+   * @param chat - topic state.
+   */
+  function startTyping(chat) {
+    if (chat.typingTimer !== undefined && chat.typingTimer !== null) return
+    const tick = () => {
+      if (!chat.busy || chat.done || lifetime === undefined || bridgeAbort.signal.aborted) {
+        stopTyping(chat)
+        return
+      }
+      // A slow or rate-limited call is not stacked with a second one.
+      if (chat.typingInFlight === true) return
+      chat.typingInFlight = true
+      call('sendChatAction', {
+        chat_id: chat.chatId,
+        ...(chat.threadId === undefined || chat.threadId === 0 ? {} : { message_thread_id: chat.threadId }),
+        action: 'typing',
+      }, bridgeAbort.signal, 10_000)
+        .catch((error) => {
+          if (!bridgeAbort.signal.aborted) warn(`sendChatAction failed: ${messageOf(error)}`)
+        })
+        .finally(() => { chat.typingInFlight = false })
+    }
+    chat.typingTimer = setInterval(tick, TYPING_REFRESH_MS)
+    chat.typingTimer.unref?.()
+    tick()
+  }
+
+  /** Stop renewing "typing…" for one topic. */
+  function stopTyping(chat) {
+    if (chat.typingTimer !== undefined && chat.typingTimer !== null) clearInterval(chat.typingTimer)
+    chat.typingTimer = null
+  }
+
   /** Stop the thinking/tool display timers. */
   function clearAuxTimers(chat) {
     if (chat.thinkingTimer !== null) {
@@ -2183,6 +2226,7 @@ export function apply(ctx, config) {
     chat.messageId = null
     resetAux(chat)
     chat.busy = false
+    stopTyping(chat)
     chat.turnSource = undefined
     chat.awaitingTurn = false
     chat.activeTurn = undefined
@@ -2240,6 +2284,7 @@ export function apply(ctx, config) {
     resetAux(chat)
     // Keep the chain: a mirrored prompt may already be queued on it.
     chat.answerEdit ??= Promise.resolve()
+    startTyping(chat)
   }
 
   /**
@@ -2356,6 +2401,7 @@ export function apply(ctx, config) {
     if (chat.done && !force) return
     chat.done = true
     chat.busy = false
+    stopTyping(chat)
     chat.turnSource = undefined
     chat.awaitingTurn = false
     chat.activeTurn = undefined
@@ -2419,6 +2465,7 @@ export function apply(ctx, config) {
     clearEditTimer(chat)
     resetAux(chat)
     chat.answerEdit = Promise.resolve()
+    startTyping(chat)
     await admitInOrder(chat, () => startTurn(chat, text, signal, attachments, messageId, nativeText, epoch))
   }
 
@@ -2494,6 +2541,7 @@ export function apply(ctx, config) {
     clearEditTimer(chat)
     clearAuxTimers(chat)
     chat.busy = false
+    stopTyping(chat)
     chat.done = true
     chat.turnSource = undefined
     chat.awaitingTurn = false
@@ -4641,6 +4689,7 @@ export function apply(ctx, config) {
       chatState.stopping = true
       try {
         chatState.busy = false
+        stopTyping(chatState)
         chatState.done = true
         chatState.turnSource = undefined
         chatState.awaitingTurn = false
