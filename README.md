@@ -26,7 +26,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Leave **Disallow users
 - You create the topics. A new topic asks which workspace to use, then whether to start a new session or continue an existing one from that workspace. The message that opened the topic runs once the session is chosen.
 - Topic names are yours: the bot never renames a topic after the session title. `/rename` renames it on request.
 - `/workspace` moves the topic to another workspace: pick the workspace, then a new or existing session there. A session's working directory is fixed when it is created, so the previous session is not continued in this topic; it stays in DSH and can be bound again later as an existing session.
-- Telegram mirrors only turns initiated from Telegram; turns started in the Web UI stay in Web.
+- Two-way sync: turns started anywhere else (Web UI, scheduled tasks, other plugins) also appear in the session's topic. The prompt is shown with a **From Web** or **Scheduled task** label, followed by the streamed answer. Messages sent from Telegram are not echoed back, and context that plugins add on their own (time, runtime notes) is not shown. A Telegram message sent while such a turn runs waits for it. Approvals and questions from those turns are answered where the turn started. Turn this off with **Show turns from other clients**.
 - `/sessions` lists workspaces and existing sessions, and can create a new session in a selected workspace.
 - Assistant answers stream into the topic with Telegram Markdown formatting. Messages sent while the agent is working are queued and processed after the current turn; `/clear` removes that queue without stopping the current answer.
 - Reasoning and tool calls are shown as temporary messages and removed after the answer. Each tool-call entry is capped at two lines.
@@ -76,6 +76,7 @@ Restart `dsh web` after installing or updating the plugin. Then open **Settings 
 | Allowed chats | Telegram chat ids or `@channelnames` |
 | Show model thinking | Show reasoning in a temporary message |
 | Show tool calls | Show tool calls in a temporary message |
+| Show turns from other clients (`mirrorTurns`) | Mirror turns started outside Telegram into the bound topic; default on |
 | Bot language | `en` (default) or `ru` |
 | Enable bot | Start or pause Telegram polling |
 

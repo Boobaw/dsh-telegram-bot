@@ -37,6 +37,8 @@ window.__ModuleLoader__.load({
       showThinkingHint: 'Send reasoning deltas as a separate Thinking message in the session topic.',
       showToolCalls: 'Show tool calls',
       showToolCallsHint: 'Send tool names and arguments as they are called.',
+      mirrorTurns: 'Show turns from other clients',
+      mirrorTurnsHint: 'Messages and answers from the Web UI, scheduled tasks and other plugins also appear in the session topic.',
       allowedUsers: 'Allowed users',
       allowedUsersHint: 'Telegram user ids or @usernames allowed to talk to the bot. Empty means nobody.',
       allowedChats: 'Allowed chats',
@@ -92,6 +94,8 @@ window.__ModuleLoader__.load({
       showThinkingHint: 'Отправлять reasoning отдельным сообщением «Thinking» в топик сессии.',
       showToolCalls: 'Показывать tool calls',
       showToolCallsHint: 'Отправлять имя инструмента и аргументы по мере вызова.',
+      mirrorTurns: 'Показывать ходы из других клиентов',
+      mirrorTurnsHint: 'Сообщения и ответы из Web UI, задач по расписанию и других плагинов тоже появляются в топике сессии.',
       allowedUsers: 'Разрешённые пользователи',
       allowedUsersHint: 'Telegram user id или @username, кому можно писать боту. Пустой список — никому.',
       allowedChats: 'Разрешённые чаты',
@@ -358,6 +362,7 @@ window.__ModuleLoader__.load({
       const [language, setLanguage] = React.useState('en')
       const [showThinking, setShowThinking] = React.useState(true)
       const [showToolCalls, setShowToolCalls] = React.useState(true)
+      const [mirrorTurns, setMirrorTurns] = React.useState(true)
       const [tokenDraft, setTokenDraft] = React.useState('')
       const [tokenState, setTokenState] = React.useState({
         loading: true,
@@ -382,6 +387,7 @@ window.__ModuleLoader__.load({
         setLanguage(value.language === 'ru' ? 'ru' : 'en')
         setShowThinking(value.showThinking !== false)
         setShowToolCalls(value.showToolCalls !== false)
+        setMirrorTurns(value.mirrorTurns !== false)
         setInitialized(true)
       }, [initialized, snapshot.status, snapshot.value])
 
@@ -413,12 +419,14 @@ window.__ModuleLoader__.load({
       const baseLanguage = value.language === 'ru' ? 'ru' : 'en'
       const baseShowThinking = value.showThinking !== false
       const baseShowToolCalls = value.showToolCalls !== false
+      const baseMirrorTurns = value.mirrorTurns !== false
       const dirty =
         initialized &&
         (enabled !== baseEnabled ||
           language !== baseLanguage ||
           showThinking !== baseShowThinking ||
           showToolCalls !== baseShowToolCalls ||
+          mirrorTurns !== baseMirrorTurns ||
           !sameList(allowedUsers, baseUsers) ||
           !sameList(allowedChats, baseChats) ||
           tokenDraft.trim().length > 0)
@@ -436,6 +444,7 @@ window.__ModuleLoader__.load({
         setLanguage(baseLanguage)
         setShowThinking(baseShowThinking)
         setShowToolCalls(baseShowToolCalls)
+        setMirrorTurns(baseMirrorTurns)
         setTokenDraft('')
         setError(null)
         setNotice(null)
@@ -458,6 +467,7 @@ window.__ModuleLoader__.load({
             { op: 'set', path: ['language'], value: language },
             { op: 'set', path: ['showThinking'], value: showThinking },
             { op: 'set', path: ['showToolCalls'], value: showToolCalls },
+            { op: 'set', path: ['mirrorTurns'], value: mirrorTurns },
             { op: 'set', path: ['allowedUsers'], value: allowedUsers },
             { op: 'set', path: ['allowedChats'], value: allowedChats },
           ]
@@ -608,6 +618,22 @@ window.__ModuleLoader__.load({
               label: t('showToolCalls'),
               disabled: saving || !writable,
               onChange: setShowToolCalls,
+            }),
+          ),
+          h(
+            'div',
+            { className: 'dtb-toggleRow' },
+            h(
+              'div',
+              { className: 'dtb-toggleCopy' },
+              h('span', { className: 'dtb-label' }, t('mirrorTurns')),
+              h('p', { className: 'dtb-hint' }, t('mirrorTurnsHint')),
+            ),
+            h(Switch, {
+              checked: mirrorTurns,
+              label: t('mirrorTurns'),
+              disabled: saving || !writable,
+              onChange: setMirrorTurns,
             }),
           ),
           h(ListEditor, {

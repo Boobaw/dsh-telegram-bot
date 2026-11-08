@@ -324,3 +324,103 @@ test('session titles never rename the topic', async () => {
     run.stop()
   }
 })
+
+/** Play one complete turn that another client started in a session. */
+async function playExternalTurn(agent, turn, userMessage, answer) {
+  const session = { id: agent.id }
+  agent.emit('session/event', session, { type: 'turn/start', data: { turn } })
+  if (userMessage !== undefined) agent.emit('session/event', session, { type: 'user/message', data: userMessage })
+  agent.emit('agent/assistant-stream', { agent, frame: { type: 'chunk', chunk: { type: 'block-start', blockType: 'text' } } })
+  agent.emit('agent/assistant-stream', { agent, frame: { type: 'chunk', chunk: { type: 'text-delta', text: answer.slice(0, 4) } } })
+  await wait(30)
+  agent.emit('agent/assistant-stream', { agent, frame: { type: 'chunk', chunk: { type: 'text-delta', text: answer.slice(4) } } })
+  agent.emit('session/event', session, { type: 'assistant/message', data: { turn, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: answer }] } } })
+  agent.emit('session/event', session, { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } })
+  await wait(120)
+}
+
+const texts = (calls, threadId) => [
+  ...calls.filter((call) => (call.method === 'sendMessage' || call.method === 'editMessageText') && (call.body.message_thread_id === threadId)),
+].map((call) => call.body.text)
+
+test('a turn started in the Web UI appears in the bound topic', async () => {
+  const run = await start()
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'hello' })
+    await wait(200)
+    const agent = run.host.live.get('session-1')
+    const before = run.telegram.calls.length
+    await playExternalTurn(agent, 2, { id: 'web-1', role: 'user', content: [{ type: 'text', text: 'question from web' }], source: { kind: 'user', rpcId: 'rpc-web-1' } }, 'answer for web')
+    const shown = texts(run.telegram.calls.slice(before), 7001)
+    assert.ok(shown.some((text) => text.includes('From Web') && text.includes('question from web')), shown.join('\n---\n'))
+    assert.ok(shown.some((text) => text.includes('answer for web')), shown.join('\n---\n'))
+    assert.equal(shown.filter((text) => text.includes('From Web')).length, 1, 'the prompt is shown once')
+    const answerSends = run.telegram.calls.slice(before).filter((call) => call.method === 'sendMessage' && !String(call.body.text).includes('From Web'))
+    assert.equal(answerSends.length, 1, 'one answer message, then edits')
+  } finally {
+    run.stop()
+  }
+})
+
+test('messages sent from Telegram are not echoed back', async () => {
+  const run = await start()
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'hello' })
+    await wait(200)
+    const agent = run.host.live.get('session-1')
+    const legacyId = agent.received[0].id
+    const before = run.telegram.calls.length
+    agent.emit('session/event', { id: 'session-1' }, { type: 'user/message', data: { id: legacyId, role: 'user', content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } } })
+    agent.emit('session/event', { id: 'session-1' }, { type: 'user/message', data: { id: 'x', role: 'user', content: [{ type: 'text', text: 'hello' }], source: { kind: 'user', rpcId: 'telegram:100:1' } } })
+    agent.emit('session/event', { id: 'session-1' }, { type: 'user/message', data: { id: 'y', role: 'user', content: [{ type: 'text', text: 'now is 10:00' }], source: { kind: 'time-context' } } })
+    await wait(80)
+    assert.deepEqual(texts(run.telegram.calls.slice(before), 7001), [])
+  } finally {
+    run.stop()
+  }
+})
+
+test('scheduled turns are labelled, and mirroring can be turned off', async () => {
+  const run = await start()
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'hello' })
+    await wait(200)
+    const agent = run.host.live.get('session-1')
+    let before = run.telegram.calls.length
+    await playExternalTurn(agent, 3, { id: 's-1', role: 'user', content: [{ type: 'text', text: 'daily check' }], source: { kind: 'schedule' } }, 'all good')
+    const shown = texts(run.telegram.calls.slice(before), 7001)
+    assert.ok(shown.some((text) => text.includes('Scheduled task') && text.includes('daily check')))
+    assert.ok(shown.some((text) => text.includes('all good')))
+  } finally {
+    run.stop()
+  }
+  const quiet = await start({ mirrorTurns: false })
+  try {
+    quiet.telegram.push({ message_thread_id: 1, text: 'hello' })
+    await wait(200)
+    const before = quiet.telegram.calls.length
+    await playExternalTurn(quiet.host.live.get('session-1'), 2, { id: 'w', role: 'user', content: [{ type: 'text', text: 'web' }], source: { kind: 'user' } }, 'hidden answer')
+    assert.deepEqual(texts(quiet.telegram.calls.slice(before), 7001), [])
+  } finally {
+    quiet.stop()
+  }
+})
+
+test('a Telegram message during a Web turn waits for that turn', async () => {
+  const run = await start()
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'hello' })
+    await wait(200)
+    const agent = run.host.live.get('session-1')
+    agent.emit('session/event', { id: 'session-1' }, { type: 'turn/start', data: { turn: 5 } })
+    run.telegram.push({ message_thread_id: 7001, text: 'queued from phone' })
+    await wait(100)
+    assert.equal(agent.received.length, 1, 'not sent while the Web turn runs')
+    agent.emit('session/event', { id: 'session-1' }, { type: 'assistant/message', data: { turn: 5, step: 1, message: { content: [{ type: 'text', text: 'done on web' }] } } })
+    agent.emit('session/event', { id: 'session-1' }, { type: 'turn/end', data: { turn: 5, reason: { kind: 'completed' } } })
+    await wait(150)
+    assert.equal(agent.received.at(-1).content[0].text, 'queued from phone')
+  } finally {
+    run.stop()
+  }
+})
