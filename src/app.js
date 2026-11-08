@@ -25,6 +25,7 @@ import {
   htmlToPlain,
   isAllThread,
   isTelegramParseError,
+  localImagePaths,
   normalizeCommand,
   parseToolArguments,
   routeMessage,
@@ -2205,6 +2206,11 @@ export function apply(ctx, config) {
         await sendAnswer(chat.chatId, chunk, bridgeAbort.signal, chat.threadId)
       }
     }
+    // Local images in the reply show inline in the Web UI only; upload them.
+    const images = localImagePaths(text)
+    if (images.length > 0) {
+      await forwardFiles(chat, images, { sessionId: chat.sessionId, turn, label: 'reply image', quiet: true })
+    }
     if (deferred?.ended === true) finalizeSafely(chat)
     // A turn that started meanwhile keeps the queue; its own end runs it.
     const next = chat.busy ? undefined : chat.pendingPrompts?.shift()
@@ -2283,6 +2289,22 @@ export function apply(ctx, config) {
     const follow = readLive(config.mirrorTurns, true) === true || chat.steerFollow === true
     if (event.type === 'turn/end' && chat.steerFollow === true && !hasPendingInput(ctx.get('agents')?.get(session.id))) {
       chat.steerFollow = false
+    }
+    if (event.type === 'deliverables/presented') {
+      // Presented files show in the Web UI; send them to the topic too, for
+      // Telegram turns and for mirrored ones.
+      if (!follow && chat.turnSource !== 'telegram') return
+      const paths = (Array.isArray(event.data?.files) ? event.data.files : [])
+        .map((file) => file?.path)
+        .filter((path) => typeof path === 'string' && path.length > 0)
+      if (paths.length === 0) return
+      const options = { sessionId: session.id, turn: event.data?.turn, label: 'present' }
+      // Queue behind the topic's other output so messages keep their order.
+      chat.answerEdit = (chat.answerEdit ?? Promise.resolve())
+        .catch(() => {})
+        .then(() => forwardFiles(chat, paths, options))
+        .catch((error) => reportError('forward-file', error))
+      return
     }
     if (!follow) return
     const turn = event.data?.turn
@@ -3087,6 +3109,95 @@ export function apply(ctx, config) {
     return call(method, { chat_id: chatId, message_thread_id: threadId }, signal, 120_000, { body, contentType: `multipart/form-data; boundary=${boundary}` })
   }
 
+  /** Bot API upload limit for sendDocument. */
+  const MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+  /**
+   * Read one local file for upload, checking the path and the size limit.
+   * @param path - absolute path.
+   * @returns `{ path, name, data }`.
+   * @throws an error marked `retryable: false`.
+   */
+  async function readUploadFile(path) {
+    if (!isAbsolute(path)) throw finalError(`File paths must be absolute: ${path}`)
+    let data
+    try {
+      data = await readFile(path)
+    } catch (error) {
+      throw finalError(error)
+    }
+    if (data.length > MAX_UPLOAD_BYTES) throw finalError(`${path} is larger than the 50 MB bot upload limit.`)
+    return { path, name: basename(path), data }
+  }
+
+  /**
+   * Remember that a file went to a topic in one turn, so the same file is
+   * not uploaded twice in that turn (present, telegram_send and reply images
+   * may all name it).
+   * @param chat - topic state.
+   * @param turn - DSH turn number; without one nothing is remembered.
+   * @param path - absolute path.
+   * @returns false when the file already went to the topic in this turn.
+   */
+  function claimTurnFile(chat, turn, path) {
+    if (typeof turn !== 'number') return true
+    if (chat.turnFiles?.turn !== turn) chat.turnFiles = { turn, paths: new Set() }
+    if (chat.turnFiles.paths.has(path)) return false
+    chat.turnFiles.paths.add(path)
+    return true
+  }
+
+  /**
+   * Upload files the session showed its user (present, or local images in
+   * the final reply) into the session's topic, so a reader on Telegram sees
+   * what the Web UI shows. Uses the telegram_send limits and send log; the
+   * session already has these files, so nothing is recorded back into it.
+   * A file that cannot be sent gets a short note in the topic instead.
+   * @param chat - topic state.
+   * @param paths - absolute paths.
+   * @param options - `{ sessionId, turn, label, quiet }`; `quiet` skips the
+   *   note for files that cannot be read (a broken image link).
+   */
+  async function forwardFiles(chat, paths, { sessionId, turn, label, quiet = false }) {
+    const failed = []
+    for (const path of paths) {
+      if (!claimTurnFile(chat, turn, path)) continue
+      let file
+      try {
+        file = await readUploadFile(path)
+      } catch (error) {
+        warn(`${label}: ${path} not sent to topic ${chat.threadId}: ${messageOf(error)}`)
+        if (!quiet) failed.push(`${basename(path)}: ${messageOf(error)}`)
+        continue
+      }
+      try {
+        const result = await uploadFile(chat.chatId, chat.threadId, file, bridgeAbort.signal)
+        await sentLog.record({
+          chatId: chat.chatId,
+          threadId: chat.threadId,
+          topic: state.topicNames?.[`${chat.chatId}:${chat.threadId}`] ?? null,
+          messageIds: result?.message_id === undefined ? [] : [result.message_id],
+          text: '',
+          files: [file.name],
+          fromSession: sessionId ?? null,
+          job: null,
+          label,
+          boundSession: sessionId ?? null,
+          recorded: true,
+        }).catch((error) => reportError('sent-log', error))
+      } catch (error) {
+        reportError('forward-file', error)
+        // A deleted topic has dropped its binding; nothing more can go there.
+        if (isTopicGone(messageOf(error))) return
+        failed.push(`${file.name}: ${messageOf(error)}`)
+      }
+    }
+    if (failed.length > 0) {
+      await sendPlain(chat.chatId, `⚠️ ${tr('Could not send', 'Не удалось отправить')}:\n${failed.join('\n')}`.slice(0, MAX_TELEGRAM_TEXT), bridgeAbort.signal, chat.threadId)
+        .catch((error) => reportError('forward-file', error))
+    }
+  }
+
   /** Messages sent through sendToTopic, for the context of later replies. */
   const sentLog = createSentLog({ onError: (error) => reportError('sent-log', error) })
 
@@ -3159,17 +3270,7 @@ export function apply(ctx, config) {
     const target = { threadId, name: state.topicNames?.[`${chatId}:${threadId}`] }
     // Read every file first, so a bad path fails before anything is sent.
     const files = []
-    for (const path of paths) {
-      if (!isAbsolute(path)) throw finalError(`File paths must be absolute: ${path}`)
-      let data
-      try {
-        data = await readFile(path)
-      } catch (error) {
-        throw finalError(error)
-      }
-      if (data.length > 50 * 1024 * 1024) throw finalError(`${path} is larger than the 50 MB bot upload limit.`)
-      files.push({ path, name: basename(path), data })
-    }
+    for (const path of paths) files.push(await readUploadFile(path))
     const messageIds = []
     try {
       if (text.trim().length > 0) {
@@ -3179,7 +3280,13 @@ export function apply(ctx, config) {
           messageIds.push(result.message_id)
         }
       }
+      // The bound session sending into its own topic: present later in the
+      // same turn skips these files.
+      const own = typeof request?.from?.sessionId === 'string' && state.threads[`${chatId}:${threadId}`] === request.from.sessionId
+        ? chatForSession(request.from.sessionId)
+        : undefined
       for (const file of files) {
+        if (own !== undefined) claimTurnFile(own, own.activeTurn, file.path)
         const result = await uploadFile(chatId, threadId, file, signal)
         if (result?.message_id !== undefined) messageIds.push(result.message_id)
       }

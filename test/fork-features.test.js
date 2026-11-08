@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import https from 'node:https'
@@ -1288,4 +1289,100 @@ test('topic title helpers split and join the topic prefix', () => {
   assert.equal(isPlaceholderTitle('TG · Anything', []), true)
   assert.equal(isPlaceholderTitle('topic 7', ['Chat', 'topic 7']), true)
   assert.equal(isPlaceholderTitle('My title', ['Chat']), false)
+})
+
+/** Uploads into one topic, as `[method, filename]`. */
+const uploads = (calls, threadId) => calls
+  .filter((call) => (call.method === 'sendPhoto' || call.method === 'sendDocument') && call.body.message_thread_id === threadId)
+  .map((call) => [call.method, /filename="([^"]+)"/u.exec(call.body.raw)?.[1]])
+
+/** Files a turn can present, in a fresh folder. */
+async function presentable() {
+  const dir = await mkdtemp(join(tmpdir(), 'present-'))
+  await writeFile(join(dir, 'camel.png'), Buffer.from('png-bytes'))
+  await writeFile(join(dir, 'notes.txt'), 'text file')
+  return { dir, png: join(dir, 'camel.png'), txt: join(dir, 'notes.txt'), missing: join(dir, 'gone.pdf') }
+}
+
+test('files presented in a Web turn are uploaded to the bound topic and logged', async () => {
+  const run = await start()
+  const files = await presentable()
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'hello' })
+    await wait(200)
+    const agent = run.host.live.get('session-1')
+    const session = { id: agent.id }
+    const before = run.telegram.calls.length
+    agent.emit('session/event', session, { type: 'turn/start', data: { turn: 2 } })
+    agent.emit('session/event', session, { type: 'deliverables/presented', data: { turn: 2, callId: 'c1', files: [{ path: files.png }, { path: files.txt, description: 'notes' }, { path: files.missing }] } })
+    await wait(100)
+    agent.emit('session/event', session, { type: 'assistant/message', data: { turn: 2, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'here they are' }] } } })
+    agent.emit('session/event', session, { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+    await wait(150)
+    const calls = run.telegram.calls.slice(before)
+    assert.deepEqual(uploads(calls, 7001), [['sendPhoto', 'camel.png'], ['sendDocument', 'notes.txt']])
+    const shown = texts(calls, 7001)
+    assert.ok(shown.some((text) => text.includes('Could not send') && text.includes('gone.pdf')), shown.join('\n---\n'))
+    assert.ok(shown.some((text) => text.includes('here they are')))
+    assert.equal(agent.injected.length, 0, 'the session is not sent its own files back')
+    const log = JSON.parse(await readFile(join(STATUS_DIR, 'sent-messages.json'), 'utf8'))
+    const entries = log.entries.filter((entry) => entry.label === 'present')
+    assert.deepEqual(entries.map((entry) => entry.files), [['camel.png'], ['notes.txt']])
+    assert.equal(entries[0].boundSession, 'session-1')
+  } finally {
+    run.stop()
+    await rm(files.dir, { recursive: true, force: true })
+  }
+})
+
+test('local images in the final reply are uploaded once, even when also presented or sent', async () => {
+  const run = await start({}, notifyState)
+  const files = await presentable()
+  try {
+    const agent = run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    const session = { id: agent.id }
+    const before = run.telegram.calls.length
+    agent.emit('session/event', session, { type: 'turn/start', data: { turn: 5 } })
+    await wait(20)
+    await run.host.tools.get('telegram_send').execute({ thread: '7100', files: [files.txt] }, { agent: { id: 'session-notify' } })
+    agent.emit('session/event', session, { type: 'deliverables/presented', data: { turn: 5, callId: 'c1', files: [{ path: files.png }, { path: files.txt }] } })
+    await wait(100)
+    const answer = `Look:\n\n![camel](<${files.png}>)\n![broken](${files.missing})\n\n\`![code](${files.txt})\``
+    agent.emit('session/event', session, { type: 'assistant/message', data: { turn: 5, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: answer }] } } })
+    agent.emit('session/event', session, { type: 'turn/end', data: { turn: 5, reason: { kind: 'completed' } } })
+    await wait(150)
+    const calls = run.telegram.calls.slice(before)
+    assert.deepEqual(uploads(calls, 7100), [['sendDocument', 'notes.txt'], ['sendPhoto', 'camel.png']])
+    assert.ok(!texts(calls, 7100).some((text) => text.includes('Could not send')), 'a broken image link adds no note')
+    // The same image in a later turn is sent again.
+    agent.emit('session/event', session, { type: 'turn/start', data: { turn: 6 } })
+    agent.emit('session/event', session, { type: 'assistant/message', data: { turn: 6, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: `again ![camel](file://${files.png})` }] } } })
+    agent.emit('session/event', session, { type: 'turn/end', data: { turn: 6, reason: { kind: 'completed' } } })
+    await wait(150)
+    assert.equal(uploads(run.telegram.calls.slice(before), 7100).filter(([, name]) => name === 'camel.png').length, 2)
+  } finally {
+    run.stop()
+    await rm(files.dir, { recursive: true, force: true })
+  }
+})
+
+test('with mirroring off, files presented in a Telegram turn still reach the topic but Web turns stay quiet', async () => {
+  const run = await start({ mirrorTurns: false })
+  const files = await presentable()
+  try {
+    const agent = await runningTelegramTurn(run)
+    const session = { id: agent.id }
+    agent.emit('session/event', session, { type: 'deliverables/presented', data: { turn: 2, callId: 'c1', files: [{ path: files.png }] } })
+    await wait(100)
+    assert.deepEqual(uploads(run.telegram.calls, 7001), [['sendPhoto', 'camel.png']])
+    agent.emit('session/event', session, { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+    await wait(150)
+    agent.emit('session/event', session, { type: 'turn/start', data: { turn: 3 } })
+    agent.emit('session/event', session, { type: 'deliverables/presented', data: { turn: 3, callId: 'c2', files: [{ path: files.txt }] } })
+    await wait(100)
+    assert.deepEqual(uploads(run.telegram.calls, 7001), [['sendPhoto', 'camel.png']])
+  } finally {
+    run.stop()
+    await rm(files.dir, { recursive: true, force: true })
+  }
 })

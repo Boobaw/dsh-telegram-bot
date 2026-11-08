@@ -331,9 +331,43 @@ function splitAnswerText(text, limit = ANSWER_MARKDOWN_LIMIT) {
   }
   return chunks
 }
-
+/**
+ * Local files shown as Markdown images (`![alt](/abs/path.png)`,
+ * `![alt](</abs/path with spaces.png>)` or `file://` URLs), outside code.
+ * Telegram cannot show these inline, so the bridge uploads them.
+ * @param markdown - assistant text.
+ * @returns absolute paths, in order, without repeats.
+ */
+function localImagePaths(markdown) {
+  const found = []
+  const pattern = /!\[[^\]]*\]\(\s*(?:<([^>\n]+)>|([^)\s]+))(?:\s+"[^"\n]*")?\s*\)/gu
+  const take = (text) => {
+    for (const match of text.matchAll(pattern)) {
+      let target = (match[1] ?? match[2]).trim()
+      if (/^file:\/\//iu.test(target)) {
+        try {
+          target = decodeURIComponent(new URL(target).pathname)
+        } catch {
+          continue
+        }
+      }
+      if (target.startsWith('/') && !found.includes(target)) found.push(target)
+    }
+  }
+  let fenced = false
+  for (const line of String(markdown ?? '').split('\n')) {
+    if (/^\s*```/u.test(line)) {
+      fenced = !fenced
+      continue
+    }
+    if (fenced) continue
+    take(line.split(/`[^`]*`/gu).join(' '))
+  }
+  return found
+}
 
 export {
+  localImagePaths,
   splitTableRow,
   isTableSeparator,
   isTableRow,
