@@ -1504,3 +1504,33 @@ test('telegram_sticker finds, views, loads sets and sends stickers into a topic'
     run.stop()
   }
 })
+
+test('a Telegram turn that answered with only a sticker posts no "Done" placeholder', async () => {
+  const run = await start()
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'first' })
+    await wait(250)
+    const one = run.host.live.get('session-1')
+    assert.ok(one, 'topic session')
+    const tool = run.host.tools.get('telegram_sticker')
+    await tool.execute({ action: 'add_set', set: 'CatMoods' }, {})
+    const done = () => texts(run.telegram.calls, 7001).filter((text) => text.includes('Done')).length
+    const finish = async (turn, withSticker) => {
+      one.whenIdle = () => new Promise(() => {})
+      run.telegram.push({ message_thread_id: 7001, text: `hi ${turn}` })
+      await wait(150)
+      one.emit('session/event', { id: 'session-1' }, { type: 'turn/start', data: { turn } })
+      await wait(20)
+      if (withSticker) await tool.execute({ action: 'send', id: 'U-SET-1', thread: '7001' }, { agent: { id: 'session-1' } })
+      one.emit('session/event', { id: 'session-1' }, { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } })
+      await wait(200)
+    }
+    const before = done()
+    await finish(2, true)
+    assert.equal(done(), before, 'a sticker-only answer adds no placeholder')
+    await finish(3, false)
+    assert.equal(done(), before + 1, 'an empty answer with nothing sent still says Done')
+  } finally {
+    run.stop()
+  }
+})

@@ -1746,6 +1746,8 @@ export function apply(ctx, config) {
           return
         }
         if (event.type === 'turn/end' && chat.turnSource === 'telegram' && event.data?.turn === chat.activeTurn) {
+          // finalizeChat still needs the number (per-turn file and send marks).
+          chat.endedTurn = chat.activeTurn
           chat.activeTurn = undefined
           finalizeSafely(chat)
         }
@@ -2300,7 +2302,8 @@ export function apply(ctx, config) {
     if (chat.done) return
     chat.done = true
     const source = chat.turnSource
-    const turn = chat.activeTurn
+    const turn = chat.activeTurn ?? chat.endedTurn
+    chat.endedTurn = undefined
     clearEditTimer(chat)
     clearAuxTimers(chat)
     if (chat.answerEdit !== undefined) await chat.answerEdit.catch(() => {})
@@ -2333,8 +2336,13 @@ export function apply(ctx, config) {
     // before spending time on answer edits and sends.
     if (thinkingId !== null) await deleteMessage(chat.chatId, chat.threadId, thinkingId)
     if (toolId !== null) await deleteMessage(chat.chatId, chat.threadId, toolId)
-    // A turn started elsewhere that produced no text adds nothing to the topic.
-    if (text.length > 0 || source !== 'mirror' || messageId !== null) {
+    // A turn started elsewhere that produced no text adds nothing to the topic,
+    // and neither does one that already answered with a sticker or file.
+    const answeredInTopic = typeof turn === 'number' && chat.sentInTurn === turn
+    if (text.length === 0 && answeredInTopic) {
+      // An empty answer placeholder would only add noise under the sticker.
+      if (messageId !== null) await deleteMessage(chat.chatId, chat.threadId, messageId)
+    } else if (text.length > 0 || source !== 'mirror' || messageId !== null) {
       const chunks = splitAnswerText(text.length > 0 ? text : tr('✅ Done.', '✅ Готово.'))
       if (messageId !== null) {
         const edited = await editAnswer(chat.chatId, messageId, chunks[0], bridgeAbort.signal, chat.threadId)
@@ -3292,6 +3300,15 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Remember that a turn already put something in its topic itself.
+   * @param chat - topic state.
+   * @param turn - DSH turn number; without one nothing is remembered.
+   */
+  function markTurnSent(chat, turn) {
+    if (typeof turn === 'number') chat.sentInTurn = turn
+  }
+
+  /**
    * Upload files the session showed its user (present, or local images in
    * the final reply) into the session's topic, so a reader on Telegram sees
    * what the Web UI shows. Uses the telegram_send limits and send log; the
@@ -3316,6 +3333,7 @@ export function apply(ctx, config) {
       }
       try {
         const result = await uploadFile(chat.chatId, chat.threadId, file, bridgeAbort.signal)
+        markTurnSent(chat, turn)
         await sentLog.record({
           chatId: chat.chatId,
           threadId: chat.threadId,
@@ -3440,6 +3458,9 @@ export function apply(ctx, config) {
         const result = await uploadFile(chatId, threadId, file, signal)
         if (result?.message_id !== undefined) messageIds.push(result.message_id)
       }
+      // The turn already said something in its topic (a sticker, a file, a
+      // message), so an empty final answer needs no "Done" placeholder.
+      if (own !== undefined && messageIds.length > 0) markTurnSent(own, own.activeTurn)
     } catch (error) {
       // call() has already dropped the topic's binding and name.
       if (isTopicGone(messageOf(error))) {
