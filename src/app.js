@@ -1,8 +1,9 @@
 /** Host runtime: Telegram polling, topic routing and the DSH session bridge. */
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import https from 'node:https'
-import { basename, extname, isAbsolute, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
+import { basename, extname, isAbsolute, join, resolve } from 'node:path'
 import {
   BOT_COMMANDS,
   BOT_COMMANDS_RU,
@@ -38,6 +39,7 @@ import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
 import { createOutbox } from './outbox.js'
 import { isAutoCommandTopic, isTopicGone, resolveThreadTarget, topicNameOf } from './topics.js'
+import { spokenMediaOf, transcribe, transcriptNote } from './voice.js'
 import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference, senderLabel } from './message-context.js'
 import { createSentLog } from './sent-log.js'
 import {
@@ -986,14 +988,66 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Save one Telegram attachment and return its DSH content block.
-   * @param message - Telegram message carrying a photo or document.
+   * Save one spoken recording (voice, audio, round video) as a file and
+   * transcribe it. A failed transcription still passes the file, with a note.
+   * @param message - Telegram message carrying the recording.
+   * @param media - result of spokenMediaOf.
    * @param signal - request lifetime.
-   * @returns prompt content block and display name.
+   * @returns the file block, the transcript block and the display name.
+   */
+  async function saveSpokenMedia(message, media, signal) {
+    const attachments = ctx.get('attachments')
+    const bytes = await downloadTelegramFile(media.file.file_id, signal)
+    const attachment = await attachments.saveFile({ data: bytes, name: media.name })
+    let path
+    try {
+      path = attachments.fileHostPath?.(attachment)
+    } catch {
+      path = undefined
+    }
+    let scratch
+    let outcome
+    try {
+      // Decoders and commands read a file; use a private copy when the store has no host path.
+      if (typeof path !== 'string') {
+        scratch = await mkdtemp(join(tmpdir(), 'dsh-telegram-voice-'))
+        await writeFile(join(scratch, basename(media.name)), bytes)
+      }
+      const result = await transcribe({
+        mode: readLive(config.transcriber, 'dsh'),
+        path: path ?? join(scratch, basename(media.name)),
+        language: readLive(config.transcribeLanguage, ''),
+        command: readLive(config.transcribeCommand, []),
+        ffmpeg: readLive(config.ffmpegPath, 'ffmpeg'),
+        speech: ctx.get('speechToText'),
+        signal,
+      })
+      outcome = { path, ...result }
+    } catch (error) {
+      if (signal.aborted) throw error
+      warn(`${media.kind} ${media.name} not transcribed: ${messageOf(error)}`)
+      outcome = { path, error: messageOf(error) }
+    } finally {
+      if (scratch !== undefined) await rm(scratch, { recursive: true, force: true })
+    }
+    return {
+      block: { type: 'file', attachment },
+      note: { type: 'text', text: transcriptNote(media, outcome) },
+      name: media.name,
+    }
+  }
+
+  /**
+   * Save one Telegram attachment and return its DSH content blocks.
+   * @param message - Telegram message carrying a photo, document or recording.
+   * @param signal - request lifetime.
+   * @returns prompt content block, a transcript note for recordings, and the display name.
    */
   async function saveTelegramAttachment(message, signal) {
     const attachments = ctx.get('attachments')
     if (attachments === undefined) throw new Error('DSH attachment store is unavailable')
+    const spoken = spokenMediaOf(message)
+    if (spoken !== undefined && message.document === undefined && !Array.isArray(message.photo)) return saveSpokenMedia(message, spoken, signal)
     const photo = Array.isArray(message.photo) ? message.photo.at(-1) : undefined
     const document = message.document
     const fileId = photo?.file_id ?? document?.file_id
@@ -3801,7 +3855,7 @@ export function apply(ctx, config) {
         // A malformed allowlist is reported by the main check below.
       }
     }
-    const hasAttachment = message.document !== undefined || (Array.isArray(message.photo) && message.photo.length > 0)
+    const hasAttachment = downloadableFile(message) !== undefined
     // A forward is a prompt even when its media cannot be attached (video,
     // voice, poll...): the agent still learns what was forwarded and from whom.
     const forwarded = isForwarded(message)
@@ -4287,7 +4341,9 @@ export function apply(ctx, config) {
     const forwarded = isForwarded(message)
     let ownFile = false
     if (downloadableFile(message) !== undefined) {
-      attachments.push((await saveTelegramAttachment(message, signal)).block)
+      const saved = await saveTelegramAttachment(message, signal)
+      if (saved.note !== undefined) attachments.push(saved.note)
+      attachments.push(saved.block)
       ownFile = true
     }
     // A replied-to photo or document is attached as well; a failure only
@@ -4300,7 +4356,9 @@ export function apply(ctx, config) {
         replyFile = 'too-large'
       } else {
         try {
-          attachments.push((await saveTelegramAttachment(target, signal)).block)
+          const saved = await saveTelegramAttachment(target, signal)
+          if (saved.note !== undefined) attachments.push(saved.note)
+          attachments.push(saved.block)
           replyFile = 'attached'
         } catch (error) {
           replyFile = 'failed'
@@ -4320,7 +4378,8 @@ export function apply(ctx, config) {
       }
     }
     let text = composePrompt(message, { botId: me?.id, ownFile, replyFile, sent, currentSession })
-    if (ownFile && !forwarded && messageBody(message).trim().length === 0) {
+    // A recording speaks for itself through its transcript.
+    if (ownFile && !forwarded && spokenMediaOf(message) === undefined && messageBody(message).trim().length === 0) {
       const ask = tr('Analyze the attached file.', 'Проанализируй приложенный файл.')
       text = text.length === 0 ? ask : `${text}\n\n${ask}`
     }

@@ -958,3 +958,36 @@ test('any Telegram call into a deleted topic, such as a mirrored turn, drops its
     run.stop()
   }
 })
+
+test('a voice message reaches the agent as a transcript plus the audio file', async () => {
+  const command = [process.execPath, '-e', 'process.stdout.write("buy oat milk")', '{file}']
+  const run = await start({ transcriber: 'command', transcribeCommand: command })
+  try {
+    const agent = await openSessionTopic(run)
+    run.telegram.push({ message_thread_id: 7001, is_topic_message: true, voice: { file_id: 'voice-1', duration: 3, mime_type: 'audio/ogg' } })
+    await wait(400)
+    const content = agent.received.at(-1).content
+    const note = content.find((block) => block.type === 'text' && block.text.includes('voice message'))
+    assert.ok(note, JSON.stringify(content))
+    assert.match(note.text, /transcribed by the configured transcription command; the transcript may contain mistakes, and the file is attached/u)
+    assert.match(note.text, /\nbuy oat milk$/u)
+    assert.equal(content.find((block) => block.type === 'file').attachment.name.endsWith('.ogg'), true)
+    assert.doesNotMatch(promptText(agent.received.at(-1)), /Analyze the attached file/u)
+  } finally {
+    run.stop()
+  }
+})
+
+test('a voice message that cannot be transcribed still passes the file and says why', async () => {
+  const run = await start({ transcriber: 'dsh' })
+  try {
+    const agent = await openSessionTopic(run)
+    run.telegram.push({ message_thread_id: 7001, is_topic_message: true, video_note: { file_id: 'round-1', duration: 4 } })
+    await wait(400)
+    const content = agent.received.at(-1).content
+    assert.ok(content.some((block) => block.type === 'text' && /video message .*not transcribed \(the DSH speech-to-text service is not enabled\); the file is attached/u.test(block.text)), JSON.stringify(content))
+    assert.ok(content.some((block) => block.type === 'file'))
+  } finally {
+    run.stop()
+  }
+})

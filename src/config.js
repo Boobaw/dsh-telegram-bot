@@ -42,5 +42,21 @@ export const Config = z.object({
    * plugins) in the topic bound to their session.
    */
   mirrorTurns: z.boolean().default(true).volatile(),
+  /**
+   * How voice messages, audio files and round video messages are turned into
+   * text: `dsh` uses the DSH speech-to-text service (decoded with ffmpeg),
+   * `command` runs `transcribeCommand`, `off` passes only the file.
+   */
+  transcriber: z.union(['dsh', 'command', 'off']).default('dsh').volatile(),
+  /** Language hint for the DSH speech-to-text service; empty uses its setting. */
+  transcribeLanguage: z.string().default('').volatile(),
+  /**
+   * Program and arguments for `transcriber: command`, run without a shell.
+   * `{file}` is replaced by the recording's path (appended when absent); the
+   * transcript is read from stdout.
+   */
+  transcribeCommand: z.array(z.string()).default([]).volatile(),
+  /** ffmpeg program used to decode recordings for the DSH service. */
+  ffmpegPath: z.string().default('ffmpeg').volatile(),
 })
 

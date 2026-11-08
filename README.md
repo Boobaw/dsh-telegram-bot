@@ -39,6 +39,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Leave **Disallow users
 - Tool approvals with **Deny** / **Allow** buttons.
 - `ask_user_question` support: options, multi-select, custom answers and plan review.
 - Documents and photos sent in a session topic are saved as DSH attachments and passed to the agent.
+- Voice messages, audio files and round video messages are saved as files and transcribed; the agent gets the transcript and the file's path, so it can check a doubtful transcript against the recording. See [Voice messages](#voice-messages).
 - Every prompt from Telegram starts with a line naming the sender, such as `[Telegram message from Ana Silva (@ana, user id 123)]`, so the agent knows who is writing when several allowed users share the bot. Prompts typed in the Web UI are not labelled.
 - Replies, quotes and forwards keep their context. The agent sees the text of the replied-to message (or only the quoted part), who wrote it and when; a replied-to photo or document is attached too. A forwarded message is labelled with its origin (person, hidden account, group or channel with a message link) and original date. Several messages forwarded together become one prompt, and forwarded text never runs as a command. Long quoted text is cut at about 2,000 characters with a note.
 - Replies to messages sent into a topic by a script, job, plugin or another session (see [Send to a topic](#send-to-a-topic)) also carry the full original text, when it was sent, and the sending session and job, even if the topic has moved to a new session since.
@@ -87,8 +88,14 @@ Restart `dsh web` after installing or updating the plugin. Then open **Settings 
 | Show model thinking | Show reasoning in a temporary message |
 | Show tool calls | Show tool calls in a temporary message |
 | Show turns from other clients (`mirrorTurns`) | Mirror turns started outside Telegram into the bound topic; default on |
+| `transcriber` | `dsh` (default), `command` or `off`; see [Voice messages](#voice-messages) |
+| `transcribeLanguage` | Language hint for DSH speech-to-text, such as `zh` or `en`; empty uses its own setting |
+| `transcribeCommand` | Program and arguments for `transcriber: command` |
+| `ffmpegPath` | ffmpeg used to decode recordings for DSH speech-to-text; default `ffmpeg` |
 | Bot language | `en` (default) or `ru` |
 | Enable bot | Start or pause Telegram polling |
+
+The voice fields have no controls on the settings page yet; set them in the profile's `cordis.patch.yml` under the `telegram-bot` row's `config`.
 
 The token field only reports whether a token is configured. A token supplied through the environment cannot be overwritten from the page.
 
@@ -156,6 +163,21 @@ ctx.get('telegramTopics').topics() // [{ threadId, name, sessionId }]: known top
 From an agent: the `telegram_send` tool takes `thread` (the thread id), `text` and `files` (absolute paths). The calling session is named as the sender and does not get a copy of its own message.
 
 Text is Markdown, converted for Telegram like assistant answers. JPEG, PNG and WebP files up to 10 MB are sent as photos, other files as documents (up to 50 MB).
+
+## Voice messages
+
+Voice messages, audio files and round video messages (also when replied to or forwarded) are downloaded, stored as a DSH file attachment and transcribed. The agent receives a note with the transcript, who transcribed it and the stored file's path, followed by the file itself. When transcription fails or is off, the file is still passed on and the note says why. A recording sent without text gets no "analyze the file" prompt: its transcript is the message.
+
+- `transcriber: dsh` (default) uses DSH's own speech-to-text service, the one behind voice input in the Web UI (the `@deepseek-ai/dsh-experimental-voice-input-bundle` bundle with a provider such as the local SenseVoice model). Its default provider and language apply; `transcribeLanguage` overrides the language for Telegram. Recordings are decoded to 16 kHz mono WAV with ffmpeg, which must be installed (`ffmpegPath`).
+- `transcriber: command` runs a program of your choice without a shell, for example a Whisper script or a client for a cloud service. `{file}` in `transcribeCommand` is replaced by the recording's path (it is appended when missing), and the transcript is read from standard output. Keys for a cloud service belong in that program's environment or the DSH credential store, not in the plugin config.
+- `transcriber: off` passes only the file.
+
+```yaml
+- id: telegram-bot
+  config:
+    transcriber: command
+    transcribeCommand: ["/usr/local/bin/transcribe", "--language", "auto", "{file}"]
+```
 
 ## Plugins page
 
@@ -226,7 +248,7 @@ node --check client.js
 npm test
 ```
 
-`src/app.js` is the Host runtime: Telegram polling, topic routing and the session bridge. `src/update-ledger.js` persists Telegram update cursors, `src/admission.js` uses the native DSH session queue. `src/formatting.js`, `src/state.js`, `src/status.js`, `src/utils.js`, `src/errors.js`, `src/config.js` and `src/constants.js` hold the supporting layers. `src/index.js` is the public entry point; root `index.js` is the loader-compatible wrapper. Root `client.js` is the loader-compatible client bundle. `src/client.js` contains the client source. `src/message-context.js` turns replies, quotes and forwards into the labelled context the agent reads. `src/topics.js` resolves topic names, `src/outbox.js` is the file spool behind `bin/dsh-telegram-send.js`, and `src/sent-log.js` remembers sent messages for later replies. The plugin adds one model-facing tool, `telegram_send`, and no system-prompt text.
+`src/app.js` is the Host runtime: Telegram polling, topic routing and the session bridge. `src/update-ledger.js` persists Telegram update cursors, `src/admission.js` uses the native DSH session queue. `src/formatting.js`, `src/state.js`, `src/status.js`, `src/utils.js`, `src/errors.js`, `src/config.js` and `src/constants.js` hold the supporting layers. `src/index.js` is the public entry point; root `index.js` is the loader-compatible wrapper. Root `client.js` is the loader-compatible client bundle. `src/client.js` contains the client source. `src/message-context.js` turns replies, quotes and forwards into the labelled context the agent reads. `src/topics.js` resolves send targets to thread ids and recognises deleted topics, `src/voice.js` decodes and transcribes recordings, `src/outbox.js` is the file spool behind `bin/dsh-telegram-send.js`, and `src/sent-log.js` remembers sent messages for later replies. The plugin adds one model-facing tool, `telegram_send`, and no system-prompt text.
 
 ## License
 

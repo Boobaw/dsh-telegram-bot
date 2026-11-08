@@ -40,15 +40,18 @@ export function isForwarded(message) {
 }
 
 /**
- * The photo or document of a message, when the bot can download it.
+ * The photo, document or spoken recording (voice, audio, round video) of a
+ * message, when the bot can download it.
  * @param message - Telegram message or external reply.
  * @returns the file kind and size, or undefined.
  */
 export function downloadableFile(message) {
   const photo = Array.isArray(message?.photo) ? message.photo.at(-1) : undefined
-  const file = photo ?? message?.document
-  if (typeof file?.file_id !== 'string') return undefined
-  return { kind: photo === undefined ? 'document' : 'photo', size: typeof file.file_size === 'number' ? file.file_size : undefined }
+  const candidates = [['photo', photo], ['document', message?.document], ['voice', message?.voice], ['video_note', message?.video_note], ['audio', message?.audio]]
+  const found = candidates.find(([, file]) => typeof file?.file_id === 'string')
+  if (found === undefined) return undefined
+  const [kind, file] = found
+  return { kind, size: typeof file.file_size === 'number' ? file.file_size : undefined }
 }
 
 /**
