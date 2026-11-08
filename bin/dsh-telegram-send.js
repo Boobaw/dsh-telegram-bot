@@ -10,12 +10,19 @@ import { resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import { enqueue, waitForResult } from '../src/outbox.js'
 
-const usage = `Usage: dsh-telegram-send --topic <name|thread-id> [--file <path>]... [--from <label>]
+const usage = `Usage: dsh-telegram-send --topic <name|thread-id> [--file <path>]...
+                         [--job <name>] [--from-session <id>] [--from <label>]
                          [--no-wait] [--timeout <seconds>] [text...]
 
 Sends text (from the arguments, or from stdin when none are given) and files
 into a topic of the running DSH Telegram bot. The message is also recorded in
-the session bound to that topic. Topic names ignore case.
+the session bound to that topic, without starting a turn. Topic names ignore
+case. Long text is split into several Telegram messages.
+
+  --job <name>           name of the job or script sending it
+  --from-session <id>    DSH session sending it; defaults to $DSH_SESSION_ID
+                         (set inside DSH sessions), --from-session '' for none
+  --from <label>         free-form sender label, used when neither is given
 
 Exit codes: 0 sent, 1 failed (for example an unknown topic), 2 bad arguments,
 3 still queued after the timeout (the bot sends it once it runs).`
@@ -28,6 +35,8 @@ try {
       topic: { type: 'string', short: 't' },
       file: { type: 'string', short: 'f', multiple: true },
       from: { type: 'string' },
+      job: { type: 'string', short: 'j' },
+      'from-session': { type: 'string' },
       'no-wait': { type: 'boolean' },
       timeout: { type: 'string' },
       help: { type: 'boolean', short: 'h' },
@@ -55,11 +64,24 @@ if (text.trim().length === 0 && files.length === 0) {
   process.exit(2)
 }
 
+/** DSH session ids carry a `session-` prefix; DSH_SESSION_ID may not. */
+function sessionIdOf(value) {
+  const id = (value ?? '').trim()
+  if (id.length === 0) return undefined
+  return id.startsWith('session-') ? id : `session-${id}`
+}
+
+const from = {}
+if (values.from !== undefined && values.from.trim().length > 0) from.label = values.from.trim()
+if (values.job !== undefined && values.job.trim().length > 0) from.job = values.job.trim()
+const sessionId = sessionIdOf(values['from-session'] ?? process.env.DSH_SESSION_ID)
+if (sessionId !== undefined) from.sessionId = sessionId
+
 const id = await enqueue({
   topic: values.topic,
   text,
   files,
-  ...(values.from === undefined ? {} : { from: { label: values.from } }),
+  ...(Object.keys(from).length === 0 ? {} : { from }),
 })
 if (values['no-wait']) {
   process.stdout.write(`${JSON.stringify({ queued: id })}\n`)

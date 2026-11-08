@@ -38,6 +38,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Leave **Disallow users
 - Documents and photos sent in a session topic are saved as DSH attachments and passed to the agent.
 - Every prompt from Telegram starts with a line naming the sender, such as `[Telegram message from Ana Silva (@ana, user id 123)]`, so the agent knows who is writing when several allowed users share the bot. Prompts typed in the Web UI are not labelled.
 - Replies, quotes and forwards keep their context. The agent sees the text of the replied-to message (or only the quoted part), who wrote it and when; a replied-to photo or document is attached too. A forwarded message is labelled with its origin (person, hidden account, group or channel with a message link) and original date. Several messages forwarded together become one prompt, and forwarded text never runs as a command. Long quoted text is cut at about 2,000 characters with a note.
+- Replies to messages sent into a topic by a script, job, plugin or another session (see [Send to a topic](#send-to-a-topic)) also carry the full original text, when it was sent, and the sending session and job, even if the topic has moved to a new session since.
 - `/new`, `/workspace`, `/last`, `/rename`, `/fork`, `/clear`, `/stop`, `/restart`, `/status` and `/menu`.
 - `/new` in a session topic starts a fresh DSH session in the same workspace and binds it to the same topic; the previous session stays in DSH. In All it opens a new session topic.
 - One session is bound to at most one topic: binding it to a new topic releases the old one.
@@ -114,7 +115,9 @@ A correct configuration contains:
 
 ## Send to a topic
 
-Scripts, scheduled jobs, other plugins and agents can post into a topic by its name or thread id. The message (text and files) appears in the topic and is also recorded in the session bound to that topic, without starting a turn: whoever answers there next sees it, even after `/new`. A name that matches no topic, or more than one, is an error; nothing is created.
+Scripts, scheduled jobs, other plugins and agents can post into a topic by its name or thread id. The message (text and files) appears in the topic and is also recorded in the session bound to that topic, without starting a turn: it is queued as context for that session's next turn, labelled with who sent it. A name that matches no topic, or more than one, is an error; nothing is created. A topic with no session only shows the message, and the result says so (`note`); if the session cannot take the record, the message is still sent and the result carries `recordError`.
+
+The bot also remembers each such send (`$DSH_HOME/telegram/sent-messages.json`: the last 1,000 sends from the past 180 days, text up to 20,000 characters). When someone replies to or quotes one of those messages, the agent gets the whole original text, however many Telegram messages it was split into, with its send time, job name and sending session, and a hint to open that session for more context. This works after `/new` too, when the current session never saw the message.
 
 Names ignore case. The bot learns a topic's name when it creates the topic, when Telegram reports a topic being created or renamed, and on `/rename`. Topics bound by an earlier version start with their last title. `/id` in a topic shows its thread id.
 
@@ -122,23 +125,27 @@ From a shell (no bot token needed):
 
 ```bash
 dsh-telegram-send --topic notify "Backup finished"
-some-report | dsh-telegram-send --topic notify --from nightly-report
+some-report | dsh-telegram-send --topic notify --job nightly-report
 dsh-telegram-send --topic 7100 --file /tmp/report.pdf "Monthly report"
 ```
+
+Who sent it: `--job <name>` names the job or script, and `--from-session <id>` the DSH session. Inside a DSH session `--from-session` defaults to `$DSH_SESSION_ID`; pass `--from-session ''` to leave it out. `--from <label>` is a free-form label for senders that are neither. When the sending session is the one bound to the topic, it gets no second copy.
+
+Long text is split into several Telegram messages. Every `--file` is sent after the text, one message per file.
 
 The command writes the request into `$DSH_HOME/telegram/outbox/` and waits up to `--timeout` seconds (default 30) for the plugin's answer. Exit codes: `0` sent, `1` failed (the error is printed, for example an unknown topic), `2` bad arguments, `3` still queued (the bot sends it once it runs). `--no-wait` returns right after queueing. The spool keeps requests while DSH is stopped, which is why it is a directory and not a socket; a request interrupted by a restart is sent again. The command is installed as the package's `bin`; link it onto your `PATH` if needed (`node_modules/.bin/dsh-telegram-send` in the profile).
 
 From another Host plugin:
 
 ```js
-const result = await ctx.get('telegramTopics').send('notify', 'Backup **finished**', ['/tmp/report.pdf'], { from: { label: 'backup' } })
-// { chatId, threadId, topic, sessionId, recorded, messageIds }
+const result = await ctx.get('telegramTopics').send('notify', 'Backup **finished**', ['/tmp/report.pdf'], { from: { job: 'backup', sessionId: 'session-…' } })
+// { chatId, threadId, topic, sessionId, recorded, messageIds }, plus note or recordError when it was not recorded
 ctx.get('telegramTopics').topics() // [{ threadId, name, sessionId }]
 ```
 
-From an agent: the `telegram_send` tool takes `topic`, `text` and `files` (absolute paths). The sending session does not get a copy of its own message.
+From an agent: the `telegram_send` tool takes `topic`, `text` and `files` (absolute paths). The calling session is named as the sender and does not get a copy of its own message.
 
-Text is Markdown, converted for Telegram like assistant answers. JPEG, PNG and WebP files up to 10 MB are sent as photos, other files as documents (up to 50 MB). A topic with no session only shows the message.
+Text is Markdown, converted for Telegram like assistant answers. JPEG, PNG and WebP files up to 10 MB are sent as photos, other files as documents (up to 50 MB).
 
 ## Plugins page
 
@@ -209,7 +216,7 @@ node --check client.js
 npm test
 ```
 
-`src/app.js` is the Host runtime: Telegram polling, topic routing and the session bridge. `src/update-ledger.js` persists Telegram update cursors, `src/admission.js` uses the native DSH session queue. `src/formatting.js`, `src/state.js`, `src/status.js`, `src/utils.js`, `src/errors.js`, `src/config.js` and `src/constants.js` hold the supporting layers. `src/index.js` is the public entry point; root `index.js` is the loader-compatible wrapper. Root `client.js` is the loader-compatible client bundle. `src/client.js` contains the client source. `src/message-context.js` turns replies, quotes and forwards into the labelled context the agent reads. `src/topics.js` resolves topic names and `src/outbox.js` is the file spool behind `bin/dsh-telegram-send.js`. The plugin adds one model-facing tool, `telegram_send`, and no system-prompt text.
+`src/app.js` is the Host runtime: Telegram polling, topic routing and the session bridge. `src/update-ledger.js` persists Telegram update cursors, `src/admission.js` uses the native DSH session queue. `src/formatting.js`, `src/state.js`, `src/status.js`, `src/utils.js`, `src/errors.js`, `src/config.js` and `src/constants.js` hold the supporting layers. `src/index.js` is the public entry point; root `index.js` is the loader-compatible wrapper. Root `client.js` is the loader-compatible client bundle. `src/client.js` contains the client source. `src/message-context.js` turns replies, quotes and forwards into the labelled context the agent reads. `src/topics.js` resolves topic names, `src/outbox.js` is the file spool behind `bin/dsh-telegram-send.js`, and `src/sent-log.js` remembers sent messages for later replies. The plugin adds one model-facing tool, `telegram_send`, and no system-prompt text.
 
 ## License
 

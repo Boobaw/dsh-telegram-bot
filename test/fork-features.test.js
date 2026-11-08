@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import test from 'node:test'
 import https from 'node:https'
@@ -197,6 +197,8 @@ function makeTelegram() {
 /** Start the plugin against fresh fakes and an optional initial state. */
 async function start(config = {}, initialState = {}, topicsFile = { chatId: 100 }) {
   await mkdir(STATUS_DIR, { recursive: true })
+  // Message ids restart with every fake bot; old sends must not match them.
+  await rm(join(STATUS_DIR, 'sent-messages.json'), { force: true })
   await writeFile(join(STATUS_DIR, 'state.json'), JSON.stringify({ version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, ...initialState }))
   await writeFile(join(STATUS_DIR, 'topics.json'), JSON.stringify(topicsFile))
   const host = makeHost()
@@ -545,6 +547,67 @@ test('the agent tool and the file spool use the same path', async () => {
     assert.equal(agent.injected.length, 2)
   } finally {
     run.stop()
+  }
+})
+
+test('a long send from a job is recorded with its sender, and a reply after /new gets it in full', async () => {
+  const run = await start({}, notifyState)
+  try {
+    const old = run.host.makeAgent('session-notify', '/tmp/default-workspace')
+    const long = Array.from({ length: 900 }, (_, index) => `word${index}`).join(' ')
+    const id = await enqueue({ topic: 'notify', text: long, from: { job: 'Morning digest', sessionId: 'session-cron' } })
+    const result = (await waitForResult(id, 3000)).result
+    assert.ok(result.messageIds.length >= 2, 'split into several messages')
+    assert.equal(result.recorded, true)
+    assert.equal(old.received.length, 0, 'no turn is started')
+    assert.match(old.injected[0].content[0].text, /^\[Sent to the Telegram topic "Notify" by job "Morning digest" from session session-cron\]\nword0 /u)
+    run.telegram.push({ message_thread_id: 7100, text: '/new' })
+    await wait(200)
+    const fresh = run.host.live.get('session-1')
+    run.telegram.push({
+      message_thread_id: 7100,
+      is_topic_message: true,
+      text: 'thanks',
+      reply_to_message: { message_id: result.messageIds.at(-1), date: 1, chat: { id: 100 }, from: { id: 1, is_bot: true, first_name: 'testbot' }, message_thread_id: 7100, text: 'word899' },
+    })
+    await wait(250)
+    const text = promptText(fresh.received.at(-1))
+    assert.match(text, /\[The replied-to message was posted by the bot on behalf of another sender \(sent [^;]+; by job "Morning digest"; from DSH session session-cron; \d+ Telegram messages; recorded in session session-notify, not this one\)\. Full text:\]\n> word0 word1 /u)
+    assert.match(text, /word899\n\(For more context, open session session-cron or session-notify\.\)\n\nthanks$/u)
+    // A reply to an ordinary bot message adds no such block.
+    run.telegram.push({
+      message_thread_id: 7100,
+      is_topic_message: true,
+      text: 'and this?',
+      reply_to_message: { message_id: 9999, date: 1, chat: { id: 100 }, from: { id: 1, is_bot: true, first_name: 'testbot' }, message_thread_id: 7100, text: 'an answer' },
+    })
+    await wait(250)
+    assert.doesNotMatch(promptText(fresh.received.at(-1)), /on behalf of/u)
+  } finally {
+    run.stop()
+  }
+})
+
+test('a topic without a session, or a session that cannot record, still gets the message', async () => {
+  const run = await start({}, { threads: {}, topicNames: { '100:7200': 'Loose' } })
+  try {
+    const unbound = await run.host.provided.telegramTopics.send('loose', 'hello', [], { from: { job: 'probe' } })
+    assert.equal(unbound.recorded, false)
+    assert.match(unbound.note, /no bound session/u)
+    assert.equal(sent(run.telegram.calls, 7200).length, 1)
+  } finally {
+    run.stop()
+  }
+  const broken = await start({}, notifyState)
+  try {
+    const agent = broken.host.makeAgent('session-notify', '/tmp/default-workspace')
+    agent.inject = () => { throw new Error('session closed') }
+    const result = await broken.host.provided.telegramTopics.send('notify', 'still sent')
+    assert.equal(result.recorded, false)
+    assert.equal(result.recordError, 'session closed')
+    assert.ok(sent(broken.telegram.calls, 7100).some((call) => call.body.text.includes('still sent')))
+  } finally {
+    broken.stop()
   }
 })
 

@@ -38,7 +38,8 @@ import { createUpdateAdmission } from './update-ledger.js'
 import { publishStatus } from './status.js'
 import { createOutbox } from './outbox.js'
 import { isAutoCommandTopic, resolveTopicTarget, topicNameOf } from './topics.js'
-import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, senderLabel } from './message-context.js'
+import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage, replyReference, senderLabel } from './message-context.js'
+import { createSentLog } from './sent-log.js'
 import {
   allowedChatsOf,
   allowedUsersOf,
@@ -2637,12 +2638,32 @@ export function apply(ctx, config) {
     return call(method, { chat_id: chatId }, signal, 120_000, { body, contentType: `multipart/form-data; boundary=${boundary}` })
   }
 
+  /** Messages sent through sendToTopic, for the context of later replies. */
+  const sentLog = createSentLog({ onError: (error) => reportError('sent-log', error) })
+
+  /**
+   * Who sent a topic message, as a short label for the session record.
+   * @param from - `{ label, sessionId, job }`.
+   * @returns label text, or an empty string.
+   */
+  function senderOf(from) {
+    const job = typeof from?.job === 'string' && from.job.trim().length > 0 ? from.job.trim() : undefined
+    const session = typeof from?.sessionId === 'string' && from.sessionId.length > 0 ? from.sessionId : undefined
+    const label = typeof from?.label === 'string' && from.label.trim().length > 0 ? from.label.trim() : undefined
+    const parts = []
+    if (job !== undefined) parts.push(`job "${job}"`)
+    if (session !== undefined) parts.push(`${job === undefined ? '' : 'from '}session ${session}`)
+    if (parts.length === 0 && label !== undefined) parts.push(label)
+    return parts.join(' ')
+  }
+
   /**
    * Send text and files into a topic, addressed by name or thread id, and
    * record them in the session bound to that topic without starting a turn.
    * The Host service, the agent tool and the file spool all use this.
    * @param request - `{ topic, text, files, from }`; `from` may hold `label`
-   *   (who sent it) and `sessionId` (a sender session that needs no copy).
+   *   (who sent it), `job` (a job name) and `sessionId` (the sender session;
+   *   when it is the bound session itself, no copy is recorded).
    * @param signal - request lifetime.
    * @returns where it went and whether the session recorded it.
    */
@@ -2686,34 +2707,69 @@ export function apply(ctx, config) {
       throw error
     }
     const sessionId = state.threads[`${chatId}:${threadId}`]
+    const sender = senderOf(request?.from)
     let recorded = false
+    let recordError
     if (typeof sessionId === 'string' && sessionId !== request?.from?.sessionId) {
-      const chat = await chatFor(chatId, threadId)
-      const agent = ctx.get('agents')?.get(sessionId) ?? await ensureAgent(chat)
-      const label = typeof request?.from?.label === 'string' && request.from.label.trim().length > 0 ? ` by ${request.from.label.trim()}` : ''
-      const where = target.name === undefined ? `topic ${threadId}` : `topic "${target.name}"`
-      const content = [{ type: 'text', text: `[Sent to the Telegram ${where}${label}]${text.trim().length > 0 ? `\n${text.trim()}` : ''}` }]
-      const store = ctx.get('attachments')
-      for (const file of files) {
-        if (store === undefined) break
-        const mediaType = PHOTO_TYPES[extname(file.name).toLowerCase()]
-        const attachment = mediaType === undefined
-          ? await store.saveFile({ data: file.data, name: file.name })
-          : await store.saveImage({ data: file.data, mediaType, name: file.name })
-        content.push({ type: mediaType === undefined ? 'file' : 'image', attachment })
+      try {
+        const chat = await chatFor(chatId, threadId)
+        const agent = ctx.get('agents')?.get(sessionId) ?? await ensureAgent(chat)
+        const label = sender.length > 0 ? ` by ${sender}` : ''
+        const where = target.name === undefined ? `topic ${threadId}` : `topic "${target.name}"`
+        const content = [{ type: 'text', text: `[Sent to the Telegram ${where}${label}]${text.trim().length > 0 ? `\n${text.trim()}` : ''}` }]
+        const store = ctx.get('attachments')
+        for (const file of files) {
+          if (store === undefined) break
+          const mediaType = PHOTO_TYPES[extname(file.name).toLowerCase()]
+          const attachment = mediaType === undefined
+            ? await store.saveFile({ data: file.data, name: file.name })
+            : await store.saveImage({ data: file.data, mediaType, name: file.name })
+          content.push({ type: mediaType === undefined ? 'file' : 'image', attachment })
+        }
+        const id = randomUUID()
+        // A next-step inbox item is durable and waits for whatever turn comes
+        // next; it does not wake the agent. The request id keeps the mirror from
+        // echoing it back into the topic.
+        const message = { id, role: 'user', content, source: { kind: 'user', rpcId: `telegram-post:${id}` } }
+        if (typeof agent?.inject === 'function') agent.inject(message)
+        else if (typeof agent?.send === 'function') agent.send(message, 'next-step', false)
+        else throw new Error('The bound session cannot record messages.')
+        recorded = true
+      } catch (error) {
+        // The message is already in Telegram; report the missing record
+        // instead of failing the send.
+        recordError = messageOf(error)
+        reportError('topic-send-record', error)
       }
-      const id = randomUUID()
-      // A next-step inbox item is durable and waits for whatever turn comes
-      // next; it does not wake the agent. The request id keeps the mirror from
-      // echoing it back into the topic.
-      const message = { id, role: 'user', content, source: { kind: 'user', rpcId: `telegram-post:${id}` } }
-      if (typeof agent?.inject === 'function') agent.inject(message)
-      else if (typeof agent?.send === 'function') agent.send(message, 'next-step', false)
-      else throw new Error('The bound session cannot record messages.')
-      recorded = true
+    }
+    try {
+      await sentLog.record({
+        chatId,
+        threadId,
+        topic: target.name ?? null,
+        messageIds,
+        text: text.trim(),
+        files: files.map((file) => file.name),
+        fromSession: typeof request?.from?.sessionId === 'string' ? request.from.sessionId : null,
+        job: typeof request?.from?.job === 'string' && request.from.job.trim().length > 0 ? request.from.job.trim() : null,
+        label: typeof request?.from?.label === 'string' ? request.from.label : null,
+        boundSession: typeof sessionId === 'string' ? sessionId : null,
+        recorded: recorded || (typeof sessionId === 'string' && sessionId === request?.from?.sessionId),
+      })
+    } catch (error) {
+      reportError('sent-log', error)
     }
     await publishStatus({ lastTopicSend: { threadId, topic: target.name ?? null, at: new Date().toISOString(), recorded } })
-    return { chatId, threadId, topic: target.name ?? null, sessionId: sessionId ?? null, recorded, messageIds }
+    return {
+      chatId,
+      threadId,
+      topic: target.name ?? null,
+      sessionId: sessionId ?? null,
+      recorded,
+      ...(recordError === undefined ? {} : { recordError }),
+      ...(typeof sessionId === 'string' ? {} : { note: 'The topic has no bound session; the message was only sent to Telegram.' }),
+      messageIds,
+    }
   }
 
   /**
@@ -3631,7 +3687,7 @@ export function apply(ctx, config) {
         return
       }
       try {
-        const prompt = await promptFrom(message, signal)
+        const prompt = await promptFrom(message, signal, chatState.sessionId)
         if (forwarded) batchForward(chatState, chat.id, threadId, prompt, signal)
         else await dispatchPrompt(chatState, chat.id, threadId, prompt, signal)
       } catch (error) {
@@ -4009,7 +4065,7 @@ export function apply(ctx, config) {
     }
 
     // Ordinary text becomes a prompt, with what it replies to or quotes.
-    await dispatchPrompt(chatState, chat.id, threadId, await promptFrom(message, signal), signal)
+    await dispatchPrompt(chatState, chat.id, threadId, await promptFrom(message, signal, chatState.sessionId), signal)
   }
 
   /**
@@ -4055,9 +4111,10 @@ export function apply(ctx, config) {
    * quotes or forwards, its own photo or document and a replied-to one.
    * @param message - Telegram message.
    * @param signal - request lifetime.
+   * @param currentSession - session bound to the message's topic, if any.
    * @returns prompt text, attachment blocks and Telegram message id.
    */
-  async function promptFrom(message, signal) {
+  async function promptFrom(message, signal, currentSession) {
     const attachments = []
     const forwarded = isForwarded(message)
     let ownFile = false
@@ -4083,7 +4140,18 @@ export function apply(ctx, config) {
         }
       }
     }
-    let text = composePrompt(message, { botId: me?.id, ownFile, replyFile })
+    // A reply to something the bot sent on another sender's behalf carries
+    // that message in full, with its sender and time.
+    let sent
+    const reference = replyReference(message)
+    if (reference !== undefined) {
+      try {
+        sent = await sentLog.find(reference.chatId, reference.messageId)
+      } catch (error) {
+        warn(`sent-message lookup failed: ${messageOf(error)}`)
+      }
+    }
+    let text = composePrompt(message, { botId: me?.id, ownFile, replyFile, sent, currentSession })
     if (ownFile && !forwarded && messageBody(message).trim().length === 0) {
       const ask = tr('Analyze the attached file.', 'Проанализируй приложенный файл.')
       text = text.length === 0 ? ask : `${text}\n\n${ask}`
@@ -4431,7 +4499,7 @@ export function apply(ctx, config) {
      * @param topic - topic name (any case) or numeric thread id.
      * @param text - Markdown text.
      * @param files - absolute file paths.
-     * @param options - `{ from: { label, sessionId } }`.
+     * @param options - `{ from: { label, sessionId, job } }`.
      */
     send: (topic, text, files = [], options = {}) => sendToTopic({ topic, text, files, from: options.from }),
     /** @returns known topic names and thread ids in the bot's chat. */

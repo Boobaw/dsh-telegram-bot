@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { composePrompt, describeReply, isForwarded, repliedMessage } from '../src/message-context.js'
+import { composePrompt, describeReply, describeSent, isForwarded, repliedMessage, replyReference } from '../src/message-context.js'
 
 const user = { id: 42, first_name: 'Owner' }
 
@@ -70,4 +70,45 @@ test('plain messages and topic roots add no context', () => {
   const inTopic = { from: user, text: 'hi', is_topic_message: true, message_thread_id: 70, reply_to_message: { message_id: 70, date: 0, text: 'topic' } }
   assert.equal(repliedMessage(inTopic), undefined)
   assert.equal(composePrompt(inTopic), 'hi')
+})
+
+const sentEntry = {
+  chatId: 100,
+  messageIds: [7, 8],
+  sentAt: '2026-11-08T18:03:22.000Z',
+  text: 'Part one.\nPart two.',
+  files: ['report.pdf'],
+  fromSession: 'session-sender',
+  job: 'Morning digest',
+  boundSession: 'session-old',
+  recorded: true,
+}
+
+test('a reply to a message sent on behalf of a job shows the full text and its sender', () => {
+  const message = { from: user, text: 'done', chat: { id: 100 }, reply_to_message: { message_id: 8, date: 0, from: { id: 1, is_bot: true, first_name: 'bot' }, text: 'Part two.' } }
+  const text = composePrompt(message, { botId: 1, sent: sentEntry, currentSession: 'session-new' })
+  assert.equal(text, [
+    '[Replying to a message from the assistant (this bot) (sent 1970-01-01 00:00 UTC)]',
+    '> Part two.',
+    '',
+    '[The replied-to message was posted by the bot on behalf of another sender (sent 2026-11-08 18:03 UTC; by job "Morning digest"; from DSH session session-sender; 2 Telegram messages; with file "report.pdf"; recorded in session session-old, not this one). Full text:]',
+    '> Part one.',
+    '> Part two.',
+    '(For more context, open session session-sender or session-old.)',
+    '',
+    'done',
+  ].join('\n'))
+  assert.deepEqual(replyReference(message), { chatId: 100, messageId: 8 })
+})
+
+test('a sent message recorded in the current session only names its sender', () => {
+  const text = describeSent({ ...sentEntry, files: [], messageIds: [8], fromSession: null, job: null, label: 'backup', boundSession: 'session-new' }, { currentSession: 'session-new' })
+  assert.equal(text, '[The replied-to message was posted by the bot on behalf of another sender (sent 2026-11-08 18:03 UTC; by backup). Full text:]\n> Part one.\n> Part two.')
+})
+
+test('no sent entry adds nothing, and forwards have no reply reference', () => {
+  const message = { from: user, text: 'ok', chat: { id: 100 }, reply_to_message: { message_id: 9, date: 0, from: { id: 1 }, text: 'hi' } }
+  assert.equal(composePrompt(message, { botId: 1 }), '[Replying to a message from the assistant (this bot) (sent 1970-01-01 00:00 UTC)]\n> hi\n\nok')
+  assert.equal(replyReference({ ...message, forward_origin: { type: 'hidden_user', sender_user_name: 'x', date: 0 } }), undefined)
+  assert.equal(replyReference({ from: user, text: 'plain' }), undefined)
 })

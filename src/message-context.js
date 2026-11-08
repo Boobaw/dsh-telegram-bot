@@ -6,6 +6,9 @@
 /** Longest quoted or forwarded text passed to the agent, in characters. */
 export const QUOTE_LIMIT = 2000
 
+/** Longest text of a message sent on someone's behalf passed to the agent, in characters. */
+export const SENT_TEXT_LIMIT = 8000
+
 /** Largest file Telegram lets a bot download (getFile). */
 export const DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
 
@@ -63,19 +66,37 @@ export function repliedMessage(message) {
 }
 
 /**
+ * Chat and message id of the message a reply points at, for looking it up
+ * in the sent-message log.
+ * @param message - Telegram message.
+ * @returns { chatId, messageId }, or undefined when it is not a reply.
+ */
+export function replyReference(message) {
+  if (originOf(message) !== undefined) return undefined
+  const target = repliedMessage(message)
+  if (target !== undefined) return { chatId: target.chat?.id ?? message.chat?.id, messageId: target.message_id }
+  const external = message?.external_reply
+  if (external?.chat?.id !== undefined && Number.isSafeInteger(external.message_id)) return { chatId: external.chat.id, messageId: external.message_id }
+  return undefined
+}
+
+/**
  * Build the prompt text for one message: context lines, then the message.
  * A forwarded message is shown in full inside its context block.
  * @param message - Telegram message.
  * @param options - botId: this bot's user id; replyFile: outcome of attaching
  *   the replied-to file ('attached', 'too-large', 'failed'); ownFile: true when
- *   the message's own photo or document is attached; maxQuote: text limit.
+ *   the message's own photo or document is attached; maxQuote: text limit;
+ *   sent: the sent-message log entry the replied-to message belongs to;
+ *   currentSession: the session now bound to the topic.
  * @returns the prompt text, possibly empty.
  */
 export function composePrompt(message, options = {}) {
   const body = messageBody(message).trim()
   const forward = describeForward(message, body, options)
   const reply = forward === undefined ? describeReply(message, options) : undefined
-  const blocks = [reply, forward].filter((block) => block !== undefined)
+  const sent = reply === undefined ? undefined : describeSent(options.sent, { currentSession: options.currentSession })
+  const blocks = [reply, sent, forward].filter((block) => block !== undefined)
   if (forward === undefined && body.length > 0) blocks.push(body)
   return blocks.join('\n\n')
 }
@@ -149,6 +170,37 @@ export function describeForward(message, body = messageBody(message).trim(), opt
   if (media !== undefined) details.push(media)
   const head = `[Forwarded message from ${describeOrigin(origin, message, options)}${details.length === 0 ? '' : ` (${details.join('; ')})`}]`
   return body.length === 0 ? head : `${head}\n${quoteLines(body, options.maxQuote ?? QUOTE_LIMIT)}`
+}
+
+/**
+ * Describe a message the bot sent into a topic on someone's behalf (a script,
+ * a job, a plugin or another session): who sent it, when, where it was
+ * recorded, and its full text, which may span several Telegram messages.
+ * @param sent - entry from the sent-message log.
+ * @param options - currentSession: session now bound to the topic; limit: text limit.
+ * @returns the context block, or undefined.
+ */
+export function describeSent(sent, options = {}) {
+  if (sent === undefined || sent === null) return undefined
+  const details = []
+  const time = Date.parse(sent.sentAt ?? '')
+  details.push(Number.isFinite(time) ? `sent ${formatDate(time / 1000)}` : 'sent at an unknown time')
+  if (typeof sent.job === 'string' && sent.job.length > 0) details.push(`by job "${sent.job}"`)
+  if (typeof sent.fromSession === 'string' && sent.fromSession.length > 0) details.push(`from DSH session ${sent.fromSession}`)
+  else if (typeof sent.label === 'string' && sent.label.length > 0 && sent.job == null) details.push(`by ${sent.label}`)
+  if (Array.isArray(sent.messageIds) && sent.messageIds.length > 1) details.push(`${sent.messageIds.length} Telegram messages`)
+  if (Array.isArray(sent.files) && sent.files.length > 0) details.push(`with ${sent.files.length === 1 ? 'file' : 'files'} ${sent.files.map((name) => `"${name}"`).join(', ')}`)
+  const bound = typeof sent.boundSession === 'string' ? sent.boundSession : undefined
+  if (bound !== undefined && sent.recorded === true && bound !== options.currentSession) details.push(`recorded in session ${bound}, not this one`)
+  else if (bound === undefined) details.push('the topic had no session then')
+  const head = `[The replied-to message was posted by the bot on behalf of another sender (${details.join('; ')}). Full text:]`
+  const body = typeof sent.text === 'string' && sent.text.trim().length > 0
+    ? quoteLines(sent.text, options.limit ?? SENT_TEXT_LIMIT) + (sent.textCut > 0 ? `\n> […${sent.textCut} more characters not kept]` : '')
+    : '> (no text)'
+  const sessions = [sent.fromSession, bound !== options.currentSession && sent.recorded === true ? bound : undefined]
+    .filter((id, index, all) => typeof id === 'string' && id.length > 0 && all.indexOf(id) === index)
+  const hint = sessions.length === 0 ? '' : `\n(For more context, open session ${sessions.join(' or ')}.)`
+  return `${head}\n${body}${hint}`
 }
 
 /** Forward origin of a message, including the fields older Bot API versions used. */
