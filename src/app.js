@@ -3248,6 +3248,11 @@ export function apply(ctx, config) {
         await send(chat.id, tr('Stop the current task before starting a new session.', 'Останови текущую задачу перед новой сессией.'), signal, threadId)
         return
       }
+      if (!inSession) {
+        // No workspace to keep yet: ask for one like any new topic.
+        await askTopicBinding(chatState, undefined, signal)
+        return
+      }
       try {
         await startNewSessionInTopic(chatState, signal)
       } catch (error) {
