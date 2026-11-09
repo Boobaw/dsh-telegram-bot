@@ -12,7 +12,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.3.0',
   agentBridge: 'v1',
-  codeRevision: 'context-send',
+  codeRevision: 'topic-error-fallback',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,

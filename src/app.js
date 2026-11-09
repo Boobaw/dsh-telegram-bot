@@ -76,7 +76,7 @@ export function apply(ctx, config) {
   /** Invalidates a start that was overtaken by stop/restart. */
   let startEpoch = 0
   /** Durable chat → session mapping. */
-  let state = { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {} }
+  let state = { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {}, goalPanels: {} }
   /** Serializes state-file writes. */
   let stateWrite = Promise.resolve()
   /** Per-chat live bridge state. */
@@ -162,6 +162,8 @@ export function apply(ctx, config) {
         thinkingEdit: Promise.resolve(),
         toolTimer: null,
         toolLastText: '',
+        typingTimer: null,
+        typingInFlight: false,
         boundAgent: undefined,
         questionAgent: undefined,
       }
@@ -723,7 +725,7 @@ export function apply(ctx, config) {
     }
     // `encoded` carries a prepared body (a file upload); `payload` then only
     // names the chat for pacing.
-    const body = encoded?.body ?? JSON.stringify(payload)
+    let body = encoded?.body ?? JSON.stringify(payload)
     const contentType = encoded?.contentType ?? 'application/json'
     // Mirror Hermes' Telegram fallback: try the normal IPv4 path first, then
     // the Bot API seed IPv4 literals with Host/SNI kept on api.telegram.org.
@@ -740,6 +742,22 @@ export function apply(ctx, config) {
         lastError = error
         if (signal.aborted) throw error
         if (error?.telegram === true) {
+          // Bot API 10.0 moved private-chat topics from message_thread_id to
+          // direct_messages_topic_id. Retry once with the direct-message field
+          // when Telegram reports a missing thread.
+          if (!encoded && /message thread not found/i.test(messageOf(error))
+            && payload !== null && typeof payload === 'object'
+            && typeof payload.message_thread_id === 'number'
+            && typeof payload.direct_messages_topic_id !== 'number'
+            && ['sendMessage', 'sendPhoto', 'sendDocument'].includes(method)) {
+            payload = {
+              ...payload,
+              direct_messages_topic_id: payload.message_thread_id,
+            }
+            delete payload.message_thread_id
+            body = JSON.stringify(payload)
+            continue
+          }
           if (payload !== null && typeof payload === 'object' && payload.chat_id !== undefined) {
             noteRateLimit(payload.chat_id, error.retryAfter)
           }
@@ -1777,7 +1795,7 @@ export function apply(ctx, config) {
    */
   function scheduleFlush(chat) {
     if (chat.editTimer !== null || chat.done) return
-    const delay = Math.max(0, 800 - (Date.now() - (chat.lastEdit ?? 0)))
+    const delay = Math.max(0, 300 - (Date.now() - (chat.lastEdit ?? 0)))
     chat.editTimer = setTimeout(() => {
       chat.editTimer = null
       fireAndForget('stream-flush', () => flushChat(chat))
@@ -1803,6 +1821,43 @@ export function apply(ctx, config) {
       if (!bridgeAbort.signal.aborted) reportError('stream-edit', error)
     })
     await chat.answerEdit
+  }
+
+  /** How often "typing…" is renewed; Telegram shows it for about 5 seconds. */
+  const TYPING_REFRESH_MS = process.env.NODE_ENV === 'test' ? 100 : 4000
+
+  /**
+   * Show "typing…" in the topic while its turn runs. Each topic has its own
+   * timer; it stops itself as soon as the topic is no longer busy.
+   */
+  function startTyping(chat) {
+    if (chat.typingTimer !== null && chat.typingTimer !== undefined) return
+    const tick = () => {
+      if (!chat.busy || chat.done || lifetime === undefined || bridgeAbort.signal.aborted) {
+        stopTyping(chat)
+        return
+      }
+      if (chat.typingInFlight === true) return
+      chat.typingInFlight = true
+      call('sendChatAction', {
+        chat_id: chat.chatId,
+        ...(chat.threadId === undefined || chat.threadId === 0 ? {} : { message_thread_id: chat.threadId }),
+        action: 'typing',
+      }, bridgeAbort.signal, 10_000)
+        .catch((error) => {
+          if (!bridgeAbort.signal.aborted) warn(`sendChatAction failed: ${messageOf(error)}`)
+        })
+        .finally(() => { chat.typingInFlight = false })
+    }
+    chat.typingTimer = setInterval(tick, TYPING_REFRESH_MS)
+    chat.typingTimer.unref?.()
+    tick()
+  }
+
+  /** Stop renewing "typing…" for one topic. */
+  function stopTyping(chat) {
+    if (chat.typingTimer !== null && chat.typingTimer !== undefined) clearInterval(chat.typingTimer)
+    chat.typingTimer = null
   }
 
   /** Stop the thinking/tool display timers. */
@@ -1857,7 +1912,7 @@ export function apply(ctx, config) {
       const text = full.slice(0, chat.thinkingShown).trim()
       if (text.length === 0) return
       // Header counts as one line; keep at most nine wrapped content lines.
-      const bounded = wrapThinkingLines(text, 40, 9).trimEnd()
+      const bounded = wrapThinkingLines(text, 36, 9).trimEnd()
       const body = `💭 Thinking\n${bounded}`
       if (body === chat.thinkingLastText) return
       chat.thinkingLastText = body
@@ -2042,6 +2097,7 @@ export function apply(ctx, config) {
     if (chat.done) return
     chat.done = true
     chat.busy = false
+    stopTyping(chat)
     chat.turnSource = undefined
     chat.awaitingTurn = false
     chat.activeTurn = undefined
@@ -2088,6 +2144,7 @@ export function apply(ctx, config) {
     if (chat.done && !force) return
     chat.done = true
     chat.busy = false
+    stopTyping(chat)
     chat.turnSource = undefined
     chat.awaitingTurn = false
     chat.activeTurn = undefined
@@ -2133,6 +2190,7 @@ export function apply(ctx, config) {
     }
     chat.busy = true
     chat.done = false
+    startTyping(chat)
     chat.turnSource = 'telegram'
     chat.awaitingTurn = true
     chat.activeTurn = undefined
@@ -2145,6 +2203,9 @@ export function apply(ctx, config) {
     clearEditTimer(chat)
     resetAux(chat)
     chat.answerEdit = Promise.resolve()
+    // The goal panel is a normal per-topic message placed immediately before
+    // the generation placeholder; it is not pinned.
+    await showGoalBeforeTurn(chat)
     const answer = await sendPlain(chat.chatId, tr('⏳ Generating…', '⏳ Генерирую…'), bridgeAbort.signal, chat.threadId)
     chat.messageId = answer?.message_id ?? null
     if (readLive(config.showThinking, true) === true) {
@@ -2271,14 +2332,27 @@ export function apply(ctx, config) {
    * @param signal - request lifetime.
    */
   async function notifyAll(text, signal) {
-    if (topics.chatId === 0) return
-    await call('sendMessage', {
-      chat_id: topics.chatId,
-      text,
-      parse_mode: 'HTML',
-    }, signal).catch((error) => {
-      if (!signal.aborted) warn(`lifecycle notification failed: ${messageOf(error)}`)
-    })
+    if (topics.chatId === 0) return false
+    let lastError
+    // Startup messages are easy to lose during a restart: the bot may still be
+    // reconnecting to the network or Telegram may answer 429. Retry a few times
+    // instead of silently dropping the lifecycle notice.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await call('sendMessage', {
+          chat_id: topics.chatId,
+          text,
+          parse_mode: 'HTML',
+        }, signal)
+        return true
+      } catch (error) {
+        lastError = error
+        if (signal.aborted) return false
+        if (attempt < 2) await sleep(500 * (attempt + 1), signal)
+      }
+    }
+    if (!signal.aborted) warn(`lifecycle notification failed: ${messageOf(lastError)}`)
+    return false
   }
 
   /** @returns the display name for a permission preset. */
@@ -2585,6 +2659,23 @@ export function apply(ctx, config) {
     return texts
   }
 
+  /** Check that a stored Telegram topic still exists before reusing it. */
+  async function topicIsUsable(chatId, threadId, title, signal) {
+    try {
+      await call('editForumTopic', {
+        chat_id: chatId,
+        message_thread_id: threadId,
+        name: shortLabel(title || 'DSH session', 120),
+      }, signal)
+      return true
+    } catch (error) {
+      const detail = messageOf(error)
+      if (/thread not found|topic.*not found|message thread/iu.test(detail)) return false
+      // Permission/rate-limit errors do not prove deletion. Let delivery decide.
+      return true
+    }
+  }
+
   /**
    * Deliver a session preview into its topic.
    * @param record - topic mapping.
@@ -2603,7 +2694,18 @@ export function apply(ctx, config) {
         [],
         signal,
       )
-      if (delivered === undefined) return false
+      if (delivered === undefined) {
+        await publishStatus({ lastTopicDelivery: { threadId: record.threadId, ok: false, reason: 'no result' } })
+        return false
+      }
+      // If Telegram accepted the message but put it in General instead of the
+      // stored thread, the topic is gone. The Bot API reports the actual
+      // message_thread_id on messages sent into a live topic.
+      if (typeof record.threadId === 'number' && delivered.message_thread_id !== record.threadId) {
+        await publishStatus({ lastTopicDelivery: { threadId: record.threadId, deliveredThreadId: delivered.message_thread_id ?? null, ok: false, reason: 'wrong thread' } })
+        return false
+      }
+      await publishStatus({ lastTopicDelivery: { threadId: record.threadId, deliveredThreadId: delivered.message_thread_id ?? record.threadId, ok: true } })
       try {
         await sendMenu(chatId, record.threadId, await chatFor(chatId, record.threadId), signal)
       } catch (error) {
@@ -2614,6 +2716,7 @@ export function apply(ctx, config) {
       return true
     } catch (error) {
       if (!signal.aborted) reportError('topic-delivery', error)
+      await publishStatus({ lastTopicDelivery: { threadId: record.threadId, ok: false, reason: messageOf(error) } })
       return false
     }
   }
@@ -2632,11 +2735,15 @@ export function apply(ctx, config) {
     const opening = (async () => {
       const existing = state.sessions[sessionId]
       if (existing !== undefined && existing.chatId === chatId && typeof existing.threadId === 'number') {
-        // Re-open the stored topic and make it visible in Telegram. If the
-        // thread was deleted, drop the stale mapping and create a fresh one.
-        if (await deliverSessionTopic(existing, chatId, signal)) return existing
+        // Re-open the stored topic and make it visible in Telegram. Probe the
+        // topic first: sending into a deleted thread can be accepted by
+        // Telegram as a message in General, which would wrongly look like a
+        // successful reuse and leave the session without a topic.
+        if (await topicIsUsable(chatId, existing.threadId, existing.title, signal)
+          && await deliverSessionTopic(existing, chatId, signal)) return existing
         delete state.sessions[sessionId]
         delete state.threads[`${chatId}:${existing.threadId}`]
+        delete state.topicNames?.[`${chatId}:${existing.threadId}`]
         await persistState()
       }
       const title = await sessionTitle(sessionId)
@@ -2665,6 +2772,35 @@ export function apply(ctx, config) {
     } finally {
       if (openingTopics.get(key) === opening) openingTopics.delete(key)
     }
+  }
+
+  /** Create a fresh topic for an existing session, even if an old mapping remains. */
+  async function openNewTopicForSession(sessionId, chatId, signal) {
+    const records = await ctx.get('sessionQuery')?.listSessions(signal)
+    const header = records?.find((entry) => entry.header.id === sessionId)?.header
+    const title = await sessionTitle(sessionId)
+    const previous = state.sessions[sessionId]
+    if (previous?.chatId === chatId && typeof previous.threadId === 'number') {
+      delete state.threads[`${chatId}:${previous.threadId}`]
+      delete state.topicNames?.[`${chatId}:${previous.threadId}`]
+      delete state.goalPanels?.[`${chatId}:${previous.threadId}`]
+      forgetChatState(chatId, previous.threadId)
+    }
+    const threadId = await createTopic(chatId, title, signal)
+    if (threadId === undefined) return undefined
+    const record = {
+      sessionId,
+      chatId,
+      threadId,
+      title,
+      ...(header?.cwd === undefined ? {} : { cwd: header.cwd }),
+      updatedAt: Date.now(),
+    }
+    state.sessions[sessionId] = record
+    state.threads[`${chatId}:${threadId}`] = sessionId
+    await persistState()
+    await deliverSessionTopic(record, chatId, signal)
+    return record
   }
 
   /**
@@ -2860,6 +2996,10 @@ export function apply(ctx, config) {
       callback_data: `f:${sessionId}`,
     }])
     rows.push([{
+      text: tr('🆕 New topic for this session', '🆕 Новый topic для этой сессии'),
+      callback_data: `t:${sessionId}`,
+    }])
+    rows.push([{
       text: tr('⬅️ Back', '⬅️ Назад'),
       callback_data: `w:${workspaceRef}`,
     }])
@@ -2976,6 +3116,22 @@ export function apply(ctx, config) {
           return
         }
         await createNewSessionTopic(chat.id, threadId, signal, target)
+        return
+      }
+      if (prefix === 't') {
+        const record = await openNewTopicForSession(ref, chat.id, signal)
+        if (record === undefined) {
+          await send(chat.id, tr('Failed to create a new topic. Check Topics in chat settings.', 'Не удалось создать новый topic. Проверь Topics в настройках чата.'), signal, threadId)
+          return
+        }
+        await editKeyboard(
+          chat.id,
+          threadId,
+          query.message.message_id,
+          `✅ ${tr('New topic for session', 'Новый topic для сессии')} «${escapeHtml(record.title)}».`,
+          [],
+          signal,
+        )
         return
       }
       if (prefix === 'f') {
@@ -3267,7 +3423,7 @@ export function apply(ctx, config) {
             ? `${tr('Current session', 'Текущая сессия')}: <code>${chatState.sessionId}</code>\n`
             : `${tr('Global topic. Choose a session or create a new one.', 'Глобальный чат. Выбери сессию или создай новую.')}\n`) +
           `\n<b>${tr('First run', 'Первый запуск')}:</b> @BotFather → Bot Settings → <b>Threaded mode</b> → ${tr('Enable', 'Включить')}.\n` +
-          `${tr('Commands', 'Команды')}: /sessions, /new, /current, /menu, /rename, /fork, /last, /clear, /stop, /restart, /status, /id, /ping.`,
+          `${tr('Commands', 'Команды')}: /sessions, /new, /current, /menu, /rename, /fork, /last, /goal, /clear, /stop, /restart, /status, /id, /ping.`,
         signal,
         threadId,
       )
@@ -3467,6 +3623,71 @@ export function apply(ctx, config) {
       scheduleRestart('command')
       return
     }
+    if (command === '/goal') {
+      if (!inSession) {
+        await send(chat.id, tr('Open a session first: /sessions.', 'Сначала открой сессию: /sessions.'), signal, threadId)
+        return
+      }
+      const goals = ctx.get('goals')
+      if (goals === undefined) {
+        await send(chat.id, tr('Goals are unavailable in this profile.', 'Цели недоступны в этом профиле.'), signal, threadId)
+        return
+      }
+      try {
+        const agent = await ensureAgent(chatState)
+        const rest = parts.slice(1).join(' ').trim()
+        const action = rest.split(/\s+/u)[0]?.toLowerCase()
+        let view = goals.get(agent)
+        if (rest.length === 0) {
+          if (view === undefined) {
+            await clearGoalPanel(chatState, signal)
+            await send(chat.id, tr('🎯 No goal is set. Use /goal <objective>.', '🎯 Цель не задана. Используй /goal <цель>.'), signal, threadId)
+            return
+          }
+          await renderGoalPanel(chatState, view, signal)
+          return
+        }
+        if (action === 'clear') {
+          if (view === undefined) {
+            await clearGoalPanel(chatState, signal)
+            await send(chat.id, tr('🎯 No goal to clear.', '🎯 Нечего очищать.'), signal, threadId)
+            return
+          }
+          goals.clear(agent, { id: view.id, revision: view.revision })
+          await clearGoalPanel(chatState, signal)
+          await send(chat.id, tr('🎯 Goal cleared.', '🎯 Цель очищена.'), signal, threadId)
+          return
+        }
+        if (action === 'pause') {
+          if (view === undefined) {
+            await send(chat.id, tr('🎯 No goal to pause.', '🎯 Нечего ставить на паузу.'), signal, threadId)
+            return
+          }
+          view = goals.pause(agent, { id: view.id, revision: view.revision })
+          await renderGoalPanel(chatState, view, signal)
+          return
+        }
+        if (action === 'resume') {
+          if (view === undefined) {
+            await send(chat.id, tr('🎯 No goal to resume.', '🎯 Нечего продолжать.'), signal, threadId)
+            return
+          }
+          view = goals.resume(agent, { id: view.id, revision: view.revision })
+          await renderGoalPanel(chatState, view, signal)
+          return
+        }
+        const objective = rest
+        if (view !== undefined && view.phase !== 'complete') {
+          view = goals.edit(agent, { id: view.id, revision: view.revision }, { objective })
+        } else {
+          view = goals.create(agent, { objective })
+        }
+        await renderGoalPanel(chatState, view, signal)
+      } catch (error) {
+        await send(chat.id, `❌ ${escapeHtml(messageOf(error))}`, signal, threadId)
+      }
+      return
+    }
     if (command === '/clear') {
       if (!inSession) {
         await send(chat.id, tr('There is no active session in this topic.', 'В этом topic нет активной сессии.'), signal, threadId)
@@ -3495,6 +3716,7 @@ export function apply(ctx, config) {
       chatState.stopping = true
       try {
         chatState.busy = false
+        stopTyping(chatState)
         chatState.done = true
         chatState.turnSource = undefined
         chatState.awaitingTurn = false
@@ -3692,6 +3914,74 @@ export function apply(ctx, config) {
     }, FORWARD_BATCH_MS)
   }
 
+  /** Format the pinned goal state. */
+  function goalPanelText(view) {
+    const phase = view.phase === 'active'
+      ? tr('active', 'активна')
+      : view.phase === 'paused' ? tr('paused', 'на паузе') : view.phase === 'blocked' ? tr('blocked', 'заблокирована') : tr('complete', 'завершена')
+    const activation = view.activation === 'armed' ? tr('armed', 'включена') : tr('disarmed', 'выключена')
+    return `🎯 <b>${tr('Goal', 'Цель')}</b>\n${escapeHtml(view.objective)}\n\n` +
+      `${tr('Status', 'Статус')}: ${phase} (${activation})\n` +
+      `${tr('Rounds', 'Раунды')}: ${view.roundsStarted}/${view.maxGoalRounds}`
+  }
+
+  /** Replace the one goal panel for a topic, without pinning it. */
+  async function renderGoalPanel(chatState, view, signal) {
+    state.goalPanels ??= {}
+    const key = chatState.key
+    const previous = state.goalPanels[key]
+    // Keep exactly one panel per topic, immediately above the next generation.
+    if (typeof previous === 'number') {
+      // A panel created by the old pin implementation may still be pinned.
+      await call('unpinChatMessage', { chat_id: chatState.chatId, message_id: previous }, signal).catch(() => {})
+      await deleteMessage(chatState.chatId, chatState.threadId, previous)
+      delete state.goalPanels[key]
+    }
+    const result = await send(chatState.chatId, goalPanelText(view), signal, chatState.threadId)
+    if (typeof result?.message_id === 'number') {
+      state.goalPanels[key] = result.message_id
+      await persistState()
+    }
+  }
+
+  /** Remove the topic's goal panel. */
+  async function clearGoalPanel(chatState, signal) {
+    state.goalPanels ??= {}
+    const key = chatState.key
+    const messageId = state.goalPanels[key]
+    delete state.goalPanels[key]
+    await persistState()
+    if (typeof messageId === 'number') {
+      await call('unpinChatMessage', { chat_id: chatState.chatId, message_id: messageId }, signal).catch(() => {})
+      await deleteMessage(chatState.chatId, chatState.threadId, messageId)
+    }
+  }
+
+  /** Show the current goal before a new assistant generation starts. */
+  async function showGoalBeforeTurn(chatState) {
+    const goals = ctx.get('goals')
+    if (goals === undefined || typeof chatState.sessionId !== 'string') return
+    try {
+      const agent = ctx.get('agents')?.get(chatState.sessionId) ?? await ensureAgent(chatState)
+      const view = goals.get(agent)
+      if (view === undefined) await clearGoalPanel(chatState, bridgeAbort.signal)
+      else await renderGoalPanel(chatState, view, bridgeAbort.signal)
+    } catch (error) {
+      warn(`goal panel before turn failed: ${messageOf(error)}`)
+    }
+  }
+
+  /** Remove legacy chat-wide pin flags recorded by the previous goal UI. */
+  async function releaseLegacyGoalPins(signal) {
+    await stateReady
+    for (const [key, messageId] of Object.entries(state.goalPanels ?? {})) {
+      if (typeof messageId !== 'number') continue
+      const chatId = Number(key.split(':')[0])
+      if (!Number.isSafeInteger(chatId)) continue
+      await call('unpinChatMessage', { chat_id: chatId, message_id: messageId }, signal).catch(() => {})
+    }
+  }
+
   /**
    * Warn when BotFather forum settings would make Telegram create topics for
    * ordinary messages in All.
@@ -3777,13 +4067,14 @@ export function apply(ctx, config) {
         // Menu publication and the startup notice must never delay getUpdates.
         // Either request can be rate-limited or time out independently.
         void publishCommands(tokenLifetime.signal)
+        void releaseLegacyGoalPins(tokenLifetime.signal)
         void checkForumConfiguration(me, tokenLifetime.signal)
         void notifyAll(
           `🟢 <b>${tr('Telegram bot enabled', 'Telegram-бот включён')}</b>\n` +
             `@${escapeHtml(me.username ?? String(me.id))}\n` +
             tr('Polling started. Send /start to open the menu.', 'Polling запущен. Отправь /start, чтобы открыть меню.'),
           tokenLifetime.signal,
-        )
+        ).then((sent) => publishStatus({ lastStartupNotice: { sent, at: Date.now() } })).catch(() => {})
         break
       } catch (error) {
         if (tokenLifetime.signal.aborted) return
@@ -3854,6 +4145,7 @@ export function apply(ctx, config) {
     me = undefined
     startedAt = 0
     if (current === undefined) return
+    for (const chat of chats.values()) stopTyping(chat)
     current.abort()
     await current.settled
     await publishStatus({ state: 'stopped', detail: '', username: '' })
@@ -4028,32 +4320,57 @@ export function apply(ctx, config) {
       }
       throw error
     }
-    const sessionId = state.threads[`${chatId}:${threadId}`]
+    let sessionId = state.threads[`${chatId}:${threadId}`]
     let recorded = false
-    if (typeof sessionId === 'string' && sessionId !== request?.from?.sessionId) {
+    let recordError
+    let note
+    if (typeof sessionId !== 'string') {
+      // A known topic without a session gets one, as /new would make, so the
+      // message is recorded. The caller already resolved a known topic.
       const chat = await chatFor(chatId, threadId)
-      const agent = ctx.get('agents')?.get(sessionId) ?? await ensureAgent(chat)
-      const label = typeof request?.from?.label === 'string' && request.from.label.trim().length > 0 ? ` by ${request.from.label.trim()}` : ''
-      const where = target.name === undefined ? `topic ${threadId}` : `topic "${target.name}"`
-      const content = [{ type: 'text', text: `[Sent to the Telegram ${where}${label}]${text.trim().length > 0 ? `\n${text.trim()}` : ''}` }]
-      const store = ctx.get('attachments')
-      for (const file of files) {
-        if (store === undefined) break
-        const mediaType = PHOTO_TYPES[extname(file.name).toLowerCase()]
-        const attachment = mediaType === undefined
-          ? await store.saveFile({ data: file.data, name: file.name })
-          : await store.saveImage({ data: file.data, mediaType, name: file.name })
-        content.push({ type: mediaType === undefined ? 'file' : 'image', attachment })
+      try {
+        chat.cwd = defaultWorkspaceCwd()
+        await ensureAgent(chat)
+        sessionId = chat.sessionId
+        if (typeof sessionId === 'string' && target.name !== undefined) {
+          const record = state.sessions[sessionId]
+          if (record !== undefined) record.title = target.name
+          await persistState()
+        }
+      } catch (error) {
+        recordError = `no session could be opened for the topic: ${messageOf(error)}`
+        reportError('topic-send-open', error)
       }
-      const id = randomUUID()
-      const message = { id, role: 'user', content, source: { kind: 'user', rpcId: `telegram-post:${id}` } }
-      if (typeof agent?.inject === 'function') agent.inject(message)
-      else if (typeof agent?.send === 'function') agent.send(message, 'next-step', false)
-      else throw new Error('The bound session cannot record messages.')
-      recorded = true
+    }
+    if (typeof sessionId === 'string' && sessionId !== request?.from?.sessionId) {
+      try {
+        const chat = await chatFor(chatId, threadId)
+        const agent = ctx.get('agents')?.get(sessionId) ?? await ensureAgent(chat)
+        const label = typeof request?.from?.label === 'string' && request.from.label.trim().length > 0 ? ` by ${request.from.label.trim()}` : ''
+        const where = target.name === undefined ? `topic ${threadId}` : `topic "${target.name}"`
+        const content = [{ type: 'text', text: `[Sent to the Telegram ${where}${label}]${text.trim().length > 0 ? `\n${text.trim()}` : ''}` }]
+        const store = ctx.get('attachments')
+        for (const file of files) {
+          if (store === undefined) break
+          const mediaType = PHOTO_TYPES[extname(file.name).toLowerCase()]
+          const attachment = mediaType === undefined
+            ? await store.saveFile({ data: file.data, name: file.name })
+            : await store.saveImage({ data: file.data, mediaType, name: file.name })
+          content.push({ type: mediaType === undefined ? 'file' : 'image', attachment })
+        }
+        const id = randomUUID()
+        const message = { id, role: 'user', content, source: { kind: 'user', rpcId: `telegram-post:${id}` } }
+        if (typeof agent?.inject === 'function') agent.inject(message)
+        else if (typeof agent?.send === 'function') agent.send(message, 'next-step', false)
+        else throw new Error('The bound session cannot record messages.')
+        recorded = true
+      } catch (error) {
+        recordError = `the message was sent but not recorded: ${messageOf(error)}`
+        reportError('topic-send-record', error)
+      }
     }
     await publishStatus({ lastTopicSend: { threadId, topic: target.name ?? null, at: new Date().toISOString(), recorded } })
-    return { chatId, threadId, topic: target.name ?? null, sessionId: sessionId ?? null, recorded, messageIds }
+    return { chatId, threadId, topic: target.name ?? null, sessionId: sessionId ?? null, recorded, messageIds, ...(recordError === undefined ? {} : { recordError }), ...(note === undefined ? {} : { note }) }
   }
 
   /** Topic sending for other plugins: `ctx.get('telegramTopics').send(...)`. */

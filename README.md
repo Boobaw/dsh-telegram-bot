@@ -25,6 +25,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Then enable **Disallow
 - One Telegram topic per DSH session; Web and Telegram use the same session.
 - Telegram mirrors only turns initiated from Telegram; turns started in the Web UI stay in Web.
 - `/sessions` lists workspaces and existing sessions, and can create a new session in a selected workspace.
+- A `typing…` action is shown in the topic while its turn runs and stops when the answer is ready.
 - Assistant answers stream into the topic with Telegram Markdown formatting. Messages sent while the agent is working are queued and processed after the current turn; `/clear` removes that queue without stopping the current answer.
 - Replies, quotes and forwards keep their context. Ordinary messages are passed unchanged; only replies, quoted parts and forwarded messages get a short context block. A replied-to photo or document is attached when Telegram allows the bot to download it.
 - Reasoning and tool calls are shown as temporary messages and removed as soon as the final answer is ready. Each tool-call entry is capped at three mobile lines.
@@ -32,7 +33,8 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Then enable **Disallow
 - Tool approvals with **Deny** / **Allow** buttons.
 - `ask_user_question` support: options, multi-select, custom answers and plan review.
 - Documents and photos sent in a session topic are saved as DSH attachments and passed to the agent.
-- `/new`, `/last`, `/rename`, `/fork`, `/clear`, `/stop`, `/restart`, `/status` and `/menu`.
+- `/new`, `/last`, `/goal`, `/rename`, `/fork`, `/clear`, `/stop`, `/restart`, `/status` and `/menu`.
+- `/goal` shows and pins the current DSH goal. `/goal <objective>` creates or edits it, `/goal pause`, `/goal resume` and `/goal clear` manage it; clear unpins and removes the panel.
 - `/new` in a session topic starts a fresh DSH session in the same workspace and binds it to the same topic; the previous session stays in DSH. In All it opens a new session topic.
 - `/fork [name]` creates a DSH session fork in a new Telegram topic; without a name it uses the previous title plus the branch number.
 - The session picker also has **🔀 Continue in Telegram fork**; automatic fork topics end with `(N)`.
@@ -94,7 +96,7 @@ If users are allowed to create threads, Telegram creates a topic before the bot 
 
 ## Send into a topic
 
-Scripts, scheduled jobs, other plugins and agents can post into a topic by name or thread id. The message is also recorded in the session bound to that topic, without starting a turn; whoever answers there next sees it.
+Scripts, scheduled jobs, other plugins and agents can post into a topic by name or thread id. The message is also recorded in the session bound to that topic, without starting a turn; whoever answers there next sees it. If the topic has no session yet, the bot opens one in the configured workspace, as `/new` would.
 
 CLI from the package:
 
