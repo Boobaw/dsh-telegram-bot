@@ -94,7 +94,15 @@ An ordinary message in **All** creates a new session topic in the default worksp
 
 If users are allowed to create threads, Telegram creates a topic before the bot receives the message; the bot then warns about the BotFather setting on startup.
 
+## Delete topics
+
+- `/topic delete <name or thread id>` deletes one known topic and its Telegram messages.
+- `/topic wipe` asks for confirmation first; send `/topic wipe confirm` to delete every topic known to the bot in this chat. DSH sessions themselves are not deleted.
+
+Topics are known after the bot creates them, after `/rename`, or after Telegram reports a topic creation/rename. Unknown topics cannot be listed through the Bot API.
+
 ## Send into a topic
+
 
 Scripts, scheduled jobs, other plugins and agents can post into a topic by name or thread id. The message is also recorded in the session bound to that topic, without starting a turn; whoever answers there next sees it. If the topic has no session yet, the bot opens one in the configured workspace, as `/new` would.
 

@@ -2545,6 +2545,18 @@ export function apply(ctx, config) {
     }
   }
 
+  /** Remove a topic's local binding after Telegram deleted it. */
+  async function forgetTopicBinding(chatId, threadId) {
+    const key = `${chatId}:${threadId}`
+    chats.delete(key)
+    delete state.threads[key]
+    delete state.topicNames?.[key]
+    for (const [sessionId, record] of Object.entries(state.sessions)) {
+      if (record?.chatId === chatId && record?.threadId === threadId) delete state.sessions[sessionId]
+    }
+    await persistState()
+  }
+
   /**
    * Remember a topic name so senders can address it by name.
    * @param chatId - chat holding the topic.
@@ -3423,7 +3435,7 @@ export function apply(ctx, config) {
             ? `${tr('Current session', 'Текущая сессия')}: <code>${chatState.sessionId}</code>\n`
             : `${tr('Global topic. Choose a session or create a new one.', 'Глобальный чат. Выбери сессию или создай новую.')}\n`) +
           `\n<b>${tr('First run', 'Первый запуск')}:</b> @BotFather → Bot Settings → <b>Threaded mode</b> → ${tr('Enable', 'Включить')}.\n` +
-          `${tr('Commands', 'Команды')}: /sessions, /new, /current, /menu, /rename, /fork, /last, /goal, /clear, /stop, /restart, /status, /id, /ping.`,
+          `${tr('Commands', 'Команды')}: /sessions, /new, /current, /menu, /rename, /topic, /fork, /last, /goal, /clear, /stop, /restart, /status, /id, /ping.`,
         signal,
         threadId,
       )
@@ -3436,6 +3448,82 @@ export function apply(ctx, config) {
         signal,
         threadId,
       )
+      return
+    }
+    if (command === '/topic') {
+      const sub = (parts[1] ?? '').toLowerCase()
+      if (sub === 'delete') {
+        const target = parts.slice(2).join(' ').trim()
+        if (target.length === 0) {
+          await send(chat.id, tr('Usage: <code>/topic delete &lt;name|thread id&gt;</code>', 'Использование: <code>/topic delete &lt;имя|thread id&gt;</code>'), signal, threadId)
+          return
+        }
+        let resolved
+        try {
+          resolved = resolveTopicTarget(state.topicNames, chat.id, target)
+        } catch (error) {
+          await send(chat.id, `❌ ${escapeHtml(messageOf(error))}`, signal, threadId)
+          return
+        }
+        if (isAllThread(resolved.threadId)) {
+          await send(chat.id, tr('The All topic cannot be deleted.', 'Топик All удалить нельзя.'), signal, threadId)
+          return
+        }
+        const replyThread = resolved.threadId === threadId ? undefined : threadId
+        try {
+          await call('deleteForumTopic', { chat_id: chat.id, message_thread_id: resolved.threadId }, signal)
+          await forgetTopicBinding(chat.id, resolved.threadId)
+          await send(chat.id, `🗑 ${tr('Topic deleted', 'Topic удалён')}: <b>${escapeHtml(resolved.name ?? String(resolved.threadId))}</b>`, signal, replyThread)
+        } catch (error) {
+          await send(chat.id, `❌ ${escapeHtml(messageOf(error))}`, signal, threadId)
+        }
+        return
+      }
+      if (sub === 'wipe') {
+        const keys = new Set([...Object.keys(state.threads), ...Object.keys(state.topicNames ?? {})])
+          .filter((key) => key.startsWith(`${chat.id}:`))
+          .filter((key) => !isAllThread(Number(key.slice(String(chat.id).length + 1))))
+        if (keys.size === 0) {
+          await send(chat.id, tr('No known topics to delete.', 'Известных topic для удаления нет.'), signal, threadId)
+          return
+        }
+        if ((parts[2] ?? '').toLowerCase() !== 'confirm') {
+          await send(
+            chat.id,
+            `⚠️ ${tr('This deletes', 'Это удалит')} <b>${keys.size}</b> ${tr('topics and all their messages.', 'topic и все сообщения в них.')}
+` +
+              tr('Send <code>/topic wipe confirm</code> to continue.', 'Отправь <code>/topic wipe confirm</code>, чтобы продолжить.'),
+            signal,
+            threadId,
+          )
+          return
+        }
+        // Answer in All: the command's own topic may be one of the deleted ones.
+        await send(chat.id, `🧹 ${tr('Deleting', 'Удаляю')} ${keys.size} ${tr('topics…', 'topic…')}`, signal, undefined)
+        let deleted = 0
+        const failed = []
+        for (const key of keys) {
+          const targetThread = Number(key.slice(String(chat.id).length + 1))
+          try {
+            await call('deleteForumTopic', { chat_id: chat.id, message_thread_id: targetThread }, signal)
+            await forgetTopicBinding(chat.id, targetThread)
+            deleted += 1
+          } catch (error) {
+            failed.push(targetThread)
+            warn(`topic wipe failed for ${targetThread}: ${messageOf(error)}`)
+          }
+        }
+        await send(
+          chat.id,
+          `🗑 ${tr('Deleted', 'Удалено')}: ${deleted}` +
+            (failed.length === 0 ? '' : `
+⚠️ ${tr('Failed', 'Не удалось')}: ${failed.join(', ')}`),
+          signal,
+          undefined,
+        )
+        return
+      }
+      await send(chat.id, tr('Usage: <code>/topic delete &lt;name&gt;</code> or <code>/topic wipe</code>', 'Использование: <code>/topic delete &lt;имя&gt;</code> или <code>/topic wipe</code>'), signal, threadId)
       return
     }
     if (command === '/menu') {
