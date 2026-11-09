@@ -1,6 +1,6 @@
 {
   "name": "dsh-telegram-bot",
-  "version": "0.2.2-fork.9",
+  "version": "0.2.2-fork.10",
   "description": "Telegram sessions, topics, model controls and approvals for DeepSeek Harness.",
   "type": "module",
   "main": "./index.js",
@@ -68,5 +68,8 @@
   },
   "scripts": {
     "test": "NODE_ENV=test DSH_HOME=\"$(mktemp -d)\" node --test --test-concurrency=1"
+  },
+  "bin": {
+    "dsh-telegram-send": "./bin/dsh-telegram-send.js"
   }
 }
