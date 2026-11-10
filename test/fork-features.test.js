@@ -1,3 +1,4 @@
+import './setup-home.js'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
@@ -87,7 +88,6 @@ function makeHost() {
 function makeTelegram() {
   const calls = []
   const pending = []
-  const missingThreads = new Set()
   let messageId = 0
   let topicId = 7000
   let updateId = 0
@@ -116,10 +116,7 @@ function makeTelegram() {
         topicId += 1
         return deliver({ ok: true, result: { message_thread_id: topicId, name: body.name } })
       }
-      if (method === 'editForumTopic') {
-        if (missingThreads.has(body.message_thread_id)) return deliver({ ok: false, description: 'Bad Request: message thread not found' })
-        return deliver({ ok: true, result: true })
-      }
+      if (method === 'editForumTopic') return deliver({ ok: true, result: true })
       if (method === 'sendMessage' || method === 'editMessageText') {
         messageId += 1
         return deliver({ ok: true, result: { message_id: messageId } })
@@ -133,7 +130,7 @@ function makeTelegram() {
     messageId += 1
     pending.push({ update_id: updateId, message: { message_id: messageId, date: 1, chat: { id: 100, type: 'private' }, from: { id: 42 }, ...message } })
   }
-  return { fake, calls, push, missingThreads }
+  return { fake, calls, push }
 }
 
 /** Start the plugin against fresh fakes and an optional initial state. */

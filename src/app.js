@@ -37,7 +37,7 @@ import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, mes
 import { loadState, loadTopics, STATE_PATH, TOPICS_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
 import { createOutbox } from './outbox.js'
-import { isAutoCommandTopic, resolveTopicTarget, topicNameOf } from './topics.js'
+import { deliveredToTopic, isAutoCommandTopic, isTopicGone, resolveTopicTarget, topicNameOf, topicTargetFor } from './topics.js'
 import { publishStatus } from './status.js'
 import {
   allowedChatsOf,
@@ -76,9 +76,11 @@ export function apply(ctx, config) {
   /** Invalidates a start that was overtaken by stop/restart. */
   let startEpoch = 0
   /** Durable chat → session mapping. */
-  let state = { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {}, goalPanels: {} }
+  let state = { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {}, directChats: {}, directTopics: {}, goalPanels: {} }
   /** Serializes state-file writes. */
   let stateWrite = Promise.resolve()
+  /** Diagnostic counter for topic creation attempts. */
+  let createTopicSeq = 0
   /** Per-chat live bridge state. */
   const chats = new Map()
   /** Per-chat token buckets for outbound Bot API traffic. */
@@ -94,6 +96,18 @@ export function apply(ctx, config) {
   ]).catch((error) => warn(`state load failed: ${messageOf(error)}`))
     .finally(() => {
       state.topicNames ??= {}
+      state.directChats ??= {}
+      state.directTopics ??= {}
+      // Private-chat topics are addressed by their thread id. Drop direct-topic
+      // ids cached by older versions, which could point at a service message.
+      let cleaned = false
+      for (const key of Object.keys(state.directTopics)) {
+        const chatId = key.slice(0, key.lastIndexOf(':'))
+        if (state.directChats[chatId] !== true) continue
+        delete state.directTopics[key]
+        cleaned = true
+      }
+      if (cleaned) void persistState()
       // Earlier versions renamed topics after their session title, so a stored
       // title is the best known name of an existing topic.
       for (const record of Object.values(state.sessions)) {
@@ -145,6 +159,12 @@ export function apply(ctx, config) {
         pendingPrompts: [],
         turnEpoch: 0,
         activeTurn: undefined,
+        pendingTurn: undefined,
+        queuedGoalTurn: undefined,
+        finalizing: false,
+        adopting: false,
+        goalPanelEdit: Promise.resolve(),
+        goalPanelPinCleared: false,
         text: '',
         textSeparator: false,
         lastText: '',
@@ -734,6 +754,9 @@ export function apply(ctx, config) {
     const targets = [undefined, '149.154.166.110', '149.154.167.220']
     let lastError
     let rateLimitRetries = 0
+    // Creating a topic is not idempotent: a timeout after Telegram committed
+    // the topic must not be retried on another IP (that creates duplicates).
+    const singleShot = method === 'createForumTopic'
     for (let attempt = 0; attempt < targets.length + 4; attempt += 1) {
       const target = targets[attempt % targets.length]
       try {
@@ -742,6 +765,17 @@ export function apply(ctx, config) {
         lastError = error
         if (signal.aborted) throw error
         if (error?.telegram === true) {
+          // Edits are addressed by message id; a rejected thread id must not
+          // hide the answer. Retry the same edit without the topic field.
+          if (!encoded && /message thread not found/i.test(messageOf(error))
+            && payload !== null && typeof payload === 'object'
+            && typeof payload.message_thread_id === 'number'
+            && ['editMessageText', 'editMessageCaption', 'editMessageReplyMarkup'].includes(method)) {
+            const { message_thread_id: _thread, ...rest } = payload
+            payload = rest
+            body = JSON.stringify(payload)
+            continue
+          }
           // Bot API 10.0 moved private-chat topics from message_thread_id to
           // direct_messages_topic_id. Retry once with the direct-message field
           // when Telegram reports a missing thread.
@@ -770,6 +804,7 @@ export function apply(ctx, config) {
           }
           throw error
         }
+        if (singleShot) throw error
       }
     }
     throw lastError ?? new Error(`Telegram ${method} failed`)
@@ -863,6 +898,65 @@ export function apply(ctx, config) {
     }
   }
 
+  /** Remember that a private chat uses Bot API 10 direct-message topics. */
+  function rememberDirectChat(chatId) {
+    state.directChats ??= {}
+    if (state.directChats[String(chatId)] === true) return
+    state.directChats[String(chatId)] = true
+    void persistState()
+  }
+
+  /**
+   * Remember a direct-message topic id for a chat that is not a private bot
+   * chat (for example a channel direct-messages chat). Private-chat topics are
+   * always addressed by their thread id.
+   */
+  function rememberDirectTopic(chatId, threadId, directTopicId) {
+    if (typeof threadId !== 'number' || typeof directTopicId !== 'number') return
+    if (state.directChats?.[String(chatId)] === true) return
+    state.directTopics ??= {}
+    const key = `${String(chatId)}:${threadId}`
+    if (state.directTopics[key] === directTopicId) return
+    state.directTopics[key] = directTopicId
+    void persistState()
+  }
+
+  /** Learn the canonical direct-message topic id from a sent message. */
+  function rememberDeliveredTopic(chatId, threadId, delivered) {
+    const directTopicId = delivered?.direct_messages_topic?.topic_id
+    if (typeof directTopicId === 'number') rememberDirectTopic(chatId, threadId, directTopicId)
+  }
+
+  /** Infer a thread id when an update omits message_thread_id. */
+  function inferredTopicId(message) {
+    const direct = message?.direct_messages_topic?.topic_id
+    if (typeof direct === 'number') return direct
+    // The topic-creation service message carries the real thread id. Its plain
+    // message_id is the service message id, not a topic id, and must not be
+    // used: doing so used to route replies into All.
+    const root = message?.reply_to_message
+    if (root?.forum_topic_created !== undefined && Number.isSafeInteger(root.message_thread_id)) {
+      return root.message_thread_id
+    }
+    return undefined
+  }
+
+  /** Outbound topic fields for send methods (DM topics vs forum topics). */
+  function topicTarget(chatId, threadId) {
+    return topicTargetFor(state.directChats, state.directTopics, chatId, threadId)
+  }
+
+  /**
+   * Topic fields for sendChatAction. The Bot API accepts only
+   * `message_thread_id` here, so direct-message topics fall back to a
+   * chat-level action when Telegram rejects the thread.
+   */
+  function actionTarget(threadId) {
+    return threadId === undefined || threadId === null || threadId === 0 || threadId === 1
+      ? {}
+      : { message_thread_id: threadId }
+  }
+
   /**
    * Send a plain-text message.
    * @param chatId - target chat.
@@ -875,7 +969,7 @@ export function apply(ctx, config) {
     try {
       return await call('sendMessage', {
         chat_id: chatId,
-        ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }),
+        ...topicTarget(chatId, threadId),
         text,
       }, signal)
     } catch (error) {
@@ -1012,7 +1106,7 @@ export function apply(ctx, config) {
     try {
       return await call('sendMessage', {
         chat_id: chatId,
-        ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }),
+        ...topicTarget(chatId, threadId),
         text: body,
         parse_mode: 'MarkdownV2',
       }, signal)
@@ -1071,7 +1165,7 @@ export function apply(ctx, config) {
     try {
       return await call('sendMessage', {
         chat_id: chatId,
-        ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }),
+        ...topicTarget(chatId, threadId),
         text: body,
         parse_mode: 'MarkdownV2',
         reply_markup: { inline_keyboard: keyboard },
@@ -1085,7 +1179,7 @@ export function apply(ctx, config) {
       }
       return call('sendMessage', {
         chat_id: chatId,
-        ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }),
+        ...topicTarget(chatId, threadId),
         text,
         reply_markup: { inline_keyboard: keyboard },
       }, signal).catch(() => undefined)
@@ -1150,26 +1244,6 @@ export function apply(ctx, config) {
   async function renderMenuMarkdown(chatId, threadId, messageId, text, keyboard, signal) {
     if (messageId !== undefined && await editKeyboardMarkdown(chatId, threadId, messageId, text, keyboard, signal)) return
     await sendKeyboardMarkdown(chatId, threadId, text, keyboard, signal)
-  }
-
-  /**
-   * Split text into Telegram-sized chunks.
-   * @param text - full response.
-   * @param limit - maximum raw characters per chunk.
-   * @returns chunks under the API limit.
-   */
-  function splitTelegramText(text, limit = MAX_TELEGRAM_TEXT) {
-    const chunks = []
-    let rest = text
-    while (rest.length > limit) {
-      let cut = rest.lastIndexOf('\n', limit)
-      if (cut < limit / 2) cut = rest.lastIndexOf(' ', limit)
-      if (cut < limit / 2) cut = limit
-      chunks.push(rest.slice(0, cut))
-      rest = rest.slice(cut).replace(/^\s+/u, '')
-    }
-    if (rest.length > 0) chunks.push(rest)
-    return chunks
   }
 
   /**
@@ -1570,14 +1644,44 @@ export function apply(ctx, config) {
     agent.ctx.on('session/event', (session, event) => {
       try {
         if (chat.boundAgent !== agent || session?.id !== chat.sessionId) return
-        if (event.type === 'turn/start' && chat.turnSource === 'telegram' && chat.awaitingTurn) {
-          chat.activeTurn = event.data?.turn
-          chat.awaitingTurn = false
+        if (event.type === 'turn/start') {
+          chat.pendingTurn = event.data?.turn
+          if (chat.turnSource === 'telegram' && chat.awaitingTurn) {
+            chat.activeTurn = chat.pendingTurn
+            chat.awaitingTurn = false
+          }
           return
         }
-        if (event.type === 'turn/end' && chat.turnSource === 'telegram' && event.data?.turn === chat.activeTurn) {
-          chat.activeTurn = undefined
-          finalizeSafely(chat)
+        if (event.type === 'user/message' && event.data?.source?.kind === 'goal') {
+          adoptGoalTurn(chat, event.data.source)
+          return
+        }
+        if (event.type === 'turn/end') {
+          const queued = chat.queuedGoalTurn
+          if (queued !== undefined && queued.turn === event.data?.turn && chat.turnSource !== 'goal') {
+            queued.ended = true
+          }
+          if ((chat.turnSource === 'telegram' || chat.turnSource === 'goal')
+            && event.data?.turn === chat.activeTurn) {
+            chat.activeTurn = undefined
+            finalizeSafely(chat)
+          }
+        }
+        if (event.type === 'goal/change') {
+          // The panel must follow the goal phase immediately, without waiting
+          // for the next turn.
+          fireAndForget('goal-panel-change', async () => {
+            const goals = ctx.get('goals')
+            if (goals === undefined) return
+            try {
+              const view = goals.get(agent)
+              if (view === undefined) await clearGoalPanel(chat, bridgeAbort.signal)
+              else await renderGoalPanel(chat, view, bridgeAbort.signal, 'update-only')
+            } catch (error) {
+              reportError('goal-panel-change', error)
+            }
+          })
+          return
         }
         if (event.type === 'session/title' && typeof event.data?.title === 'string') {
           fireAndForget('title-event', () => applyTopicTitle(chat, event.data.title))
@@ -1595,13 +1699,13 @@ export function apply(ctx, config) {
       }
     })
     agent.ctx.on('agent/error', (payload) => {
-      if (chat.boundAgent !== agent || chat.turnSource !== 'telegram') return
+      if (chat.boundAgent !== agent || (chat.turnSource !== 'telegram' && chat.turnSource !== 'goal')) return
       fireAndForget('agent-error', () => failChat(chat, payload?.error))
     })
     if (chat.approvalAgent !== agent) {
       chat.approvalAgent = agent
       agent.ctx.on('approval/request', (req, next) => {
-        if (chat.boundAgent !== agent || chat.turnSource !== 'telegram') return next()
+        if (chat.boundAgent !== agent || (chat.turnSource !== 'telegram' && chat.turnSource !== 'goal')) return next()
         return Promise.resolve(requestApproval(agent, chat, req, next)).catch((error) => {
           reportError('approval', error)
           return next()
@@ -1611,7 +1715,7 @@ export function apply(ctx, config) {
     if (chat.questionAgent !== agent) {
       chat.questionAgent = agent
       agent.ctx.on('user-questions/request', (req, next) => {
-        if (chat.boundAgent !== agent || chat.turnSource !== 'telegram') return next()
+        if (chat.boundAgent !== agent || (chat.turnSource !== 'telegram' && chat.turnSource !== 'goal')) return next()
         return Promise.resolve(requestUserQuestions(agent, chat, req, next)).catch((error) => {
           reportError('user-questions', error)
           return next()
@@ -1795,7 +1899,7 @@ export function apply(ctx, config) {
    */
   function scheduleFlush(chat) {
     if (chat.editTimer !== null || chat.done) return
-    const delay = Math.max(0, 300 - (Date.now() - (chat.lastEdit ?? 0)))
+    const delay = Math.max(0, STREAM_EDIT_MS - (Date.now() - (chat.lastEdit ?? 0)))
     chat.editTimer = setTimeout(() => {
       chat.editTimer = null
       fireAndForget('stream-flush', () => flushChat(chat))
@@ -1807,7 +1911,7 @@ export function apply(ctx, config) {
    * @param chat - chat bridge state.
    */
   async function flushChat(chat) {
-    if (chat.done || chat.messageId === null) return
+    if (chat.done || chat.adopting || chat.messageId === null) return
     const raw = renderChat(chat)
     if (raw.length === 0) return
     const next = toTelegramMarkdown(raw)
@@ -1825,6 +1929,8 @@ export function apply(ctx, config) {
 
   /** How often "typing…" is renewed; Telegram shows it for about 5 seconds. */
   const TYPING_REFRESH_MS = process.env.NODE_ENV === 'test' ? 100 : 4000
+  /** Minimum gap between streaming edits of one answer message. */
+  const STREAM_EDIT_MS = 200
 
   /**
    * Show "typing…" in the topic while its turn runs. Each topic has its own
@@ -1839,13 +1945,24 @@ export function apply(ctx, config) {
       }
       if (chat.typingInFlight === true) return
       chat.typingInFlight = true
-      call('sendChatAction', {
+      const payload = {
         chat_id: chat.chatId,
-        ...(chat.threadId === undefined || chat.threadId === 0 ? {} : { message_thread_id: chat.threadId }),
+        ...actionTarget(chat.threadId),
         action: 'typing',
-      }, bridgeAbort.signal, 10_000)
-        .catch((error) => {
-          if (!bridgeAbort.signal.aborted) warn(`sendChatAction failed: ${messageOf(error)}`)
+      }
+      call('sendChatAction', payload, bridgeAbort.signal, 10_000)
+        .catch(async (error) => {
+          if (bridgeAbort.signal.aborted) return
+          // Bot API 10 may reject message_thread_id for private-chat topics.
+          // Typing is cosmetic; retry at chat level instead of failing the turn.
+          if (payload.message_thread_id !== undefined && isTopicGone(messageOf(error))) {
+            await call('sendChatAction', { chat_id: chat.chatId, action: 'typing' }, bridgeAbort.signal, 10_000)
+              .catch((fallbackError) => {
+                if (!bridgeAbort.signal.aborted) warn(`sendChatAction failed: ${messageOf(fallbackError)}`)
+              })
+            return
+          }
+          warn(`sendChatAction failed: ${messageOf(error)}`)
         })
         .finally(() => { chat.typingInFlight = false })
     }
@@ -1905,6 +2022,7 @@ export function apply(ctx, config) {
    */
   async function flushThinking(chat) {
     return queueAuxEdit(chat, 'thinkingEdit', 'thinking-edit', async () => {
+      if (chat.adopting) return
       const full = chat.thinkingText.replace(/\r/gu, '')
       if (full.trim().length === 0) return
       if (chat.done) chat.thinkingShown = full.length
@@ -1961,7 +2079,7 @@ export function apply(ctx, config) {
 
   async function flushTool(chat) {
     return queueAuxEdit(chat, 'toolEdit', 'tool-edit', async () => {
-      if (chat.done || chat.tools.length === 0) return
+      if (chat.done || chat.adopting || chat.tools.length === 0) return
       const epoch = chat.toolEpoch ?? 0
       const lines = chat.tools.slice(-5).map(formatToolCall).join('\n').split('\n')
       if (lines.length > 0) lines[lines.length - 1] = lines.at(-1).slice(0, 26).trimEnd()
@@ -1999,7 +2117,7 @@ export function apply(ctx, config) {
    * @param frame - stream frame.
    */
   function onFrame(chat, frame) {
-    if (frame === undefined || chat.done || chat.turnSource !== 'telegram') return
+    if (frame === undefined || chat.done || (chat.turnSource !== 'telegram' && chat.turnSource !== 'goal')) return
     if (frame.type === 'chunk' && frame.chunk?.type === 'block-start' && frame.chunk.blockType === 'reasoning') {
       if (chat.thinkingText.length > 0 && !chat.thinkingText.endsWith('\n')) chat.thinkingText += '\n'
       return
@@ -2010,6 +2128,9 @@ export function apply(ctx, config) {
     }
     if (frame.type === 'chunk' && frame.chunk?.type === 'text-delta') {
       const nextText = frame.chunk.text
+      // The first text delta starts the edit throttle, so the first visible
+      // edit contains a readable chunk instead of a single character.
+      if (chat.text.length === 0) chat.lastEdit = Date.now()
       if (chat.textSeparator && chat.text.length > 0 && !/\s$/u.test(chat.text) && !/^\s/u.test(nextText)) {
         chat.text += '\n\n'
       } else if (chat.text.length > 0 && !/\s$/u.test(chat.text) && /[.!?…]$/u.test(chat.text) && /^[A-ZА-ЯЁ]/u.test(nextText)) {
@@ -2097,6 +2218,8 @@ export function apply(ctx, config) {
     if (chat.done) return
     chat.done = true
     chat.busy = false
+    chat.finalizing = true
+    chat.adopting = false
     stopTyping(chat)
     chat.turnSource = undefined
     chat.awaitingTurn = false
@@ -2133,6 +2256,10 @@ export function apply(ctx, config) {
     }
     fireAndForget('topic-title', () => refreshTopicTitle(chat))
     await publishStatus({ lastOutcome: 'agent-replied' })
+    chat.finalizing = false
+    const queued = chat.queuedGoalTurn
+    chat.queuedGoalTurn = undefined
+    if (queued !== undefined && !queued.ended) adoptGoalTurn(chat, queued.source, queued.turn)
   }
 
   /**
@@ -2144,6 +2271,9 @@ export function apply(ctx, config) {
     if (chat.done && !force) return
     chat.done = true
     chat.busy = false
+    chat.finalizing = false
+    chat.adopting = false
+    chat.queuedGoalTurn = undefined
     stopTyping(chat)
     chat.turnSource = undefined
     chat.awaitingTurn = false
@@ -2212,6 +2342,7 @@ export function apply(ctx, config) {
       const thinking = await sendPlain(chat.chatId, '💭 Thinking…', bridgeAbort.signal, chat.threadId)
       chat.thinkingMessageId = thinking?.message_id ?? null
     }
+    chat.lastEdit = Date.now()
     try {
       const agent = await ensureAgent(chat)
       let admitted = false
@@ -2232,6 +2363,71 @@ export function apply(ctx, config) {
     }
   }
 
+
+  /**
+   * Adopt an autonomous goal round for a Telegram-bound session so its
+   * reasoning, tool calls and final answer appear in the topic like a normal
+   * user-initiated turn. The goal-round driver queues these turns itself.
+   */
+  function adoptGoalTurn(chat, source, turn = chat.pendingTurn) {
+    if (chat.busy || chat.turnSource !== undefined || chat.finalizing) {
+      chat.queuedGoalTurn = { turn, source, ended: false }
+      return false
+    }
+    chat.queuedGoalTurn = undefined
+    const epoch = (chat.turnEpoch ?? 0) + 1
+    chat.busy = true
+    chat.done = false
+    chat.turnSource = 'goal'
+    chat.awaitingTurn = false
+    chat.activeTurn = turn
+    chat.turnEpoch = epoch
+    chat.toolEpoch = (chat.toolEpoch ?? 0) + 1
+    chat.text = ''
+    chat.lastText = ''
+    chat.messageId = null
+    chat.adopting = true
+    clearEditTimer(chat)
+    resetAux(chat)
+    chat.answerEdit = Promise.resolve()
+    startTyping(chat)
+    void publishStatus({
+      lastGoalRound: {
+        threadId: chat.threadId,
+        round: typeof source?.round === 'number' ? source.round : null,
+        at: Date.now(),
+      },
+    })
+    fireAndForget('goal-turn', async () => {
+      await showGoalBeforeTurn(chat)
+      if (chat.done || chat.turnSource !== 'goal' || chat.turnEpoch !== epoch) {
+        chat.adopting = false
+        return
+      }
+      const answer = await sendPlain(chat.chatId, tr('⏳ Generating…', '⏳ Генерирую…'), bridgeAbort.signal, chat.threadId)
+      if (chat.done || chat.turnSource !== 'goal' || chat.turnEpoch !== epoch) {
+        chat.adopting = false
+        if (answer?.message_id !== undefined) await deleteMessage(chat.chatId, chat.threadId, answer.message_id)
+        return
+      }
+      chat.messageId = answer?.message_id ?? null
+      if (readLive(config.showThinking, true) === true) {
+        const thinking = await sendPlain(chat.chatId, '💭 Thinking…', bridgeAbort.signal, chat.threadId)
+        if (chat.done || chat.turnSource !== 'goal' || chat.turnEpoch !== epoch) {
+          chat.adopting = false
+          if (thinking?.message_id !== undefined) await deleteMessage(chat.chatId, chat.threadId, thinking.message_id)
+          return
+        }
+        chat.thinkingMessageId = thinking?.message_id ?? null
+      }
+      chat.lastEdit = Date.now()
+      chat.adopting = false
+      scheduleFlush(chat)
+      if (chat.thinkingText.length > 0) scheduleThinking(chat)
+      if (chat.tools.length > 0) fireAndForget('tool-flush-now', () => flushTool(chat))
+    })
+    return true
+  }
 
   /**
    * Escape text for Telegram HTML parse mode.
@@ -2261,7 +2457,7 @@ export function apply(ctx, config) {
     try {
       return await call('sendMessage', {
         chat_id: chatId,
-        ...(threadId === undefined || threadId === 0 ? {} : { message_thread_id: threadId }),
+        ...topicTarget(chatId, threadId),
         text,
         parse_mode: 'HTML',
         reply_markup: { inline_keyboard: keyboard },
@@ -2551,6 +2747,8 @@ export function apply(ctx, config) {
     chats.delete(key)
     delete state.threads[key]
     delete state.topicNames?.[key]
+    delete state.directTopics?.[key]
+    delete state.goalPanels?.[key]
     for (const [sessionId, record] of Object.entries(state.sessions)) {
       if (record?.chatId === chatId && record?.threadId === threadId) delete state.sessions[sessionId]
     }
@@ -2582,22 +2780,31 @@ export function apply(ctx, config) {
    * @returns thread id, or undefined.
    */
   async function createTopic(chatId, name, signal) {
-    await publishStatus({ lastCreateTopicCall: { chatId, name } })
+    createTopicSeq += 1
+    await publishStatus({ lastCreateTopicCall: { chatId, name, seq: createTopicSeq, at: Date.now() } })
     const clean = shortLabel(name, 120) || 'DSH session'
     for (const candidate of [clean, `${clean} · ${randomUUID().slice(0, 4)}`]) {
       try {
         const topic = await call('createForumTopic', { chat_id: chatId, name: candidate }, signal)
         if (typeof topic?.message_thread_id === 'number') {
           rememberTopicName(chatId, topic.message_thread_id, candidate, true)
+          const directTopicId = topic.direct_messages_topic?.topic_id ?? topic.direct_messages_topic_id
+          if (typeof directTopicId === 'number') rememberDirectTopic(chatId, topic.message_thread_id, directTopicId)
           return topic.message_thread_id
         }
       } catch (error) {
-        const message = messageOf(error).toLowerCase()
-        if (message.includes('duplicate') || message.includes('already')) continue
-        if (message.includes('forum') || message.includes('topic')) {
+        const detail = messageOf(error)
+        await publishStatus({
+          lastCreateTopicError: { chatId, name: clean, candidate, error: detail, at: Date.now() },
+        })
+        const lower = detail.toLowerCase()
+        if (lower.includes('duplicate') || lower.includes('already')) continue
+        // Do not mask a concrete Telegram error behind the Threaded-mode hint:
+        // BOT_FORUM_CREATE_FORBIDDEN and permission errors need their real text.
+        if (/chat is not a forum|forum.*disabled|threaded mode/iu.test(detail)) {
           throw new Error(tr('Enable Threaded mode in @BotFather → Bot Settings, then enable Topics in the bot chat (tap the bot name → Topics).', 'Включи Threaded mode в @BotFather → Bot Settings, затем включи Topics в чате с ботом (имя бота сверху → Topics).'))
         }
-        throw error
+        throw new Error(tr(`Telegram could not create a topic: ${detail}`, `Telegram не смог создать topic: ${detail}`))
       }
     }
     return undefined
@@ -2671,23 +2878,6 @@ export function apply(ctx, config) {
     return texts
   }
 
-  /** Check that a stored Telegram topic still exists before reusing it. */
-  async function topicIsUsable(chatId, threadId, title, signal) {
-    try {
-      await call('editForumTopic', {
-        chat_id: chatId,
-        message_thread_id: threadId,
-        name: shortLabel(title || 'DSH session', 120),
-      }, signal)
-      return true
-    } catch (error) {
-      const detail = messageOf(error)
-      if (/thread not found|topic.*not found|message thread/iu.test(detail)) return false
-      // Permission/rate-limit errors do not prove deletion. Let delivery decide.
-      return true
-    }
-  }
-
   /**
    * Deliver a session preview into its topic.
    * @param record - topic mapping.
@@ -2710,14 +2900,34 @@ export function apply(ctx, config) {
         await publishStatus({ lastTopicDelivery: { threadId: record.threadId, ok: false, reason: 'no result' } })
         return false
       }
+      // A direct-message-topic response may carry only direct_messages_topic;
+      // learn that id so later sends can use the canonical target.
+      rememberDeliveredTopic(chatId, record.threadId, delivered)
       // If Telegram accepted the message but put it in General instead of the
-      // stored thread, the topic is gone. The Bot API reports the actual
-      // message_thread_id on messages sent into a live topic.
-      if (typeof record.threadId === 'number' && delivered.message_thread_id !== record.threadId) {
-        await publishStatus({ lastTopicDelivery: { threadId: record.threadId, deliveredThreadId: delivered.message_thread_id ?? null, ok: false, reason: 'wrong thread' } })
+      // stored thread, the topic is gone. A DM-topic response may omit thread
+      // fields entirely, so those are accepted when the send used a direct id.
+      if (!deliveredToTopic(state.directChats, state.directTopics, chatId, record.threadId, delivered)) {
+        await publishStatus({
+          lastTopicDelivery: {
+            threadId: record.threadId,
+            deliveredThreadId: delivered.message_thread_id ?? null,
+            deliveredDirectTopicId: delivered.direct_messages_topic?.topic_id ?? null,
+            ok: false,
+            reason: 'wrong thread',
+          },
+        })
         return false
       }
-      await publishStatus({ lastTopicDelivery: { threadId: record.threadId, deliveredThreadId: delivered.message_thread_id ?? record.threadId, ok: true } })
+      const fieldsMissing = delivered.message_thread_id === undefined && delivered.direct_messages_topic === undefined
+      await publishStatus({
+        lastTopicDelivery: {
+          threadId: record.threadId,
+          deliveredThreadId: delivered.message_thread_id ?? null,
+          deliveredDirectTopicId: delivered.direct_messages_topic?.topic_id ?? null,
+          ...(fieldsMissing ? { fieldsMissing: true } : {}),
+          ok: true,
+        },
+      })
       try {
         await sendMenu(chatId, record.threadId, await chatFor(chatId, record.threadId), signal)
       } catch (error) {
@@ -2734,35 +2944,59 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Open or reuse one topic for an existing session.
-   * @param sessionId - session id.
-   * @param chatId - control chat.
-   * @param signal - request lifetime.
-   * @returns topic record, or undefined.
+   * Continue an existing session in the topic where the callback was pressed.
+   * This avoids creating another topic (and avoids BOT_FORUM_CREATE_FORBIDDEN)
+   * when the user is already inside a topic.
    */
-  async function openTopicForSession(sessionId, chatId, signal) {
+  async function continueInCurrentTopic(sessionId, chatId, threadId, signal) {
+    const chat = await chatFor(chatId, threadId)
+    const previous = state.sessions[sessionId]
+    if (previous !== undefined && (previous.chatId !== chatId || previous.threadId !== threadId)) {
+      delete state.threads[`${previous.chatId}:${previous.threadId}`]
+      delete state.goalPanels?.[`${previous.chatId}:${previous.threadId}`]
+      forgetChatState(previous.chatId, previous.threadId)
+    }
+    const currentSession = state.threads[chat.key]
+    if (currentSession !== undefined && currentSession !== sessionId) {
+      delete state.sessions[currentSession]
+    }
+    const title = previous?.title ?? await sessionTitle(sessionId)
+    chat.sessionId = sessionId
+    chat.cwd = previous?.cwd ?? chat.cwd
+    state.threads[chat.key] = sessionId
+    state.sessions[sessionId] = {
+      ...(previous ?? {}),
+      sessionId,
+      chatId,
+      threadId,
+      title,
+      updatedAt: Date.now(),
+    }
+    await persistState()
+    await ensureAgent(chat)
+    const record = state.sessions[sessionId]
+    await deliverSessionTopic(record, chatId, signal)
+    return record
+  }
+
+  /** Create a fresh topic for an existing session, even if an old mapping remains. */
+  async function openNewTopicForSession(sessionId, chatId, signal) {
     const key = `${chatId}:${sessionId}`
     const inFlight = openingTopics.get(key)
     if (inFlight !== undefined) return inFlight
     const opening = (async () => {
-      const existing = state.sessions[sessionId]
-      if (existing !== undefined && existing.chatId === chatId && typeof existing.threadId === 'number') {
-        // Re-open the stored topic and make it visible in Telegram. Probe the
-        // topic first: sending into a deleted thread can be accepted by
-        // Telegram as a message in General, which would wrongly look like a
-        // successful reuse and leave the session without a topic.
-        if (await topicIsUsable(chatId, existing.threadId, existing.title, signal)
-          && await deliverSessionTopic(existing, chatId, signal)) return existing
-        delete state.sessions[sessionId]
-        delete state.threads[`${chatId}:${existing.threadId}`]
-        delete state.topicNames?.[`${chatId}:${existing.threadId}`]
-        await persistState()
-      }
-      const title = await sessionTitle(sessionId)
       const records = await ctx.get('sessionQuery')?.listSessions(signal)
       const header = records?.find((entry) => entry.header.id === sessionId)?.header
+      const title = await sessionTitle(sessionId)
+      const previous = state.sessions[sessionId]
       const threadId = await createTopic(chatId, title, signal)
       if (threadId === undefined) return undefined
+      if (previous?.chatId === chatId && typeof previous.threadId === 'number' && previous.threadId !== threadId) {
+        delete state.threads[`${chatId}:${previous.threadId}`]
+        delete state.topicNames?.[`${chatId}:${previous.threadId}`]
+        delete state.goalPanels?.[`${chatId}:${previous.threadId}`]
+        forgetChatState(chatId, previous.threadId)
+      }
       const record = {
         sessionId,
         chatId,
@@ -2774,7 +3008,6 @@ export function apply(ctx, config) {
       state.sessions[sessionId] = record
       state.threads[`${chatId}:${threadId}`] = sessionId
       await persistState()
-      await notifyAll(`📂 ${tr('Session opened', 'Открыта сессия')} <code>${escapeHtml(sessionId)}</code>`, signal)
       await deliverSessionTopic(record, chatId, signal)
       return record
     })()
@@ -2784,35 +3017,6 @@ export function apply(ctx, config) {
     } finally {
       if (openingTopics.get(key) === opening) openingTopics.delete(key)
     }
-  }
-
-  /** Create a fresh topic for an existing session, even if an old mapping remains. */
-  async function openNewTopicForSession(sessionId, chatId, signal) {
-    const records = await ctx.get('sessionQuery')?.listSessions(signal)
-    const header = records?.find((entry) => entry.header.id === sessionId)?.header
-    const title = await sessionTitle(sessionId)
-    const previous = state.sessions[sessionId]
-    if (previous?.chatId === chatId && typeof previous.threadId === 'number') {
-      delete state.threads[`${chatId}:${previous.threadId}`]
-      delete state.topicNames?.[`${chatId}:${previous.threadId}`]
-      delete state.goalPanels?.[`${chatId}:${previous.threadId}`]
-      forgetChatState(chatId, previous.threadId)
-    }
-    const threadId = await createTopic(chatId, title, signal)
-    if (threadId === undefined) return undefined
-    const record = {
-      sessionId,
-      chatId,
-      threadId,
-      title,
-      ...(header?.cwd === undefined ? {} : { cwd: header.cwd }),
-      updatedAt: Date.now(),
-    }
-    state.sessions[sessionId] = record
-    state.threads[`${chatId}:${threadId}`] = sessionId
-    await persistState()
-    await deliverSessionTopic(record, chatId, signal)
-    return record
   }
 
   /**
@@ -3008,10 +3212,6 @@ export function apply(ctx, config) {
       callback_data: `f:${sessionId}`,
     }])
     rows.push([{
-      text: tr('🆕 New topic for this session', '🆕 Новый topic для этой сессии'),
-      callback_data: `t:${sessionId}`,
-    }])
-    rows.push([{
       text: tr('⬅️ Back', '⬅️ Назад'),
       callback_data: `w:${workspaceRef}`,
     }])
@@ -3026,7 +3226,8 @@ export function apply(ctx, config) {
   async function handleCallback(query, signal) {
     const chat = query.message?.chat
     const from = query.from
-    const threadId = query.message?.message_thread_id
+    const directTopicId = query.message?.direct_messages_topic?.topic_id
+    const threadId = query.message?.message_thread_id ?? inferredTopicId(query.message)
     if (chat === undefined || from === undefined) return
     const data = String(query.data ?? '')
     await publishStatus({ lastCallback: data, lastCallbackAt: Date.now() })
@@ -3034,6 +3235,8 @@ export function apply(ctx, config) {
       await call('answerCallbackQuery', { callback_query_id: query.id, text: tr('Access denied', 'Нет доступа'), show_alert: true }, signal, 5000).catch(() => {})
       return
     }
+    if (chat.type === 'private') rememberDirectChat(chat.id)
+    if (typeof directTopicId === 'number') rememberDirectTopic(chat.id, threadId, directTopicId)
     const colon = data.indexOf(':')
     const prefix = colon === -1 ? data : data.slice(0, colon)
     const ref = colon === -1 ? '' : data.slice(colon + 1)
@@ -3163,7 +3366,15 @@ export function apply(ctx, config) {
         return
       }
       if (prefix === 'c') {
-        const record = await openTopicForSession(ref, chat.id, signal)
+        // Telegram may keep accepting messages for a topic deleted in the
+        // client and even echo the thread id, so reusing it cannot be trusted.
+        // Continue from All opens a fresh topic; from inside a topic it stays
+        // in that topic. Exactly one creation attempt per Continue: an
+        // ambiguous Telegram error after a committed create used to fall back
+        // to another create path and leave two topics behind.
+        const record = isAllThread(threadId)
+          ? await openNewTopicForSession(ref, chat.id, signal)
+          : await continueInCurrentTopic(ref, chat.id, threadId, signal)
         if (record === undefined) {
           await send(chat.id, tr('Failed to create a topic. Check Topics in chat settings.', 'Не удалось создать topic. Проверь Topics в настройках чата.'), signal, threadId)
           return
@@ -3183,7 +3394,7 @@ export function apply(ctx, config) {
       const detail = messageOf(error)
       await publishStatus({ lastCallbackError: detail, lastErrorKind: classifyError(error), lastErrorScope: 'callback' })
       // Replying into a deleted topic only produces a second identical error.
-      if (!/message thread not found|topic.*not found/iu.test(detail)) {
+      if (!isTopicGone(detail)) {
         await send(chat.id, `❌ ${escapeHtml(detail)}`, signal, threadId)
       }
     }
@@ -3309,14 +3520,16 @@ export function apply(ctx, config) {
       lastChatId: chat?.id ?? null,
       lastFromId: from?.id ?? null,
       lastUpdateType: type,
-      lastThreadId: message.message_thread_id ?? null,
+      lastThreadId: message.message_thread_id ?? inferredTopicId(message) ?? null,
       lastOutcome: 'received',
       detail: '',
     })
+    const directTopicId = message.direct_messages_topic?.topic_id
+    const threadId = message.message_thread_id ?? inferredTopicId(message)
     const announced = topicNameOf(message)
-    if (announced !== undefined && chat !== undefined && typeof message.message_thread_id === 'number') {
+    if (announced !== undefined && chat !== undefined && typeof threadId === 'number') {
       try {
-        if (chatAllowed(chat, allowedChatsOf(config))) rememberTopicName(chat.id, message.message_thread_id, announced.name, announced.authoritative)
+        if (chatAllowed(chat, allowedChatsOf(config))) rememberTopicName(chat.id, threadId, announced.name, announced.authoritative)
       } catch {
         // A malformed allowlist is reported by the main check below.
       }
@@ -3330,7 +3543,6 @@ export function apply(ctx, config) {
       return
     }
 
-    const threadId = message.message_thread_id
     const allowedUsers = allowedUsersOf(config)
     const allowedChats = allowedChatsOf(config)
     let allowedUser
@@ -3345,7 +3557,11 @@ export function apply(ctx, config) {
     await publishStatus({
       lastOutcome: allowedUser && allowedChat ? 'allowed' : 'denied',
     })
-    if (allowedUser && allowedChat) await rememberControlChat(chat.id)
+    if (allowedUser && allowedChat) {
+      await rememberControlChat(chat.id)
+      if (chat.type === 'private') rememberDirectChat(chat.id)
+      if (typeof directTopicId === 'number') rememberDirectTopic(chat.id, threadId, directTopicId)
+    }
     if (!allowedUser || !allowedChat) {
       // Setup hint: an empty user list is the first-run state. Tell a private
       // caller their ids once, so they can be pasted into Settings. Once the
@@ -3435,7 +3651,7 @@ export function apply(ctx, config) {
             ? `${tr('Current session', 'Текущая сессия')}: <code>${chatState.sessionId}</code>\n`
             : `${tr('Global topic. Choose a session or create a new one.', 'Глобальный чат. Выбери сессию или создай новую.')}\n`) +
           `\n<b>${tr('First run', 'Первый запуск')}:</b> @BotFather → Bot Settings → <b>Threaded mode</b> → ${tr('Enable', 'Включить')}.\n` +
-          `${tr('Commands', 'Команды')}: /sessions, /new, /current, /menu, /rename, /topic, /fork, /last, /goal, /clear, /stop, /restart, /status, /id, /ping.`,
+          `${tr('Commands', 'Команды')}: /sessions, /new, /current, /menu, /rename, /topic, /fork, /last, /clear, /stop, /restart, /status, /id, /ping, /goal.`,
         signal,
         threadId,
       )
@@ -3475,14 +3691,29 @@ export function apply(ctx, config) {
           await forgetTopicBinding(chat.id, resolved.threadId)
           await send(chat.id, `🗑 ${tr('Topic deleted', 'Topic удалён')}: <b>${escapeHtml(resolved.name ?? String(resolved.threadId))}</b>`, signal, replyThread)
         } catch (error) {
-          await send(chat.id, `❌ ${escapeHtml(messageOf(error))}`, signal, threadId)
+          const detail = messageOf(error)
+          if (isTopicGone(detail)) {
+            await forgetTopicBinding(chat.id, resolved.threadId)
+            await send(
+              chat.id,
+              `🗑 ${tr('Topic was already deleted by Telegram', 'Telegram уже удалил topic')}: <b>${escapeHtml(resolved.name ?? String(resolved.threadId))}</b>\n` +
+                tr(
+                  'If it still shows in the Telegram client, clear the client cache or delete it from another official client. Bot API cannot remove a topic that reports TOPIC_ID_INVALID.',
+                  'Если он всё ещё виден в клиенте — очисти кэш Telegram или удали его из другого официального клиента. Bot API не может удалить topic, который отвечает TOPIC_ID_INVALID.',
+                ),
+              signal,
+              replyThread,
+            )
+          } else {
+            await send(chat.id, `❌ ${escapeHtml(detail)}`, signal, threadId)
+          }
         }
         return
       }
       if (sub === 'wipe') {
-        const keys = new Set([...Object.keys(state.threads), ...Object.keys(state.topicNames ?? {})])
+        const keys = new Set([...Object.keys(state.threads), ...Object.keys(state.topicNames ?? {})]
           .filter((key) => key.startsWith(`${chat.id}:`))
-          .filter((key) => !isAllThread(Number(key.slice(String(chat.id).length + 1))))
+          .filter((key) => !isAllThread(Number(key.slice(String(chat.id).length + 1)))))
         if (keys.size === 0) {
           await send(chat.id, tr('No known topics to delete.', 'Известных topic для удаления нет.'), signal, threadId)
           return
@@ -3651,7 +3882,7 @@ export function apply(ctx, config) {
       }
       await send(
         chat.id,
-        `🍴 ${tr('Session forked', 'Сессия форкнута')}: <b>${escapeHtml(record.title || title)}</b>`,
+        `🔀 ${tr('Session forked', 'Сессия форкнута')}: <b>${escapeHtml(record.title || title)}</b>`,
         signal,
         threadId,
       )
@@ -3725,17 +3956,16 @@ export function apply(ctx, config) {
         const agent = await ensureAgent(chatState)
         const rest = parts.slice(1).join(' ').trim()
         const action = rest.split(/\s+/u)[0]?.toLowerCase()
+        const objective = action === 'set' || action === 'edit'
+          ? parts.slice(2).join(' ').trim()
+          : rest
         let view = goals.get(agent)
         if (rest.length === 0) {
-          if (view === undefined) {
-            await clearGoalPanel(chatState, signal)
-            await send(chat.id, tr('🎯 No goal is set. Use /goal <objective>.', '🎯 Цель не задана. Используй /goal <цель>.'), signal, threadId)
-            return
-          }
-          await renderGoalPanel(chatState, view, signal)
+          if (view === undefined) await clearGoalPanel(chatState, signal)
+          await send(chat.id, goalHelpText(view), signal, threadId)
           return
         }
-        if (action === 'clear') {
+        if (action === 'clear' || action === 'delete') {
           if (view === undefined) {
             await clearGoalPanel(chatState, signal)
             await send(chat.id, tr('🎯 No goal to clear.', '🎯 Нечего очищать.'), signal, threadId)
@@ -3743,7 +3973,14 @@ export function apply(ctx, config) {
           }
           goals.clear(agent, { id: view.id, revision: view.revision })
           await clearGoalPanel(chatState, signal)
-          await send(chat.id, tr('🎯 Goal cleared.', '🎯 Цель очищена.'), signal, threadId)
+          await send(
+            chat.id,
+            action === 'delete'
+              ? tr('🎯 Goal deleted.', '🎯 Цель удалена.')
+              : tr('🎯 Goal cleared.', '🎯 Цель очищена.'),
+            signal,
+            threadId,
+          )
           return
         }
         if (action === 'pause') {
@@ -3757,20 +3994,66 @@ export function apply(ctx, config) {
         }
         if (action === 'resume') {
           if (view === undefined) {
-            await send(chat.id, tr('🎯 No goal to resume.', '🎯 Нечего продолжать.'), signal, threadId)
+            await send(chat.id, tr('🎯 No goal is set.', '🎯 Цель не задана.'), signal, threadId)
+            return
+          }
+          if (view.phase === 'complete') {
+            await send(chat.id, tr('🎯 The goal is already complete.', '🎯 Цель уже завершена.'), signal, threadId)
+            return
+          }
+          if (view.phase === 'active' && view.activation === 'armed') {
+            await renderGoalPanel(chatState, view, signal)
             return
           }
           view = goals.resume(agent, { id: view.id, revision: view.revision })
           await renderGoalPanel(chatState, view, signal)
           return
         }
-        const objective = rest
+        if (action === 'edit') {
+          if (objective.length === 0) {
+            await send(chat.id, `🎯 ${tr('Usage: /goal edit &lt;objective&gt;', 'Использование: /goal edit &lt;цель&gt;')}`, signal, threadId)
+            return
+          }
+          if (view === undefined || view.phase === 'complete') {
+            if (view !== undefined) goals.clear(agent, { id: view.id, revision: view.revision })
+            view = goals.create(agent, { objective })
+            await renderGoalPanel(chatState, view, signal, 'fresh')
+            return
+          }
+          view = goals.edit(agent, { id: view.id, revision: view.revision }, { objective })
+          // Editing is also a request to keep working: rearm paused, blocked
+          // or disarmed goals so the goal-round driver starts a new round.
+          if (view.phase !== 'active' || view.activation !== 'armed') {
+            try {
+              view = goals.resume(agent, { id: view.id, revision: view.revision })
+            } catch (error) {
+              warn(`goal resume after edit failed: ${messageOf(error)}`)
+            }
+          }
+          await renderGoalPanel(chatState, view, signal, 'fresh')
+          return
+        }
+        if (action === 'set' && objective.length === 0) {
+          await send(chat.id, `🎯 ${tr('Usage: /goal &lt;objective&gt;', 'Использование: /goal &lt;цель&gt;')}`, signal, threadId)
+          return
+        }
+        // Reuse the same goal when it is not complete: edit it and rearm it.
+        // Clearing first would delete the existing Telegram panel and create a
+        // second one, which is exactly what we want to avoid.
         if (view !== undefined && view.phase !== 'complete') {
           view = goals.edit(agent, { id: view.id, revision: view.revision }, { objective })
-        } else {
-          view = goals.create(agent, { objective })
+          if (view.phase !== 'active' || view.activation !== 'armed') {
+            try {
+              view = goals.resume(agent, { id: view.id, revision: view.revision })
+            } catch (error) {
+              warn(`goal resume after replace failed: ${messageOf(error)}`)
+            }
+          }
+          await renderGoalPanel(chatState, view, signal, 'fresh')
+          return
         }
-        await renderGoalPanel(chatState, view, signal)
+        view = goals.create(agent, { objective })
+        await renderGoalPanel(chatState, view, signal, 'fresh')
       } catch (error) {
         await send(chat.id, `❌ ${escapeHtml(messageOf(error))}`, signal, threadId)
       }
@@ -3889,9 +4172,9 @@ export function apply(ctx, config) {
    */
   async function answerInAll(message, signal, type) {
     const chatId = message.chat.id
-    const threadId = message.message_thread_id
+    const threadId = message.message_thread_id ?? inferredTopicId(message)
     const key = `${chatId}:${threadId}`
-    const { message_thread_id: _thread, is_topic_message: _topic, ...rest } = message
+    const { message_thread_id: _thread, direct_messages_topic: _directTopic, is_topic_message: _topic, ...rest } = message
     const inAll = { ...rest }
     if (inAll.reply_to_message?.forum_topic_created !== undefined) delete inAll.reply_to_message
     await handleMessage(inAll, signal, type)
@@ -4002,47 +4285,147 @@ export function apply(ctx, config) {
     }, FORWARD_BATCH_MS)
   }
 
-  /** Format the pinned goal state. */
-  function goalPanelText(view) {
-    const phase = view.phase === 'active'
-      ? tr('active', 'активна')
-      : view.phase === 'paused' ? tr('paused', 'на паузе') : view.phase === 'blocked' ? tr('blocked', 'заблокирована') : tr('complete', 'завершена')
-    const activation = view.activation === 'armed' ? tr('armed', 'включена') : tr('disarmed', 'выключена')
-    return `🎯 <b>${tr('Goal', 'Цель')}</b>\n${escapeHtml(view.objective)}\n\n` +
-      `${tr('Status', 'Статус')}: ${phase} (${activation})\n` +
-      `${tr('Rounds', 'Раунды')}: ${view.roundsStarted}/${view.maxGoalRounds}`
+  /** Horizontal rule used to separate the goal objective from its metadata. */
+  const GOAL_SEPARATOR = '----------------'
+
+  /** Discoverable /goal subcommands. */
+  function goalCommands() {
+    return tr(
+      '/goal &lt;objective&gt; · /goal edit &lt;objective&gt; · /goal pause · /goal resume · /goal clear',
+      '/goal &lt;цель&gt; · /goal edit &lt;цель&gt; · /goal pause · /goal resume · /goal clear',
+    )
   }
 
-  /** Replace the one goal panel for a topic, without pinning it. */
-  async function renderGoalPanel(chatState, view, signal) {
-    state.goalPanels ??= {}
-    const key = chatState.key
-    const previous = state.goalPanels[key]
-    // Keep exactly one panel per topic, immediately above the next generation.
-    if (typeof previous === 'number') {
-      // A panel created by the old pin implementation may still be pinned.
-      await call('unpinChatMessage', { chat_id: chatState.chatId, message_id: previous }, signal).catch(() => {})
-      await deleteMessage(chatState.chatId, chatState.threadId, previous)
-      delete state.goalPanels[key]
+  /** Human label for one goal phase. */
+  function goalPhaseLabel(view) {
+    return view.phase === 'active'
+      ? tr('active', 'активна')
+      : view.phase === 'paused' ? tr('paused', 'на паузе') : view.phase === 'blocked' ? tr('blocked', 'заблокирована') : tr('complete', 'завершена')
+  }
+
+  /** Human label for process-local goal activation. */
+  function goalActivationLabel(view) {
+    return view.activation === 'armed' ? tr('armed', 'включена') : tr('disarmed', 'выключена')
+  }
+
+  /** Format the goal panel. */
+  function goalPanelText(view) {
+    return `🎯 <b>${tr('Goal', 'Цель')}</b>\n${escapeHtml(view.objective)}\n` +
+      `${GOAL_SEPARATOR}\n` +
+      `${tr('Status', 'Статус')}: ${goalPhaseLabel(view)} (${goalActivationLabel(view)}) ${view.roundsStarted}/${view.maxGoalRounds}\n` +
+      `${tr('Commands', 'Команды')}: ${goalCommands()}`
+  }
+
+  /** Status first, then the discoverable goal hints for a bare /goal. */
+  function goalHelpText(view) {
+    const status = view === undefined
+      ? `${tr('Status', 'Статус')}: ${tr('not set', 'не задана')}`
+      : `${tr('Status', 'Статус')}: ${goalPhaseLabel(view)} (${goalActivationLabel(view)}) ${view.roundsStarted}/${view.maxGoalRounds}`
+    const objective = view === undefined ? '' : `\n${escapeHtml(view.objective)}\n`
+    return `🎯 <b>${tr('Goal', 'Цель')}</b>${objective}\n${status}\n\n` +
+      `<b>${tr('Hints', 'Подсказки')}</b>\n` +
+      `/goal &lt;objective&gt; — ${tr('create a goal', 'создать цель')}\n` +
+      `/goal edit &lt;objective&gt; — ${tr('edit the current goal', 'изменить текущую цель')}\n` +
+      `/goal pause — ${tr('pause automatic rounds', 'поставить авто-раунды на паузу')}\n` +
+      `/goal resume — ${tr('resume the goal', 'продолжить цель')}\n` +
+      `/goal clear — ${tr('clear the goal and panel', 'очистить цель и панель')}`
+  }
+
+  /**
+   * Edit the goal panel in place. False means the tracked message is gone and
+   * a fresh panel has to be sent.
+   */
+  async function editGoalPanel(chatState, messageId, text, signal) {
+    try {
+      await call('editMessageText', {
+        chat_id: chatState.chatId,
+        message_id: messageId,
+        ...(chatState.threadId === undefined || chatState.threadId === 0 ? {} : { message_thread_id: chatState.threadId }),
+        text,
+        parse_mode: 'HTML',
+      }, signal)
+      return true
+    } catch (error) {
+      const detail = messageOf(error)
+      if (/not modified/iu.test(detail)) return true
+      if (/message to edit not found|message can't be edited|MESSAGE_ID_INVALID|message_id_invalid/iu.test(detail)) return false
+      throw error
     }
-    const result = await send(chatState.chatId, goalPanelText(view), signal, chatState.threadId)
-    if (typeof result?.message_id === 'number') {
-      state.goalPanels[key] = result.message_id
-      await persistState()
-    }
+  }
+
+  /**
+   * Render the single goal panel for a topic: create it once, then edit the
+   * same message in place. Pinning is intentionally disabled; older pinned
+   * panels are unpinned once after a restart.
+   */
+  async function renderGoalPanel(chatState, view, signal, mode = 'edit') {
+    chatState.goalPanelEdit = (chatState.goalPanelEdit ?? Promise.resolve()).then(async () => {
+      state.goalPanels ??= {}
+      const key = chatState.key
+      const text = goalPanelText(view)
+      let messageId = state.goalPanels[key]
+      if (mode === 'update-only') {
+        // Goal events only update an existing panel. The /goal command owns
+        // creating the fresh message, so an event can never race it into a
+        // duplicate.
+        if (typeof messageId !== 'number') return
+        if (!await editGoalPanel(chatState, messageId, text, signal)) delete state.goalPanels[key]
+        return
+      }
+      if (mode === 'fresh' && typeof messageId === 'number') {
+        await call('unpinChatMessage', { chat_id: chatState.chatId, message_id: messageId }, signal).catch(() => {})
+        chatState.goalPanelPinCleared = true
+        await deleteMessage(chatState.chatId, chatState.threadId, messageId)
+        delete state.goalPanels[key]
+        messageId = undefined
+      }
+      let edited = false
+      if (typeof messageId === 'number') {
+        edited = await editGoalPanel(chatState, messageId, text, signal)
+      }
+      if (!edited) {
+        // The tracked panel is gone; drop it and send exactly one new panel.
+        if (typeof messageId === 'number') {
+          await call('unpinChatMessage', { chat_id: chatState.chatId, message_id: messageId }, signal).catch(() => {})
+          chatState.goalPanelPinCleared = true
+          delete state.goalPanels[key]
+        }
+        messageId = undefined
+        const result = await send(chatState.chatId, text, signal, chatState.threadId)
+        if (typeof result?.message_id === 'number') {
+          messageId = result.message_id
+          state.goalPanels[key] = messageId
+          await persistState()
+        }
+      }
+      if (typeof messageId === 'number' && chatState.goalPanelPinCleared !== true) {
+        // Clean up a pin left by an older plugin revision, once per process.
+        await call('unpinChatMessage', { chat_id: chatState.chatId, message_id: messageId }, signal).catch(() => {})
+        chatState.goalPanelPinCleared = true
+      }
+    }).catch((error) => {
+      if (!signal.aborted) reportError('goal-panel', error)
+    })
+    return chatState.goalPanelEdit
   }
 
   /** Remove the topic's goal panel. */
   async function clearGoalPanel(chatState, signal) {
-    state.goalPanels ??= {}
-    const key = chatState.key
-    const messageId = state.goalPanels[key]
-    delete state.goalPanels[key]
-    await persistState()
-    if (typeof messageId === 'number') {
-      await call('unpinChatMessage', { chat_id: chatState.chatId, message_id: messageId }, signal).catch(() => {})
-      await deleteMessage(chatState.chatId, chatState.threadId, messageId)
-    }
+    chatState.goalPanelEdit = (chatState.goalPanelEdit ?? Promise.resolve()).then(async () => {
+      state.goalPanels ??= {}
+      const key = chatState.key
+      const messageId = state.goalPanels[key]
+      delete state.goalPanels[key]
+      await persistState()
+      if (typeof messageId === 'number') {
+        await call('unpinChatMessage', { chat_id: chatState.chatId, message_id: messageId }, signal).catch(() => {})
+        chatState.goalPanelPinCleared = true
+        await deleteMessage(chatState.chatId, chatState.threadId, messageId)
+      }
+    }).catch((error) => {
+      if (!signal.aborted) reportError('goal-panel', error)
+    })
+    return chatState.goalPanelEdit
   }
 
   /** Show the current goal before a new assistant generation starts. */
@@ -4059,8 +4442,8 @@ export function apply(ctx, config) {
     }
   }
 
-  /** Remove legacy chat-wide pin flags recorded by the previous goal UI. */
-  async function releaseLegacyGoalPins(signal) {
+  /** Remove pins left by older plugin revisions; pinning is no longer used. */
+  async function unpinLegacyGoalPanels(signal) {
     await stateReady
     for (const [key, messageId] of Object.entries(state.goalPanels ?? {})) {
       if (typeof messageId !== 'number') continue
@@ -4155,7 +4538,7 @@ export function apply(ctx, config) {
         // Menu publication and the startup notice must never delay getUpdates.
         // Either request can be rate-limited or time out independently.
         void publishCommands(tokenLifetime.signal)
-        void releaseLegacyGoalPins(tokenLifetime.signal)
+        void unpinLegacyGoalPanels(tokenLifetime.signal)
         void checkForumConfiguration(me, tokenLifetime.signal)
         void notifyAll(
           `🟢 <b>${tr('Telegram bot enabled', 'Telegram-бот включён')}</b>\n` +
@@ -4353,17 +4736,39 @@ export function apply(ctx, config) {
     const field = photo ? 'photo' : 'document'
     const boundary = `----dsh-telegram-${randomUUID()}`
     const safeName = file.name.replace(/["\r\n]/gu, '_')
-    const parts = [
-      `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`,
-      `--${boundary}\r\nContent-Disposition: form-data; name="message_thread_id"\r\n\r\n${threadId}\r\n`,
-      `--${boundary}\r\nContent-Disposition: form-data; name="${field}"; filename="${safeName}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
-    ]
-    const body = Buffer.concat([
-      Buffer.from(parts.join(''), 'utf8'),
-      file.data,
-      Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
-    ])
-    return call(method, { chat_id: chatId }, signal, 120_000, { body, contentType: `multipart/form-data; boundary=${boundary}` })
+    const target = topicTarget(chatId, threadId)
+    const bodyFor = (topicField, topicId) => {
+      const parts = [
+        `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`,
+        `--${boundary}\r\nContent-Disposition: form-data; name="${topicField}"\r\n\r\n${topicId}\r\n`,
+        `--${boundary}\r\nContent-Disposition: form-data; name="${field}"; filename="${safeName}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+      ]
+      return Buffer.concat([
+        Buffer.from(parts.join(''), 'utf8'),
+        file.data,
+        Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
+      ])
+    }
+    const contentType = `multipart/form-data; boundary=${boundary}`
+    if (typeof target.direct_messages_topic_id === 'number') {
+      return call(method, { chat_id: chatId }, signal, 120_000, {
+        body: bodyFor('direct_messages_topic_id', target.direct_messages_topic_id),
+        contentType,
+      })
+    }
+    try {
+      return await call(method, { chat_id: chatId }, signal, 120_000, {
+        body: bodyFor('message_thread_id', threadId),
+        contentType,
+      })
+    } catch (error) {
+      // Bot API 10 may reject message_thread_id for private-chat topics.
+      if (!/message thread not found/i.test(messageOf(error))) throw error
+      return call(method, { chat_id: chatId }, signal, 120_000, {
+        body: bodyFor('direct_messages_topic_id', threadId),
+        contentType,
+      })
+    }
   }
 
   /**
@@ -4401,8 +4806,10 @@ export function apply(ctx, config) {
         if (result?.message_id !== undefined) messageIds.push(result.message_id)
       }
     } catch (error) {
-      if (/thread not found|topic.*not found/iu.test(messageOf(error))) {
-        delete state.topicNames[`${chatId}:${threadId}`]
+      if (isTopicGone(messageOf(error))) {
+        // Do not drop the session binding here: Telegram also reports this for
+        // a live topic during Bot API 10's sporadic private-topic failures.
+        delete state.topicNames?.[`${chatId}:${threadId}`]
         await persistState()
         throw new Error(`Telegram topic ${target.name === undefined ? threadId : `"${target.name}"`} no longer exists.`)
       }

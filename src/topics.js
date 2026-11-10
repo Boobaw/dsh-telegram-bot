@@ -35,6 +35,61 @@ export function isAutoCommandTopic(command, text, topicName, fresh) {
   return name.startsWith('/') && text.trim().startsWith(name)
 }
 
+/** True when Telegram says the topic no longer exists. */
+export function isTopicGone(description) {
+  return /message thread not found|(?:topic|thread)[^.]{0,40}(?:not found|deleted)|TOPIC_ID_INVALID|TOPIC_DELETED/iu.test(String(description ?? ''))
+}
+
+/** True when a thread id denotes the chat-wide All topic. */
+function isAllTopic(threadId) {
+  return threadId === undefined || threadId === null || threadId === 0 || threadId === 1
+}
+
+/**
+ * Outbound topic fields for send methods. Private-chat and forum topics use
+ * `message_thread_id`; a cached direct id is used only for chats without a
+ * forum thread (for example channel direct-messages chats).
+ * @param directChats - `{ "<chatId>": true }` for private chats with topics.
+ * @param directTopics - `{ "<chatId>:<threadId>": directTopicId }`.
+ * @param chatId - chat holding the topic.
+ * @param threadId - stored topic thread id.
+ * @returns `{}`, `{ message_thread_id }` or `{ direct_messages_topic_id }`.
+ */
+export function topicTargetFor(directChats, directTopics, chatId, threadId) {
+  if (isAllTopic(threadId)) return {}
+  // Private-chat topics use message_thread_id. If Telegram rejects it with
+  // "message thread not found", call() retries with direct_messages_topic_id.
+  if (directChats?.[String(chatId)] === true) return { message_thread_id: threadId }
+  const direct = directTopics?.[`${chatId}:${threadId}`]
+  if (Number.isSafeInteger(direct)) return { direct_messages_topic_id: direct }
+  return { message_thread_id: threadId }
+}
+
+/**
+ * Whether a Bot API message proves it reached the expected topic. A response
+ * without any topic field is not proof: Telegram may have silently sent the
+ * message into All after the topic was deleted.
+ * @param directChats - `{ "<chatId>": true }` for private chats with topics.
+ * @param directTopics - `{ "<chatId>:<threadId>": directTopicId }`.
+ * @param chatId - chat holding the topic.
+ * @param threadId - stored topic thread id.
+ * @param delivered - Bot API result for the sent message.
+ * @returns whether the message belongs to the expected topic.
+ */
+export function deliveredToTopic(directChats, directTopics, chatId, threadId, delivered) {
+  if (delivered === null || typeof delivered !== 'object') return false
+  if (typeof delivered.message_thread_id === 'number') return delivered.message_thread_id === threadId
+  const direct = delivered.direct_messages_topic?.topic_id
+  if (typeof direct === 'number') {
+    if (directChats?.[String(chatId)] === true) return direct === threadId
+    const expected = directTopics?.[`${chatId}:${threadId}`]
+    return typeof expected !== 'number' || direct === expected
+  }
+  // No topic fields at all: Telegram silently drops a message into All when
+  // the topic is gone, so this is not proof of delivery.
+  return false
+}
+
 /**
  * Resolve a send target: a numeric thread id, or a topic name compared
  * without regard to case.
@@ -51,6 +106,10 @@ export function resolveTopicTarget(names, chatId, target) {
     .map(([key, name]) => ({ threadId: Number(key.slice(String(chatId).length + 1)), name: String(name) }))
   if (/^\d+$/u.test(raw)) {
     const threadId = Number(raw)
+    if (!Number.isSafeInteger(threadId) || threadId <= 0 || threadId > 2_147_483_647) {
+      const list = known.map((entry) => `"${entry.name}" (${entry.threadId})`).join(', ')
+      throw new Error(`"${raw}" is not a Telegram topic id. Topic ids are message-thread ids (for example 55221).${list.length > 0 ? ` Known topics: ${list}.` : ''} Send /id inside the topic to see its id.`)
+    }
     return { threadId, name: known.find((entry) => entry.threadId === threadId)?.name }
   }
   const wanted = raw.toLocaleLowerCase()

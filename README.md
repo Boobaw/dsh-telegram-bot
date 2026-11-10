@@ -23,7 +23,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Then enable **Disallow
 ## Features
 
 - One Telegram topic per DSH session; Web and Telegram use the same session.
-- Telegram mirrors only turns initiated from Telegram; turns started in the Web UI stay in Web.
+- Telegram mirrors turns initiated from Telegram; turns started in the Web UI stay in Web. Automatic goal rounds for a Telegram-bound session are mirrored too, with thinking, tool calls and the final answer.
 - `/sessions` lists workspaces and existing sessions, and can create a new session in a selected workspace.
 - A `typing…` action is shown in the topic while its turn runs and stops when the answer is ready.
 - Assistant answers stream into the topic with Telegram Markdown formatting. Messages sent while the agent is working are queued and processed after the current turn; `/clear` removes that queue without stopping the current answer.
@@ -34,10 +34,11 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Then enable **Disallow
 - `ask_user_question` support: options, multi-select, custom answers and plan review.
 - Documents and photos sent in a session topic are saved as DSH attachments and passed to the agent.
 - `/new`, `/last`, `/goal`, `/rename`, `/fork`, `/clear`, `/stop`, `/restart`, `/status` and `/menu`.
-- `/goal` shows and pins the current DSH goal. `/goal <objective>` creates or edits it, `/goal pause`, `/goal resume` and `/goal clear` manage it; clear unpins and removes the panel.
+- `/goal` shows the current DSH goal and the command hints. `/goal <objective>` creates or replaces the goal and starts working immediately; `/goal edit <objective>` updates the objective and resumes a paused, blocked or disarmed goal; `/goal pause`, `/goal resume` and `/goal clear` manage the current goal. `/goal <objective>` and `/goal edit <objective>` replace the current panel with one fresh message; later goal changes edit that message in place. The panel is never pinned.
 - `/new` in a session topic starts a fresh DSH session in the same workspace and binds it to the same topic; the previous session stays in DSH. In All it opens a new session topic.
 - `/fork [name]` creates a DSH session fork in a new Telegram topic; without a name it uses the previous title plus the branch number.
 - The session picker also has **🔀 Continue in Telegram fork**; automatic fork topics end with `(N)`.
+- **▶️ Continue in Telegram** from All opens a fresh topic for the session. From inside a topic it continues in that topic. The previous topic stays in Telegram and can be deleted manually; reusing it from All is unsafe because Telegram can keep accepting messages for a topic deleted in the client.
 - English and Russian bot messages.
 - Bot token stays in the DSH credential store.
 
@@ -96,7 +97,7 @@ If users are allowed to create threads, Telegram creates a topic before the bot 
 
 ## Delete topics
 
-- `/topic delete <name or thread id>` deletes one known topic and its Telegram messages.
+- `/topic delete <name or thread id>` deletes one known topic and its Telegram messages. Numeric targets must be real topic thread ids; ids larger than 2^31 (for example a user id) are rejected. Send `/id` inside the topic to read its id.
 - `/topic wipe` asks for confirmation first; send `/topic wipe confirm` to delete every topic known to the bot in this chat. DSH sessions themselves are not deleted.
 
 Topics are known after the bot creates them, after `/rename`, or after Telegram reports a topic creation/rename. Unknown topics cannot be listed through the Bot API.
@@ -139,6 +140,10 @@ A correct configuration contains:
 "threadedMode": true,
 "usersCanCreateTopics": false
 ```
+
+Topic creation is single-shot: a network timeout is never retried, because retrying a `createForumTopic` that Telegram already committed creates a duplicate topic. Concurrent open requests for the same session are coalesced.
+
+Private-chat topics send with `message_thread_id`. If Telegram answers `message thread not found`, the bot retries once with `direct_messages_topic_id` (the Bot API 10 direct-message-topic field). A send that Telegram accepts without returning any topic field is treated as undelivered, so a deleted topic is recreated instead of silently receiving messages in All.
 
 ## Plugins page
 
@@ -209,7 +214,7 @@ node --check client.js
 npm test
 ```
 
-`src/app.js` is the Host runtime: Telegram polling, topic routing and the session bridge. `src/update-ledger.js` persists Telegram update cursors, `src/admission.js` uses the native DSH session queue. `src/formatting.js`, `src/state.js`, `src/status.js`, `src/utils.js`, `src/errors.js`, `src/config.js` and `src/constants.js` hold the supporting layers. `src/message-context.js` builds reply/quote/forward context, `src/topics.js` resolves topic names and `src/outbox.js` powers `dsh-telegram-send`. `src/index.js` is the public entry point; root `index.js` is the loader-compatible wrapper. Root `client.js` is the loader-compatible client bundle. `src/client.js` contains the client source. The plugin registers the model-facing `telegram_send` tool for posting into a Telegram topic.
+`src/app.js` is the Host runtime: Telegram polling, topic routing and the session bridge. `src/update-ledger.js` persists Telegram update cursors, `src/admission.js` uses the native DSH session queue. `src/formatting.js`, `src/state.js`, `src/status.js`, `src/utils.js`, `src/errors.js`, `src/config.js` and `src/constants.js` hold the supporting layers. `src/message-context.js` builds reply/quote/forward context, `src/topics.js` resolves topic names, direct-message topic targets and delivery checks, and `src/outbox.js` powers `dsh-telegram-send`. `src/index.js` is the public entry point; root `index.js` is the loader-compatible wrapper. Root `client.js` is the loader-compatible client bundle. `src/client.js` contains the client source. The plugin registers the model-facing `telegram_send` tool for posting into a Telegram topic.
 
 ## License
 
