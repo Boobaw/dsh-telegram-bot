@@ -13,8 +13,8 @@ Installation, bot token, the allowlist, `/start`, `/sessions` and a test prompt.
 ### Enable Threaded mode
 
 <p align="center">
-  <a href="docs/threaded-mode.gif">
-    <img src="docs/threaded-mode.gif" alt="BotFather: Bot Settings → Threaded mode → Enable" width="320">
+  <a href="docs/threaded-mode.gif?v=2">
+    <img src="docs/threaded-mode.gif?v=2" alt="BotFather: Bot Settings → Threaded mode → Enable" width="320">
   </a>
 </p>
 
