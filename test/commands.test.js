@@ -1,3 +1,4 @@
+import './setup-home.js'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
@@ -23,6 +24,7 @@ function makeAgent(id, cwd, idleMs) {
         .then(() => (this.received.length === 0 ? undefined : new Promise((resolve) => setTimeout(resolve, idleMs))))
     },
     cancel() {},
+    emit(name, ...args) { events.emit(name, ...args) },
   }
 }
 
@@ -33,8 +35,57 @@ function makeContext(agent) {
     async saveFile({ data, name }) { return { attachmentId: 'file-1', name: name ?? 'file', bytes: data.length } },
     async saveImage({ data, name, mediaType }) { return { attachmentId: 'image-1', name: name ?? 'image', bytes: data.length, mediaType, width: 1, height: 1 } },
   }
+  const goalCalls = []
+  const goalState = {
+    current: {
+      id: 'goal-old',
+      revision: 1,
+      objective: 'old blocked goal',
+      phase: 'blocked',
+      activation: 'disarmed',
+      roundsStarted: 3,
+      maxGoalRounds: 256,
+      blockedReason: { code: 'test', message: 'blocked' },
+    },
+  }
   const services = {
     credentials: { resolve: async () => ({ value: 'TEST_TOKEN' }) },
+    goals: {
+      get: () => goalState.current,
+      create: (_agent, { objective }) => {
+        goalCalls.push({ op: 'create', objective })
+        goalState.current = {
+          id: 'goal-new',
+          revision: 1,
+          objective,
+          phase: 'active',
+          activation: 'armed',
+          roundsStarted: 0,
+          maxGoalRounds: 256,
+        }
+        return goalState.current
+      },
+      clear: (_agent, ref) => {
+        goalCalls.push({ op: 'clear', ref })
+        goalState.current = undefined
+        return { id: ref.id, revision: ref.revision + 1 }
+      },
+      edit: (_agent, _ref, { objective }) => {
+        goalCalls.push({ op: 'edit', objective })
+        goalState.current = { ...goalState.current, objective }
+        return goalState.current
+      },
+      pause: () => {
+        goalCalls.push({ op: 'pause' })
+        goalState.current = { ...goalState.current, phase: 'paused', activation: 'disarmed' }
+        return goalState.current
+      },
+      resume: () => {
+        goalCalls.push({ op: 'resume' })
+        goalState.current = { ...goalState.current, phase: 'active', activation: 'armed' }
+        return goalState.current
+      },
+    },
     agents: { get: () => undefined, create: async () => ({ agent }), resume: async () => ({ agent }) },
     sessionController: {
       createSession: async () => ({ agent }),
@@ -63,6 +114,8 @@ function makeContext(agent) {
       effect(fn) { cleanups.push(fn()) },
     },
     logs,
+    goalCalls,
+    goalState,
     cleanup: () => { for (const fn of cleanups) fn?.() },
   }
 }
@@ -162,7 +215,15 @@ async function runScenario(updates, idleMs = 20, waitMs = 400, afterReady) {
     })
     await new Promise((resolve) => setTimeout(resolve, waitMs))
     if (afterReady !== undefined) await afterReady({ agent, calls: telegram.calls })
-    return { calls: telegram.calls, agent, logs: context.logs, cleanup: context.cleanup }
+    return {
+      calls: telegram.calls,
+      agent,
+      telegram,
+      logs: context.logs,
+      goalCalls: context.goalCalls,
+      goalState: context.goalState,
+      cleanup: context.cleanup,
+    }
   } catch (error) {
     context.cleanup()
     throw error
@@ -179,6 +240,11 @@ const topic = (threadId, text, delay = 100) => ({
   delay,
   update_id: 2,
   message: { message_id: 2, date: 1, chat: { id: 100, type: 'private' }, from: { id: 42 }, message_thread_id: threadId, text },
+})
+const topicAt = (updateId, threadId, text, delay = 100) => ({
+  delay,
+  update_id: updateId,
+  message: { message_id: updateId + 1, date: 1, chat: { id: 100, type: 'private' }, from: { id: 42 }, message_thread_id: threadId, text },
 })
 const topicFile = (threadId, delay = 100) => ({
   delay,
@@ -253,6 +319,172 @@ test('stop settles a running Telegram turn without duplicates', async () => {
       call.method === 'sendMessage' && typeof call.body?.text === 'string' && call.body.text.includes('Stopped.'),
     )
     assert.equal(stopped.length, 1)
+  } finally {
+    result.cleanup()
+  }
+})
+
+test('/goal replaces a non-complete goal', async () => {
+  const result = await runScenario([all('hello'), topicAt(2, 7001, '/goal new task', 200)], 20, 900)
+  try {
+    assert.deepEqual(result.goalCalls.map((entry) => entry.op), ['edit', 'resume'])
+    assert.equal(result.goalState.current.phase, 'active')
+    assert.equal(result.goalState.current.objective, 'new task')
+    const newPanels = result.calls.filter((call) =>
+      call.method === 'sendMessage'
+      && typeof call.body?.text === 'string'
+      && call.body.text.includes('🎯 <b>Goal</b>')
+      && call.body.text.includes('new task'))
+    assert.equal(newPanels.length, 1, '/goal posts exactly one new panel')
+    assert.ok(result.calls.some((call) => call.method === 'deleteMessage'), 'the old panel is removed')
+  } finally {
+    result.cleanup()
+  }
+})
+
+test('Continue inside a topic reuses that topic', async () => {
+  const callback = {
+    delay: 300,
+    update_id: 3,
+    callback_query: {
+      id: 'callback-3',
+      from: { id: 42 },
+      data: 'c:session-one',
+      message: { message_id: 1, date: 1, chat: { id: 100, type: 'private' }, message_thread_id: 7001 },
+    },
+  }
+  const result = await runScenario([all('hello'), callback], 20, 1000)
+  try {
+    assert.equal(result.calls.filter((call) => call.method === 'createForumTopic').length, 1, 'no additional topic is created')
+    // Continue inside a topic binds the session there the way the topic's
+    // session picker does; this topic already shows it.
+    assert.ok(result.calls.some((call) =>
+      (call.method === 'sendMessage' || call.method === 'editMessageText')
+      && typeof call.body?.text === 'string'
+      && call.body.text.includes('This topic already uses that session')), 'the current topic confirms the session')
+  } finally {
+    result.cleanup()
+  }
+})
+
+test('/goal edit updates and resumes a blocked goal', async () => {
+  const result = await runScenario([all('hello'), topicAt(2, 7001, '/goal edit new objective', 200)], 20, 900)
+  try {
+    assert.deepEqual(result.goalCalls.map((entry) => entry.op), ['edit', 'resume'])
+    assert.equal(result.goalState.current.objective, 'new objective')
+    assert.equal(result.goalState.current.phase, 'active')
+  } finally {
+    result.cleanup()
+  }
+})
+
+test('/goal creates a goal and /goal edit updates the same panel', async () => {
+  const result = await runScenario([
+    all('hello'),
+    topicAt(2, 7001, '/goal clear', 150),
+    topicAt(3, 7001, '/goal first task', 350),
+    topicAt(4, 7001, '/goal edit second task', 650),
+  ], 20, 1800)
+  try {
+    assert.deepEqual(result.goalCalls.map((entry) => entry.op), ['clear', 'create', 'edit'])
+    assert.equal(result.goalState.current.objective, 'second task')
+    assert.equal(result.goalState.current.phase, 'active')
+    const firstPanels = result.calls.filter((call) =>
+      call.method === 'sendMessage'
+      && typeof call.body?.text === 'string'
+      && call.body.text.includes('🎯 <b>Goal</b>')
+      && call.body.text.includes('first task'))
+    assert.equal(firstPanels.length, 1, 'create posts a new panel')
+    const secondPanels = result.calls.filter((call) =>
+      call.method === 'sendMessage'
+      && typeof call.body?.text === 'string'
+      && call.body.text.includes('🎯 <b>Goal</b>')
+      && call.body.text.includes('second task'))
+    assert.equal(secondPanels.length, 1, 'edit posts exactly one new panel')
+    assert.equal(result.calls.filter((call) => call.method === 'pinChatMessage').length, 0, 'nothing is pinned')
+  } finally {
+    result.cleanup()
+  }
+})
+
+test('a goal change updates the panel immediately', async () => {
+  const result = await runScenario([
+    all('hello'),
+    topicAt(2, 7001, '/goal clear', 150),
+    topicAt(3, 7001, '/goal task', 350),
+  ], 20, 1200)
+  const originalRequest = https.request
+  https.request = result.telegram.fake
+  try {
+    result.goalState.current = {
+      ...result.goalState.current,
+      phase: 'complete',
+      activation: 'disarmed',
+    }
+    result.agent.emit('session/event', { id: 'session-one' }, {
+      type: 'goal/change',
+      data: { operation: 'complete', goal: result.goalState.current },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    assert.ok(result.calls.some((call) =>
+      call.method === 'editMessageText'
+      && typeof call.body?.text === 'string'
+      && call.body.text.includes('complete')), 'the panel shows the completed phase')
+    assert.equal(result.calls.filter((call) => call.method === 'pinChatMessage').length, 0, 'nothing is pinned')
+  } finally {
+    https.request = originalRequest
+    result.cleanup()
+  }
+})
+
+test('/goal without arguments prints status then hints', async () => {
+  const result = await runScenario([all('hello'), topicAt(2, 7001, '/goal', 300)], 20, 900)
+  try {
+    const help = result.calls.filter((call) =>
+      call.method === 'sendMessage'
+      && typeof call.body?.text === 'string'
+      && call.body.text.includes('Hints')).at(-1)
+    assert.ok(help !== undefined, 'the bare /goal prints hints')
+    assert.ok(help.body.text.includes('Status:'), 'status is included')
+    assert.ok(help.body.text.includes('/goal edit'), 'edit hint is included')
+    assert.ok(help.body.text.includes('/goal resume'), 'resume hint is included')
+    assert.ok(help.body.text.indexOf('Status:') < help.body.text.indexOf('Hints'), 'status comes before hints')
+  } finally {
+    result.cleanup()
+  }
+})
+
+test('/goal clear removes the current goal', async () => {
+  const result = await runScenario([
+    all('hello'),
+    topicAt(2, 7001, '/goal clear', 150),
+    topicAt(3, 7001, '/goal task', 350),
+    topicAt(4, 7001, '/goal clear', 650),
+  ], 20, 1600)
+  try {
+    assert.deepEqual(result.goalCalls.map((entry) => entry.op), ['clear', 'create', 'clear'])
+    assert.equal(result.goalState.current, undefined)
+    assert.ok(result.calls.some((call) =>
+      call.method === 'sendMessage'
+      && typeof call.body?.text === 'string'
+      && call.body.text.includes('Goal cleared')), 'the bot confirms clearing')
+    assert.ok(result.calls.some((call) => call.method === 'deleteMessage'), 'the panel is removed')
+  } finally {
+    result.cleanup()
+  }
+})
+
+test('/goal pause and resume manage the current goal', async () => {
+  const result = await runScenario([
+    all('hello'),
+    topicAt(2, 7001, '/goal clear', 100),
+    topicAt(3, 7001, '/goal task', 150),
+    topicAt(4, 7001, '/goal pause', 250),
+    topicAt(5, 7001, '/goal resume', 350),
+  ], 20, 2000)
+  try {
+    assert.deepEqual(result.goalCalls.map((entry) => entry.op), ['clear', 'create', 'pause', 'resume'])
+    assert.equal(result.goalState.current.phase, 'active')
   } finally {
     result.cleanup()
   }
