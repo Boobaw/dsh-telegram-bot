@@ -1629,3 +1629,25 @@ test('a Telegram turn keeps the access mode the session has, even when changed e
     run.stop()
   }
 })
+
+test('a [SILENT] message after real text in the same turn is cut, and the text is kept', async () => {
+  const run = await start()
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'hello' })
+    await wait(200)
+    const agent = run.host.live.get('session-1')
+    const before = run.telegram.calls.length
+    const session = { id: agent.id }
+    agent.emit('session/event', session, { type: 'turn/start', data: { turn: 4 } })
+    agent.emit('session/event', session, { type: 'user/message', data: { id: 'n-1', role: 'user', content: [{ type: 'text', text: 'subagent report' }], source: { kind: 'user' } } })
+    agent.emit('session/event', session, { type: 'assistant/message', data: { turn: 4, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'the long report' }] } } })
+    agent.emit('session/event', session, { type: 'assistant/message', data: { turn: 4, step: 2, message: { role: 'assistant', content: [{ type: 'text', text: '[SILENT]' }] } } })
+    agent.emit('session/event', session, { type: 'turn/end', data: { turn: 4, reason: { kind: 'completed' } } })
+    await wait(300)
+    const shown = texts(run.telegram.calls.slice(before), 7001)
+    assert.ok(shown.some((text) => text.includes('the long report')), shown.join('\n---\n'))
+    assert.ok(!shown.some((text) => (text ?? '').includes('SILENT')), shown.join('\n---\n'))
+  } finally {
+    run.stop()
+  }
+})
