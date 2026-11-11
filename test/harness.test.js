@@ -1,3 +1,4 @@
+import './setup-home.js'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'

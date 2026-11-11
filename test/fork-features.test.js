@@ -1,3 +1,4 @@
+import './setup-home.js'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -169,7 +170,11 @@ function makeTelegram() {
       } catch {
         // A multipart upload; keep the raw form fields for assertions.
         const raw = Buffer.from(value).toString('latin1')
-        body = { raw, message_thread_id: Number(/name="message_thread_id"\r\n\r\n(\d+)/u.exec(raw)?.[1]) }
+        const field = (name) => {
+          const match = new RegExp(`name="${name}"\r\n\r\n(\\d+)`, 'u').exec(raw)
+          return match === null ? undefined : Number(match[1])
+        }
+        body = { raw, message_thread_id: field('message_thread_id'), direct_messages_topic_id: field('direct_messages_topic_id') }
       }
       if (String(options.path).includes('/file/')) {
         setTimeout(() => {
@@ -187,7 +192,10 @@ function makeTelegram() {
       }
       if (method === 'getUpdates') return deliver({ ok: true, result: pending.splice(0) }, 15)
       calls.push({ method, body })
-      if (goneThreads.has(body?.message_thread_id)) return deliver({ ok: false, description: goneThreads.get(body.message_thread_id) })
+      // A deleted topic is gone whichever field addresses it (private-chat
+      // topics may be retried with direct_messages_topic_id).
+      const topicField = body?.message_thread_id ?? body?.direct_messages_topic_id
+      if (goneThreads.has(topicField)) return deliver({ ok: false, description: goneThreads.get(topicField) })
       if (method === 'createForumTopic') {
         topicId += 1
         return deliver({ ok: true, result: { message_thread_id: topicId, name: body.name } })
@@ -492,6 +500,30 @@ test('scheduled turns are labelled, and mirroring can be turned off', async () =
     assert.deepEqual(texts(quiet.telegram.calls.slice(before), 7001), [])
   } finally {
     quiet.stop()
+  }
+})
+
+test('a goal round of a topic session is shown once, through the goal path, with or without mirroring', async () => {
+  for (const mirrorTurns of [true, false]) {
+    const run = await start({ mirrorTurns })
+    try {
+      run.telegram.push({ message_thread_id: 1, text: 'hello' })
+      await wait(200)
+      const agent = run.host.live.get('session-1')
+      const before = run.telegram.calls.length
+      const goal = { id: 'goal-msg-1', role: 'user', content: [{ type: 'text', text: '<goal_round>' }], source: { kind: 'goal', goalId: 'goal-1', revision: 1, round: 1 } }
+      await playExternalTurn(agent, 4, goal, 'goal round answer')
+      await wait(150)
+      const calls = run.telegram.calls.slice(before).filter((call) => call.body?.message_thread_id === 7001)
+      assert.ok(calls.some((call) => call.method === 'sendMessage' && String(call.body.text).includes('Generating')), `mirrorTurns ${mirrorTurns}: the goal path shows a placeholder`)
+      const carrying = new Set(calls
+        .filter((call) => (call.method === 'sendMessage' || call.method === 'editMessageText') && String(call.body.text).includes('goal round answer'))
+        .map((call) => call.method === 'sendMessage' ? call.result?.message_id : call.body.message_id))
+      assert.equal(carrying.size, 1, `mirrorTurns ${mirrorTurns}: the answer is in one message`)
+      assert.ok(!calls.some((call) => String(call.body.text ?? '').includes('<goal_round>')), 'the goal prompt is not shown')
+    } finally {
+      run.stop()
+    }
   }
 })
 

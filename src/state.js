@@ -21,12 +21,15 @@ async function loadState() {
         updateLedger: parsed.updateLedger !== null && typeof parsed.updateLedger === 'object' && !Array.isArray(parsed.updateLedger) ? parsed.updateLedger : {},
         updateOffset: Number.isSafeInteger(parsed.updateOffset) && parsed.updateOffset >= 0 ? parsed.updateOffset : 0,
         topicNames: parsed.topicNames !== null && typeof parsed.topicNames === 'object' && !Array.isArray(parsed.topicNames) ? parsed.topicNames : {},
+        directChats: parsed.directChats !== null && typeof parsed.directChats === 'object' && !Array.isArray(parsed.directChats) ? parsed.directChats : {},
+        directTopics: parsed.directTopics !== null && typeof parsed.directTopics === 'object' && !Array.isArray(parsed.directTopics) ? parsed.directTopics : {},
+        goalPanels: parsed.goalPanels !== null && typeof parsed.goalPanels === 'object' && !Array.isArray(parsed.goalPanels) ? parsed.goalPanels : (parsed.goalPins !== null && typeof parsed.goalPins === 'object' && !Array.isArray(parsed.goalPins) ? parsed.goalPins : {}),
       }
     }
   } catch {
     // Missing or corrupt state is nonfatal; the next session creates a mapping.
   }
-  return { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {} }
+  return { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {}, directChats: {}, directTopics: {}, goalPanels: {} }
 }
 
 /** Durable control-chat id for lifecycle notifications. */
