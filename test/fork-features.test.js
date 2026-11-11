@@ -130,7 +130,7 @@ function makeHost() {
     on(name, fn) { hostEvents.on(name, fn); return () => hostEvents.off(name, fn) },
     effect(fn) { cleanups.push(fn()) },
   }
-  return { ctx, live, created, logs, makeAgent, sessionRecords, provided, tools, cleanup: () => { for (const fn of cleanups) fn?.() } }
+  return { ctx, services, live, created, logs, makeAgent, sessionRecords, provided, tools, cleanup: () => { for (const fn of cleanups) fn?.() } }
 }
 
 /**
@@ -1565,6 +1565,34 @@ test('a final answer of exactly [SILENT] posts nothing, after a sticker or alone
     assert.equal(noisy(), before, 'a sticker plus [SILENT] adds no text')
     await finish(3, false)
     assert.equal(noisy(), before, 'a lone [SILENT] adds no text either')
+  } finally {
+    run.stop()
+  }
+})
+
+test('a Telegram turn keeps the access mode the session has, even when changed elsewhere', async () => {
+  const run = await start()
+  try {
+    let mode = 'workspace-write'
+    const sets = []
+    run.host.services.permissionPresets = {
+      defaultPreset: 'danger-full-access',
+      current: () => mode,
+      set: (_session, preset) => { sets.push(preset); mode = preset },
+    }
+    run.telegram.push({ message_thread_id: 1, text: 'first' })
+    await wait(250)
+    const one = run.host.live.get('session-1')
+    assert.ok(one, 'topic session')
+    const record = async () => JSON.parse(await readFile(join(STATUS_DIR, 'state.json'), 'utf8')).sessions['session-1']
+    assert.equal((await record()).permission, 'workspace-write', 'the session mode is recorded')
+    // Livia switches the session to full access in the Web UI.
+    mode = 'danger-full-access'
+    run.telegram.push({ message_thread_id: 7001, text: 'second' })
+    await wait(250)
+    assert.deepEqual(sets, [], 'the bot never writes its cached mode back')
+    assert.equal(mode, 'danger-full-access')
+    assert.equal((await record()).permission, 'danger-full-access', 'the record follows the session')
   } finally {
     run.stop()
   }

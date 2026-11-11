@@ -559,29 +559,25 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Apply the selected permission preset to a live session.
+   * Record the session's own permission preset for the topic menu.
+   * The session owns its access mode: it is changed in the Web UI or with the
+   * topic's mode picker, and a copy cached here must never be written back,
+   * or every Telegram turn would undo a change made elsewhere.
    * @param chat - chat bridge state.
    * @param agent - live agent.
    */
-  async function applyPermission(chat, agent) {
+  async function syncPermission(chat, agent) {
     const service = ctx.get('permissionPresets')
     if (service === undefined) return
     try {
-      if (chat.permission === undefined) {
-        chat.permission = typeof service.current === 'function'
-          ? service.current(agent.session)
-          : service.defaultPreset
-        await persistPreferences(chat)
-        return
-      }
-      if (typeof service.set === 'function') {
-        service.set(agent.session, chat.permission)
-      } else {
-        applyPermissionFallback(chat, agent, chat.permission)
-      }
+      const current = typeof service.current === 'function'
+        ? service.current(agent.session)
+        : chat.permission ?? service.defaultPreset
+      if (current === undefined || current === chat.permission) return
+      chat.permission = current
       await persistPreferences(chat)
     } catch (error) {
-      warn(`permission set failed: ${messageOf(error)}`)
+      warn(`permission read failed: ${messageOf(error)}`)
     }
   }
 
@@ -1952,7 +1948,7 @@ export function apply(ctx, config) {
       if (live !== undefined) {
         if (typeof live.session?.header?.cwd === 'string') chat.cwd = live.session.header.cwd
         attachAgent(live, chat)
-        await applyPermission(chat, live)
+        await syncPermission(chat, live)
         return live
       }
       try {
@@ -1965,7 +1961,7 @@ export function apply(ctx, config) {
         const agent = resumed?.agent ?? resumed
         if (typeof agent?.session?.header?.cwd === 'string') chat.cwd = agent.session.header.cwd
         attachAgent(agent, chat)
-        await applyPermission(chat, agent)
+        await syncPermission(chat, agent)
         info(`resumed Telegram session ${chat.sessionId}`)
         return agent
       } catch (error) {
@@ -1991,7 +1987,7 @@ export function apply(ctx, config) {
         await bindSession(chat, sessionId, '', targetCwd)
         await attachToWorkspace(sessionId, targetCwd)
         attachAgent(agent, chat)
-        await applyPermission(chat, agent)
+        await syncPermission(chat, agent)
         info(`created Telegram session ${sessionId} via sessionController`)
         return agent
       } catch (error) {
@@ -2007,7 +2003,7 @@ export function apply(ctx, config) {
     await bindSession(chat, sessionId, '', targetCwd)
     await attachToWorkspace(sessionId, meta.cwd)
     attachAgent(handle.agent, chat)
-    await applyPermission(chat, handle.agent)
+    await syncPermission(chat, handle.agent)
     info(`created Telegram session ${sessionId}`)
     return handle.agent
   }
