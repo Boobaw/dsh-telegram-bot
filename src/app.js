@@ -14,6 +14,7 @@ import {
   POLL_TIMEOUT_SECONDS,
   RESTART_DEBOUNCE_MS,
   RETRY_DELAY_MS,
+  SILENT_REPLY,
   STATUS_DIR,
   name,
 } from './constants.js'
@@ -1345,6 +1346,8 @@ export function apply(ctx, config) {
   function renderChat(chat) {
     const text = chat.text.trim()
     if (text.length === 0) return ''
+    // Hold back what may still become the silence marker, so it never flashes.
+    if (SILENT_REPLY.startsWith(text)) return ''
     return fitAnswerText(text)
   }
 
@@ -2338,8 +2341,10 @@ export function apply(ctx, config) {
     if (toolId !== null) await deleteMessage(chat.chatId, chat.threadId, toolId)
     // A turn started elsewhere that produced no text adds nothing to the topic,
     // and neither does one that already answered with a sticker or file.
+    // A final answer of exactly SILENT_REPLY means "post nothing": the model
+    // cannot end a turn with no text at all (DSH treats that as EMPTY_RESPONSE).
     const answeredInTopic = typeof turn === 'number' && chat.sentInTurn === turn
-    if (text.length === 0 && answeredInTopic) {
+    if (text === SILENT_REPLY || (text.length === 0 && answeredInTopic)) {
       // An empty answer placeholder would only add noise under the sticker.
       if (messageId !== null) await deleteMessage(chat.chatId, chat.threadId, messageId)
     } else if (text.length > 0 || source !== 'mirror' || messageId !== null) {

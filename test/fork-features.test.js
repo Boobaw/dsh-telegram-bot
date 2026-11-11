@@ -1534,3 +1534,38 @@ test('a Telegram turn that answered with only a sticker posts no "Done" placehol
     run.stop()
   }
 })
+
+test('a final answer of exactly [SILENT] posts nothing, after a sticker or alone', async () => {
+  const run = await start()
+  try {
+    run.telegram.push({ message_thread_id: 1, text: 'first' })
+    await wait(250)
+    const one = run.host.live.get('session-1')
+    assert.ok(one, 'topic session')
+    const tool = run.host.tools.get('telegram_sticker')
+    await tool.execute({ action: 'add_set', set: 'CatMoods' }, {})
+    const noisy = () => texts(run.telegram.calls, 7001).filter((text) => /SILENT|Done|\[/u.test(text ?? '')).length
+    const finish = async (turn, withSticker) => {
+      one.whenIdle = () => new Promise(() => {})
+      run.telegram.push({ message_thread_id: 7001, text: `hi ${turn}` })
+      await wait(150)
+      one.emit('session/event', { id: 'session-1' }, { type: 'turn/start', data: { turn } })
+      await wait(20)
+      if (withSticker) await tool.execute({ action: 'send', id: 'U-SET-1', thread: '7001' }, { agent: { id: 'session-1' } })
+      one.emit('agent/assistant-stream', { agent: one, frame: { type: 'chunk', chunk: { type: 'block-start', blockType: 'text' } } })
+      one.emit('agent/assistant-stream', { agent: one, frame: { type: 'chunk', chunk: { type: 'text-delta', text: '[SIL' } } })
+      await wait(1200)
+      one.emit('agent/assistant-stream', { agent: one, frame: { type: 'chunk', chunk: { type: 'text-delta', text: 'ENT]' } } })
+      await wait(1200)
+      one.emit('session/event', { id: 'session-1' }, { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } })
+      await wait(200)
+    }
+    const before = noisy()
+    await finish(2, true)
+    assert.equal(noisy(), before, 'a sticker plus [SILENT] adds no text')
+    await finish(3, false)
+    assert.equal(noisy(), before, 'a lone [SILENT] adds no text either')
+  } finally {
+    run.stop()
+  }
+})

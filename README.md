@@ -184,6 +184,8 @@ Every received sticker is kept in a sticker library (`$DSH_HOME/telegram/sticker
 
 A Telegram turn that already sent its own topic a sticker, file or message and ends with no text posts nothing more, so a sticker can be the whole reply. A turn that sent nothing and has no text still ends with **✅ Done.**
 
+Models often can't end a turn with no text at all (DSH counts an empty answer as a failed `EMPTY_RESPONSE` call and retries or falls back), so a final answer of exactly `[SILENT]` also posts nothing: after a sticker, or alone when the agent chooses to stay quiet. Text that may still turn into `[SILENT]` is held back while it streams, so the marker never shows up in the topic.
+
 ## Voice messages
 
 Voice messages, audio files and round video messages (also when replied to or forwarded) are downloaded, stored as a DSH file attachment and transcribed. The agent receives a note with the transcript, who transcribed it and the stored file's path, followed by the file itself. When transcription fails or is off, the file is still passed on and the note says why. A recording sent without text gets no "analyze the file" prompt: its transcript is the message.
