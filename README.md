@@ -33,6 +33,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Then enable **Disallow
 - Tool approvals with **Deny** / **Allow** buttons.
 - `ask_user_question` support: options, multi-select, custom answers and plan review.
 - Documents and photos sent in a session topic are saved as DSH attachments and passed to the agent.
+- Each prompt from Telegram records its sender on the message source as `principal`, the field DSH uses for who is behind a user message: `{ kind: 'telegram-user', channel: 'telegram', id: '123', name: 'Ana Silva', username: 'ana', chat: { id, thread, name } }`. Scripts and plugins that read session logs can tell which allowed user wrote what.
 - `/new`, `/last`, `/goal`, `/rename`, `/fork`, `/clear`, `/stop`, `/restart`, `/status` and `/menu`.
 - `/goal` shows the current DSH goal and the command hints. `/goal <objective>` creates or replaces the goal and starts working immediately; `/goal edit <objective>` updates the objective and resumes a paused, blocked or disarmed goal; `/goal pause`, `/goal resume` and `/goal clear` manage the current goal. `/goal <objective>` and `/goal edit <objective>` replace the current panel with one fresh message; later goal changes edit that message in place. The panel is never pinned.
 - `/new` in a session topic starts a fresh DSH session in the same workspace and binds it to the same topic; the previous session stays in DSH. In All it opens a new session topic.

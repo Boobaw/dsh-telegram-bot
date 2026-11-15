@@ -110,7 +110,7 @@ test('All message creates one topic, then the same topic continues', async () =>
                 message_id: 1,
                 date: 1,
                 chat: { id: 100, type: 'private' },
-                from: { id: 42 },
+                from: { id: 42, first_name: 'Ana', username: 'ana' },
                 message_thread_id: 1,
                 text: 'hello from All',
               },
@@ -150,6 +150,13 @@ test('All message creates one topic, then the same topic continues', async () =>
     assert.equal(topicCalls[0].body.name, 'New session')
     assert.equal(agent.received.length, 1, 'the initial prompt must reach the new agent')
     assert.equal(agent.received[0].content[0].text, 'hello from All')
+    const principal = agent.received[0].source.principal
+    assert.equal(principal.kind, 'telegram-user')
+    assert.equal(principal.id, '42')
+    assert.equal(principal.name, 'Ana')
+    assert.equal(principal.username, 'ana')
+    assert.equal(principal.chat.id, '100')
+    assert.equal(principal.chat.thread, 7001)
   } finally {
     cleanup()
     https.request = originalRequest
