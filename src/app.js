@@ -30,7 +30,8 @@ import {
   toTelegramMarkdown,
   toolArg,
 } from './formatting.js'
-import { admitText } from './admission.js'
+import { admitText, promptRequestId } from './admission.js'
+import { MAX_PENDING_PRINCIPALS, createPrincipalTagger, telegramUserPrincipal } from './sender.js'
 import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, messageBody, repliedMessage } from './message-context.js'
 import { loadState, loadTopics, STATE_PATH, TOPICS_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
@@ -84,6 +85,10 @@ export function apply(ctx, config) {
   const chats = new Map()
   /** Per-chat token buckets for outbound Bot API traffic. */
   const outboundStates = new Map()
+  // Telegram senders by `<chatId>:<messageId>`, kept from routing until the
+  // prompt reaches DSH.
+  const promptSenders = new Map()
+  const principals = createPrincipalTagger()
   /** Agent API calls use this lifetime; the bot polling lifetime is separate. */
   const bridgeAbort = new AbortController()
   /** Control chat id used for lifecycle notifications. */
@@ -2355,13 +2360,15 @@ export function apply(ctx, config) {
     chat.lastEdit = Date.now()
     try {
       const agent = await ensureAgent(chat)
+      const principal = promptPrincipal(chat, messageId)
       let admitted = false
       if (nativeText) {
+        principals.remember(promptRequestId(chat.chatId, messageId), principal)
         admitted = admitText(ctx, { sessionId: chat.sessionId, chatId: chat.chatId, messageId, text }, signal)
         if (admitted !== false) await admitted
       }
       if (!admitted) {
-        agent.followup({ id: randomUUID(), role: 'user', content: [...(text.trim().length === 0 ? [] : [{ type: 'text', text }]), ...attachments], source: { kind: 'user' } })
+        agent.followup({ id: randomUUID(), role: 'user', content: [...(text.trim().length === 0 ? [] : [{ type: 'text', text }]), ...attachments], source: { kind: 'user', ...(principal === undefined ? {} : { principal }) } })
       }
       // The turn/end listener finalizes the Telegram turn. whenIdle is only a
       // fallback for the turn that started this epoch, never a queued turn.
@@ -4408,7 +4415,30 @@ export function apply(ctx, config) {
       const ask = tr('Analyze the attached file.', 'Проанализируй приложенный файл.')
       text = text.length === 0 ? ask : `${text}\n\n${ask}`
     }
-    return { text, attachments, messageId: message.message_id }
+    return { text, attachments, messageId: message.message_id, from: message.from }
+  }
+
+  /**
+   * Keep who wrote a Telegram message until its prompt reaches DSH; a new
+   * topic, a session choice or the queue may come in between.
+   */
+  function rememberSender(chatId, messageId, from) {
+    if (!Number.isSafeInteger(messageId) || from === undefined || from === null) return
+    const key = `${chatId}:${messageId}`
+    promptSenders.delete(key)
+    promptSenders.set(key, from)
+    if (promptSenders.size > MAX_PENDING_PRINCIPALS) promptSenders.delete(promptSenders.keys().next().value)
+  }
+
+  /** The sender of a Telegram message as the principal for its prompt. */
+  function promptPrincipal(chat, messageId) {
+    const from = promptSenders.get(`${chat.chatId}:${messageId}`)
+    if (from === undefined) return undefined
+    return telegramUserPrincipal(from, {
+      chatId: chat.chatId,
+      threadId: chat.threadId,
+      topic: typeof chat.threadId === 'number' ? state.topicNames?.[`${chat.chatId}:${chat.threadId}`] : undefined,
+    })
   }
 
   /**
@@ -4416,6 +4446,7 @@ export function apply(ctx, config) {
    * or a turn in the bound session.
    */
   async function dispatchPrompt(chatState, chatId, threadId, prompt, signal) {
+    rememberSender(chatId, prompt.messageId, prompt.from)
     const route = routeMessage({ threadId, inSession: typeof chatState.sessionId === 'string' })
     if (route === 'new-topic') {
       await createNewSessionTopic(chatId, threadId, signal, defaultWorkspaceCwd(), prompt.text, prompt.attachments, prompt.messageId)
@@ -4452,6 +4483,7 @@ export function apply(ctx, config) {
         text: prompts.map((item) => item.text).filter((text) => text.length > 0).join('\n\n'),
         attachments: prompts.flatMap((item) => item.attachments),
         messageId: prompts[0].messageId,
+        from: prompts[0].from,
       }
       fireAndForget('forward-batch', () => dispatchPrompt(chatState, chatId, threadId, merged, signal))
     }, FORWARD_BATCH_MS)
@@ -5135,6 +5167,8 @@ export function apply(ctx, config) {
     return () => outbox.stop()
   }, 'dsh-telegram-bot: outbox')
 
+  // Record each Telegram sender on the prompt the session controller built for it.
+  ctx.on('agent/pre-step', (payload, next) => principals.preStep(payload, next), { global: true })
   ctx.on('settings/document-updated', (ns) => {
     if (ns === name) scheduleRestart('settings')
   })
