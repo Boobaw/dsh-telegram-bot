@@ -93,6 +93,8 @@ export function apply(ctx, config) {
   const bridgeAbort = new AbortController()
   /** Control chat id used for lifecycle notifications. */
   let topics = { chatId: 0 }
+  /** Set once the mapping and topic files have been read. */
+  let stateLoaded = false
   /** Resolves after the mapping and topic files have been read. */
   const stateReady = Promise.all([
     loadState().then((loaded) => { state = loaded }),
@@ -121,6 +123,7 @@ export function apply(ctx, config) {
           state.topicNames[key] = record.title.trim()
         }
       }
+      stateLoaded = true
     })
 
   /**
@@ -144,6 +147,11 @@ export function apply(ctx, config) {
    */
   async function chatFor(chatId, threadId) {
     await stateReady
+    return loadedChat(chatId, threadId)
+  }
+
+  /** Resolve one chat's bridge state once the state file has been read. */
+  function loadedChat(chatId, threadId) {
     const key = `${chatId}:${threadId ?? 0}`
     let chat = chats.get(key)
     if (chat === undefined) {
@@ -1703,7 +1711,8 @@ export function apply(ctx, config) {
     })
     agent.ctx.on('agent/assistant-stream', (payload) => {
       try {
-        if (chat.boundAgent !== agent) return
+        // Mirrored turns get their frames from the Host-wide listener.
+        if (chat.boundAgent !== agent || chat.turnSource === 'mirror') return
         onFrame(chat, payload?.frame)
       } catch (error) {
         reportError('assistant-stream', error)
@@ -2132,7 +2141,7 @@ export function apply(ctx, config) {
    * @param frame - stream frame.
    */
   function onFrame(chat, frame) {
-    if (frame === undefined || chat.done || (chat.turnSource !== 'telegram' && chat.turnSource !== 'goal')) return
+    if (frame === undefined || chat.done || (chat.turnSource !== 'telegram' && chat.turnSource !== 'goal' && chat.turnSource !== 'mirror')) return
     if (frame.type === 'chunk' && frame.chunk?.type === 'block-start' && frame.chunk.blockType === 'reasoning') {
       if (chat.thinkingText.length > 0 && !chat.thinkingText.endsWith('\n')) chat.thinkingText += '\n'
       return
@@ -2445,6 +2454,141 @@ export function apply(ctx, config) {
       if (chat.tools.length > 0) fireAndForget('tool-flush-now', () => flushTool(chat))
     })
     return true
+  }
+
+  /**
+   * The topic currently bound to a session, without waiting. Host events
+   * arrive synchronously, so nothing is mirrored before the state is read.
+   */
+  function boundChat(sessionId) {
+    if (!stateLoaded || typeof sessionId !== 'string') return undefined
+    const record = state.sessions[sessionId]
+    if (typeof record?.chatId !== 'number' || typeof record.threadId !== 'number') return undefined
+    if (state.threads[`${record.chatId}:${record.threadId}`] !== sessionId) return undefined
+    return loadedChat(record.chatId, record.threadId)
+  }
+
+  /**
+   * Label for a prompt that came from outside Telegram, or undefined when the
+   * message came from Telegram or is not something a person or a schedule sent.
+   */
+  function mirrorLabel(source) {
+    if (source?.kind === 'schedule') return tr('⏰ Scheduled task', '⏰ Задача по расписанию')
+    if (source?.kind !== 'user') return undefined
+    if (typeof source.rpcId === 'string' && source.rpcId.startsWith('telegram')) return undefined
+    if (source.principal?.kind === 'telegram-user') return undefined
+    return tr('🖥 From Web', '🖥 Из Web')
+  }
+
+  /** Plain-text copy of a mirrored prompt: its label, text and file count. */
+  function mirrorPromptText(label, message) {
+    const content = Array.isArray(message?.content) ? message.content : []
+    const text = content.filter((block) => block?.type === 'text').map((block) => block.text).join('\n').trim()
+    const files = content.filter((block) => block?.type === 'image' || block?.type === 'file').length
+    if (text.length === 0 && files === 0) return undefined
+    const clipped = clipPreview(text, 3500)
+    return `${label}:\n${clipped}${clipped.length < text.length ? '…' : ''}${files === 0 ? '' : `\n📎 ${files}`}`
+  }
+
+  /**
+   * Show a turn that started outside Telegram in its topic: the prompt, then
+   * reasoning, tool calls and the answer, the same way as a goal round.
+   */
+  function adoptMirrorTurn(chat, turn, prompt) {
+    const epoch = (chat.turnEpoch ?? 0) + 1
+    chat.busy = true
+    chat.done = false
+    chat.turnSource = 'mirror'
+    chat.awaitingTurn = false
+    chat.activeTurn = turn
+    chat.turnEpoch = epoch
+    chat.toolEpoch = (chat.toolEpoch ?? 0) + 1
+    chat.text = ''
+    chat.lastText = ''
+    chat.messageId = null
+    chat.adopting = true
+    clearEditTimer(chat)
+    resetAux(chat)
+    chat.answerEdit = Promise.resolve()
+    startTyping(chat)
+    const current = () => !chat.done && chat.turnSource === 'mirror' && chat.turnEpoch === epoch
+    chat.mirrorStart = (async () => {
+      if (prompt !== undefined) await sendPlain(chat.chatId, prompt, bridgeAbort.signal, chat.threadId)
+      if (!current()) return
+      const answer = await sendPlain(chat.chatId, tr('⏳ Generating…', '⏳ Генерирую…'), bridgeAbort.signal, chat.threadId)
+      if (!current()) {
+        if (answer?.message_id !== undefined) await deleteMessage(chat.chatId, chat.threadId, answer.message_id)
+        return
+      }
+      chat.messageId = answer?.message_id ?? null
+      if (readLive(config.showThinking, true) === true) {
+        const thinking = await sendPlain(chat.chatId, '💭 Thinking…', bridgeAbort.signal, chat.threadId)
+        if (!current()) {
+          if (thinking?.message_id !== undefined) await deleteMessage(chat.chatId, chat.threadId, thinking.message_id)
+          return
+        }
+        chat.thinkingMessageId = thinking?.message_id ?? null
+      }
+      chat.lastEdit = Date.now()
+      chat.adopting = false
+      scheduleFlush(chat)
+      if (chat.thinkingText.length > 0) scheduleThinking(chat)
+      if (chat.tools.length > 0) fireAndForget('tool-flush-now', () => flushTool(chat))
+    })().catch((error) => reportError('mirror-turn', error)).finally(() => {
+      if (chat.turnEpoch === epoch) chat.adopting = false
+    })
+  }
+
+  /**
+   * Host-wide session events, for `mirrorTurns`. A turn is adopted only when
+   * its topic is idle and its prompt did not come from Telegram, so Telegram
+   * turns and goal rounds never pass through here.
+   */
+  function onMirrorEvent(session, event) {
+    if (readLive(config.mirrorTurns, false) !== true || lifetime === undefined) return
+    const chat = boundChat(session?.id)
+    if (chat === undefined) return
+    if (event.type === 'turn/start') {
+      const idle = !chat.busy && !chat.finalizing && chat.turnSource === undefined
+      chat.mirrorCandidate = idle ? event.data?.turn : undefined
+      return
+    }
+    if (event.type === 'user/message') {
+      const source = event.data?.source
+      const label = mirrorLabel(source)
+      if (label === undefined) {
+        // A Telegram prompt or goal round owns this turn.
+        if (source?.kind === 'goal' || source?.kind === 'user') chat.mirrorCandidate = undefined
+        return
+      }
+      const prompt = mirrorPromptText(label, event.data)
+      if (chat.turnSource === 'mirror') {
+        // Another message sent into the turn that is already shown.
+        if (prompt !== undefined) fireAndForget('mirror-prompt', () => sendPlain(chat.chatId, prompt, bridgeAbort.signal, chat.threadId))
+        return
+      }
+      const turn = chat.mirrorCandidate
+      chat.mirrorCandidate = undefined
+      if (turn === undefined || chat.busy || chat.finalizing || chat.turnSource !== undefined) return
+      adoptMirrorTurn(chat, turn, prompt)
+      return
+    }
+    if (event.type === 'turn/end') {
+      const turn = event.data?.turn
+      if (chat.mirrorCandidate === turn) chat.mirrorCandidate = undefined
+      if (chat.turnSource !== 'mirror' || turn !== chat.activeTurn) return
+      const reason = event.data?.reason
+      if (reason?.kind === 'error') {
+        const failure = `❌ ${reason.error?.message ?? tr('The turn failed.', 'Ход завершился ошибкой.')}`
+        chat.text = chat.text.trim().length > 0 ? `${chat.text}\n\n${failure}` : failure
+      }
+      // Finish after the prompt and placeholder went out, so the answer
+      // lands below them; /stop may have ended the turn meanwhile.
+      const epoch = chat.turnEpoch
+      void (chat.mirrorStart ?? Promise.resolve()).then(() => {
+        if (chat.turnSource === 'mirror' && chat.turnEpoch === epoch) finalizeSafely(chat)
+      })
+    }
   }
 
   /**
@@ -5169,6 +5313,25 @@ export function apply(ctx, config) {
 
   // Record each Telegram sender on the prompt the session controller built for it.
   ctx.on('agent/pre-step', (payload, next) => principals.preStep(payload, next), { global: true })
+  // Turns started outside Telegram, when `mirrorTurns` is on. These listen on
+  // every session because a session resumed by the Web UI has no per-agent
+  // listener from this plugin.
+  ctx.on('session/event', (session, event) => {
+    try {
+      onMirrorEvent(session, event)
+    } catch (error) {
+      reportError('mirror-event', error)
+    }
+  }, { global: true })
+  ctx.on('agent/assistant-stream', (payload) => {
+    try {
+      if (readLive(config.mirrorTurns, false) !== true) return
+      const chat = boundChat(payload?.agent?.session?.id)
+      if (chat !== undefined && chat.turnSource === 'mirror') onFrame(chat, payload.frame)
+    } catch (error) {
+      reportError('mirror-stream', error)
+    }
+  }, { global: true })
   ctx.on('settings/document-updated', (ns) => {
     if (ns === name) scheduleRestart('settings')
   })
