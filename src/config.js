@@ -33,6 +33,13 @@ export const Config = z.object({
   cwd: z.string().default(process.cwd()).volatile(),
   /** Agent preset mounted for Telegram-created sessions when presets exist. */
   agentPreset: z.string().default('standard').volatile(),
+  /**
+   * Time zone of the people writing to the bot (IANA name such as
+   * `Europe/Berlin`). When set, the agent is told when each Telegram message
+   * was sent, in this zone, and DSH gets it as the prompt's client zone.
+   * Empty leaves both off.
+   */
+  timeZone: z.string().default('').volatile(),
   /** Mirror model reasoning deltas into the session topic. */
   showThinking: z.boolean().default(true).volatile(),
   /** Mirror tool calls into the session topic. */

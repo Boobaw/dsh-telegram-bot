@@ -79,6 +79,7 @@ Restart `dsh web` after installing or updating the plugin. Then open **Settings 
 | Show tool calls | Show tool calls in a temporary message |
 | Bot language | `en` (default) or `ru` |
 | Enable bot | Start or pause Telegram polling |
+| `timeZone` | IANA zone of the people writing to the bot, such as `Europe/Berlin`. When set, each prompt comes right after a short notice saying when the message was sent, such as `[Telegram message, sent Mon 2026-03-02 09:41 UTC+01:00]`, and DSH gets the zone as the prompt's client zone, so the [time-context](https://www.npmjs.com/package/@deepseek-ai/dsh-time-context) clock reads in it. Empty (default) leaves both off. No control on the settings page yet; set it under the `telegram-bot` row's `config` in `cordis.patch.yml` |
 
 The token field only reports whether a token is configured. A token supplied through the environment cannot be overwritten from the page.
 

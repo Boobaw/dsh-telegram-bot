@@ -9,7 +9,7 @@ export function promptRequestId(chatId, messageId) {
  * Admit text into the native session queue. Returns false when the mounted
  * controller has no prompt method so the caller can use its legacy path.
  */
-export function admitText(ctx, { sessionId, chatId, messageId, text }, signal) {
+export function admitText(ctx, { sessionId, chatId, messageId, text, clientTimeZone }, signal) {
   const controller = ctx.get('sessionController')
   if (typeof controller?.prompt !== 'function') return false
   return controller.prompt({
@@ -17,5 +17,6 @@ export function admitText(ctx, { sessionId, chatId, messageId, text }, signal) {
     requestId: promptRequestId(chatId, messageId),
     mode: 'queue',
     content: text.trim().length > 0 ? [{ type: 'text', text }] : [],
+    ...(clientTimeZone === undefined ? {} : { clientTimeZone }),
   }, signal)
 }
