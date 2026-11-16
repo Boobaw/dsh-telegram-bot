@@ -24,12 +24,13 @@ async function loadState() {
         directChats: parsed.directChats !== null && typeof parsed.directChats === 'object' && !Array.isArray(parsed.directChats) ? parsed.directChats : {},
         directTopics: parsed.directTopics !== null && typeof parsed.directTopics === 'object' && !Array.isArray(parsed.directTopics) ? parsed.directTopics : {},
         goalPanels: parsed.goalPanels !== null && typeof parsed.goalPanels === 'object' && !Array.isArray(parsed.goalPanels) ? parsed.goalPanels : (parsed.goalPins !== null && typeof parsed.goalPins === 'object' && !Array.isArray(parsed.goalPins) ? parsed.goalPins : {}),
+        goalOrigins: parsed.goalOrigins !== null && typeof parsed.goalOrigins === 'object' && !Array.isArray(parsed.goalOrigins) ? parsed.goalOrigins : {},
       }
     }
   } catch {
     // Missing or corrupt state is nonfatal; the next session creates a mapping.
   }
-  return { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {}, directChats: {}, directTopics: {}, goalPanels: {} }
+  return { version: 2, sessions: {}, threads: {}, updateLedger: {}, updateOffset: 0, topicNames: {}, directChats: {}, directTopics: {}, goalPanels: {}, goalOrigins: {} }
 }
 
 /** Durable control-chat id for lifecycle notifications. */

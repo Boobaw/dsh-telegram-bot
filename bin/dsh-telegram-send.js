@@ -10,12 +10,15 @@ import { resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import { enqueue, waitForResult } from '../src/outbox.js'
 
-const usage = `Usage: dsh-telegram-send --topic <name|thread-id> [--file <path>]... [--from <label>]
+const usage = `Usage: dsh-telegram-send --topic <name|thread-id> [--chat <chat-id>] [--file <path>]... [--from <label>]
                          [--no-wait] [--timeout <seconds>] [text...]
 
 Sends text (from the arguments, or from stdin when none are given) and files
 into a topic of the running DSH Telegram bot. The message is also recorded in
 the session bound to that topic. Topic names ignore case.
+
+The chat comes from the topic binding; --chat is only needed when several chats
+have a topic with the same name or thread id.
 
 Exit codes: 0 sent, 1 failed (for example an unknown topic), 2 bad arguments,
 3 still queued after the timeout (the bot sends it once it runs).`
@@ -26,6 +29,7 @@ try {
     allowPositionals: true,
     options: {
       topic: { type: 'string', short: 't' },
+      chat: { type: 'string', short: 'c' },
       file: { type: 'string', short: 'f', multiple: true },
       from: { type: 'string' },
       'no-wait': { type: 'boolean' },
@@ -46,6 +50,10 @@ if (values.topic === undefined || values.topic.trim().length === 0) {
   process.stderr.write(`--topic is required.\n\n${usage}\n`)
   process.exit(2)
 }
+if (values.chat !== undefined && !/^-?\d+$/u.test(values.chat.trim())) {
+  process.stderr.write(`--chat takes a numeric chat id.\n\n${usage}\n`)
+  process.exit(2)
+}
 
 let text = positionals.join(' ')
 if (positionals.length === 0 && !process.stdin.isTTY) text = readFileSync(0, 'utf8')
@@ -57,6 +65,7 @@ if (text.trim().length === 0 && files.length === 0) {
 
 const id = await enqueue({
   topic: values.topic,
+  ...(values.chat === undefined ? {} : { chat: values.chat.trim() }),
   text,
   files,
   ...(values.from === undefined ? {} : { from: { label: values.from } }),

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { enqueue, waitForResult } from '../src/outbox.js'
-import { isAutoCommandTopic, isTopicGone, topicNameOf, resolveTopicTarget, topicTargetFor, deliveredToTopic } from '../src/topics.js'
+import { isAutoCommandTopic, isTopicGone, topicNameOf, resolveTopicTarget, resolveSendTarget, topicTargetFor, deliveredToTopic } from '../src/topics.js'
 
 test('topic names are learned from creation and rename messages', () => {
   assert.deepEqual(topicNameOf({ forum_topic_created: { name: 'Build' } }), { name: 'Build', authoritative: true })
@@ -82,4 +82,17 @@ test('delivery checks require evidence of the target topic', () => {
   assert.equal(deliveredToTopic({}, {}, 200, 7001, { message_id: 1 }), false)
   // A channel direct-messages chat may use a distinct direct topic id.
   assert.equal(deliveredToTopic({}, { '200:7001': 2597 }, 200, 7001, { direct_messages_topic: { topic_id: 2597 } }), true)
+})
+
+
+test('programmatic sends resolve the chat that owns the topic', () => {
+  const keys = ['100:7001', '200:7001', '300:8001']
+  const names = { '100:7001': 'Build', '200:7001': 'Build', '300:8001': 'Other' }
+  assert.deepEqual(resolveSendTarget(keys, names, undefined, 8001), { chatId: 300, threadId: 8001, name: 'Other' })
+  assert.deepEqual(resolveSendTarget(keys, names, 100, 7001), { chatId: 100, threadId: 7001, name: 'Build' })
+  assert.deepEqual(resolveSendTarget(keys, names, '200', 'Build'), { chatId: 200, threadId: 7001, name: 'Build' })
+  assert.throws(() => resolveSendTarget(keys, names, undefined, 7001), /several chats/)
+  assert.throws(() => resolveSendTarget(keys, names, undefined, 'Build'), /several chats/)
+  assert.throws(() => resolveSendTarget(keys, names, undefined, 9999), /Unknown Telegram topic/)
+  assert.throws(() => resolveSendTarget(keys, names, 100, 8001), /Unknown Telegram topic/)
 })

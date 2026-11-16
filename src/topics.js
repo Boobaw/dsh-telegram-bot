@@ -91,6 +91,59 @@ export function deliveredToTopic(directChats, directTopics, chatId, threadId, de
 }
 
 /**
+ * Resolve a programmatic send target to the chat that owns the topic. Thread
+ * ids belong to one chat, so the chat comes from where the bot saw the topic,
+ * not from whichever chat wrote to the bot last. An explicit `chat` is kept and
+ * must own the topic; an ambiguous or unknown target fails instead of guessing.
+ * @param keys - known `"<chatId>:<threadId>"` keys.
+ * @param names - `{ "<chatId>:<threadId>": name }`.
+ * @param chat - chat id named by the caller, or undefined to use the owner.
+ * @param target - topic name or numeric thread id.
+ * @returns `{ chatId, threadId, name }`.
+ */
+export function resolveSendTarget(keys, names, chat, target) {
+  const raw = String(target ?? '').trim()
+  if (raw.length === 0) throw new Error('A topic name or thread id is required.')
+  const entries = new Map()
+  for (const key of keys ?? []) {
+    const match = /^(-?\d+):(\d+)$/u.exec(String(key))
+    if (match === null) continue
+    const chatId = Number(match[1])
+    const threadId = Number(match[2])
+    if (!Number.isSafeInteger(chatId) || !Number.isSafeInteger(threadId) || threadId <= 0) continue
+    entries.set(`${chatId}:${threadId}`, { chatId, threadId, name: names?.[key] })
+  }
+  const wantedRaw = chat === undefined || chat === null ? '' : String(chat).trim()
+  let wantedChat
+  if (wantedRaw.length > 0) {
+    if (!/^-?\d+$/u.test(wantedRaw)) throw new Error(`"${wantedRaw}" is not a Telegram chat id.`)
+    wantedChat = Number(wantedRaw)
+    if (!Number.isSafeInteger(wantedChat)) throw new Error(`"${wantedRaw}" is not a Telegram chat id.`)
+  }
+  let candidates
+  if (/^\d+$/u.test(raw)) {
+    const threadId = Number(raw)
+    if (!Number.isSafeInteger(threadId) || threadId <= 0 || threadId > 2_147_483_647) {
+      throw new Error(`"${raw}" is not a Telegram topic id. Use /id inside the topic to read its thread id.`)
+    }
+    candidates = [...entries.values()].filter((entry) => entry.threadId === threadId)
+  } else {
+    const wanted = raw.toLocaleLowerCase()
+    candidates = [...entries.values()].filter((entry) => typeof entry.name === 'string' && entry.name.trim().toLocaleLowerCase() === wanted)
+  }
+  if (wantedChat !== undefined) {
+    const found = candidates.find((entry) => entry.chatId === wantedChat)
+    if (found === undefined) throw new Error(`Unknown Telegram topic "${raw}" in chat ${wantedChat}.`)
+    return found
+  }
+  if (candidates.length === 0) throw new Error(`Unknown Telegram topic "${raw}". Use /sessions or /id to find the topic.`)
+  const chats = [...new Set(candidates.map((entry) => entry.chatId))]
+  if (chats.length > 1) throw new Error(`Topic "${raw}" exists in several chats (${chats.join(', ')}); name the chat to send to.`)
+  if (candidates.length > 1) throw new Error(`Several Telegram topics in chat ${chats[0]} are named "${raw}".`)
+  return candidates[0]
+}
+
+/**
  * Resolve a send target: a numeric thread id, or a topic name compared
  * without regard to case.
  * @param names - `{ "<chatId>:<threadId>": name }`.

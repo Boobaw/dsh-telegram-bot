@@ -159,6 +159,7 @@ test('private-chat topics send with message_thread_id and edit by message id', a
     // Older versions cached a service-message id here; it must be dropped.
     directChats: { 100: true },
     directTopics: { '100:7001': 2597 },
+    goalOrigins: { 'goal-1': { sessionId: 'session-1', chatId: 100, threadId: 7001, at: 1 } },
   }))
   await writeFile(join(STATUS_DIR, 'topics.json'), JSON.stringify({ chatId: 100 }))
   const host = makeHost()
@@ -273,6 +274,28 @@ test('private-chat topics send with message_thread_id and edit by message id', a
         && typeof call.body?.text === 'string' && call.body.text.includes('bash')),
       'goal round tool call is mirrored into the topic',
     )
+
+    // A goal started in the Web UI has no Telegram origin: its rounds must not
+    // be mirrored into this topic.
+    agent.emit('session/event', { id: 'session-1' }, { type: 'turn/start', data: { turn: 'gweb' } })
+    agent.emit('session/event', { id: 'session-1' }, {
+      type: 'user/message',
+      data: {
+        source: { kind: 'goal', goalId: 'goal-web', revision: 1, round: 1 },
+        content: [{ type: 'text', text: '<goal_round>' }],
+        role: 'user',
+      },
+    })
+    agent.emit('agent/assistant-stream', {
+      frame: { type: 'chunk', chunk: { type: 'text-delta', text: 'Web goal answer' } },
+    })
+    await wait(300)
+    agent.emit('session/event', { id: 'session-1' }, { type: 'turn/end', data: { turn: 'gweb', reason: { kind: 'completed' } } })
+    await wait(250)
+    assert.ok(!telegram.calls.some((call) =>
+      (call.method === 'sendMessage' || call.method === 'editMessageText')
+      && typeof call.body?.text === 'string'
+      && call.body.text.includes('Web goal answer')), 'Web-initiated goal work stays out of Telegram')
 
     // A second autonomous round must be adopted again after the first one.
     agent.emit('session/event', { id: 'session-1' }, { type: 'turn/start', data: { turn: 'g2' } })

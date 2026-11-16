@@ -6,10 +6,8 @@ import { basename, extname, isAbsolute, resolve } from 'node:path'
 import {
   BOT_COMMANDS,
   BOT_COMMANDS_RU,
-  EFFORT_CHOICES,
   FORWARD_BATCH_MS,
   MAX_TELEGRAM_TEXT,
-  MODEL_CHOICES,
   POLL_TIMEOUT_SECONDS,
   RESTART_DEBOUNCE_MS,
   RETRY_DELAY_MS,
@@ -37,7 +35,8 @@ import { composePrompt, DOWNLOAD_LIMIT_BYTES, downloadableFile, isForwarded, mes
 import { loadState, loadTopics, STATE_PATH, TOPICS_PATH } from './state.js'
 import { createUpdateAdmission } from './update-ledger.js'
 import { createOutbox } from './outbox.js'
-import { deliveredToTopic, isAutoCommandTopic, isTopicGone, resolveTopicTarget, topicNameOf, topicTargetFor } from './topics.js'
+import { deliveredToTopic, isAutoCommandTopic, isTopicGone, resolveSendTarget, resolveTopicTarget, topicNameOf, topicTargetFor } from './topics.js'
+import { catalogKey, createModelCatalog, effortChoices, effortName, findModel, modelByKey, modelName, pageOf, pickedSelection, providerByKey, sessionModelOf, sameSelection } from './models.js'
 import { publishStatus } from './status.js'
 import {
   allowedChatsOf,
@@ -318,38 +317,24 @@ export function apply(ctx, config) {
     })
   }
 
-  /** Cached provider model names, populated from the live catalog. */
-  let modelChoicesCache
-
-  /**
-   * Load model ids and the exact display names used by the Web model picker.
-   * @returns model choices.
-   */
-  async function loadModelChoices() {
-    if (modelChoicesCache !== undefined) return modelChoicesCache
-    try {
-      const models = await ctx.get('llm')?.listModels('deepseek-official')
-      const choices = []
-      for (const wanted of MODEL_CHOICES) {
-        const found = models?.find((entry) => entry.id === wanted.id)
-        choices.push({ id: wanted.id, label: found?.name ?? wanted.label })
+  /** @returns the session's current model, read from the live agent when possible. */
+  async function currentModel(chat) {
+    const live = await sessionModelOf(ctx, chat.sessionId)
+    if (live !== undefined) {
+      const selection = selectionForChat(chat)
+      if (!sameSelection(selection.current, live)) {
+        selection.current = live
+        selection.assembled = undefined
+        await persistPreferences(chat)
       }
-      modelChoicesCache = choices
-    } catch {
-      modelChoicesCache = MODEL_CHOICES
+      return live
     }
-    return modelChoicesCache
+    return selectionForChat(chat).current
   }
 
-  /** @returns the display label for a model id. */
-  function modelLabel(model) {
-    return (modelChoicesCache ?? MODEL_CHOICES).find((choice) => choice.id === model)?.label ?? String(model ?? '?')
-  }
-
-  /** @returns the display label for an effort id. */
-  function effortLabel(effort) {
-    if (effort === undefined) return tr('Default', 'По умолчанию')
-    return EFFORT_CHOICES.find((choice) => choice.id === effort)?.label ?? String(effort)
+  /** @returns the label for a model's provider-default effort. */
+  function defaultEffortLabel() {
+    return tr('Default', 'По умолчанию')
   }
 
   /**
@@ -546,30 +531,50 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Apply the selected permission preset to a live session.
-   * @param chat - chat bridge state.
-   * @param agent - live agent.
+   * Record the session's own permission preset for the topic menu. The session
+   * owns its access mode: a Telegram change writes it directly, and changes
+   * made in the Web UI must never be overwritten by a cached copy here.
    */
-  async function applyPermission(chat, agent) {
+  async function syncPermission(chat, agent) {
     const service = ctx.get('permissionPresets')
     if (service === undefined) return
     try {
-      if (chat.permission === undefined) {
-        chat.permission = typeof service.current === 'function'
-          ? service.current(agent.session)
-          : service.defaultPreset
-        await persistPreferences(chat)
-        return
-      }
-      if (typeof service.set === 'function') {
-        service.set(agent.session, chat.permission)
-      } else {
-        applyPermissionFallback(chat, agent, chat.permission)
-      }
+      const current = typeof service.current === 'function'
+        ? service.current(agent.session)
+        : chat.permission ?? service.defaultPreset
+      if (current === undefined || current === chat.permission) return
+      chat.permission = current
       await persistPreferences(chat)
     } catch (error) {
-      warn(`permission set failed: ${messageOf(error)}`)
+      warn(`permission read failed: ${messageOf(error)}`)
     }
+  }
+
+  /** @returns the live agent for a chat, when there is one. */
+  function liveAgentFor(chat) {
+    if (typeof chat.sessionId !== 'string') return undefined
+    try {
+      return ctx.get('agents')?.get(chat.sessionId)
+    } catch {
+      return undefined
+    }
+  }
+
+  /** Read the live agent's model/effort so Web-side changes reach the topic menu. */
+  async function syncSelection(chat, agent = liveAgentFor(chat)) {
+    const current = agent?.model?.current?.()
+    if (current === undefined || typeof current.provider !== 'string' || typeof current.model !== 'string') return
+    const selection = selectionForChat(chat)
+    const next = {
+      provider: current.provider,
+      model: current.model,
+      reasoningEffort: current.reasoningEffort,
+    }
+    const old = selection.current
+    if (old.provider === next.provider && old.model === next.model && old.reasoningEffort === next.reasoningEffort) return
+    selection.current = next
+    selection.assembled = undefined
+    await persistPreferences(chat)
   }
 
   /** @returns a compact token count, e.g. 1M or 12.3k. */
@@ -620,6 +625,7 @@ export function apply(ctx, config) {
     return { windowSize, used, inputTokens, cacheRead }
   }
 
+  const modelCatalog = createModelCatalog(ctx)
   const logger = ctx.logger
   const info = (message) => logger?.info?.(`[telegram] ${message}`)
   const warn = (message) => logger?.warn?.(`[telegram] ${message}`)
@@ -1675,7 +1681,7 @@ export function apply(ctx, config) {
             if (goals === undefined) return
             try {
               const view = goals.get(agent)
-              if (view === undefined) await clearGoalPanel(chat, bridgeAbort.signal)
+              if (view === undefined || !goalIsTelegram(chat, view.id)) await clearGoalPanel(chat, bridgeAbort.signal)
               else await renderGoalPanel(chat, view, bridgeAbort.signal, 'update-only')
             } catch (error) {
               reportError('goal-panel-change', error)
@@ -1827,7 +1833,8 @@ export function apply(ctx, config) {
       if (live !== undefined) {
         if (typeof live.session?.header?.cwd === 'string') chat.cwd = live.session.header.cwd
         attachAgent(live, chat)
-        await applyPermission(chat, live)
+        await syncPermission(chat, live)
+        await syncSelection(chat, live)
         return live
       }
       try {
@@ -1840,7 +1847,8 @@ export function apply(ctx, config) {
         const agent = resumed?.agent ?? resumed
         if (typeof agent?.session?.header?.cwd === 'string') chat.cwd = agent.session.header.cwd
         attachAgent(agent, chat)
-        await applyPermission(chat, agent)
+        await syncPermission(chat, agent)
+        await syncSelection(chat, agent)
         info(`resumed Telegram session ${chat.sessionId}`)
         return agent
       } catch (error) {
@@ -1865,7 +1873,8 @@ export function apply(ctx, config) {
         await bindSession(chat, sessionId, '', targetCwd)
         await attachToWorkspace(sessionId, targetCwd)
         attachAgent(agent, chat)
-        await applyPermission(chat, agent)
+        await syncPermission(chat, agent)
+        await syncSelection(chat, agent)
         info(`created Telegram session ${sessionId} via sessionController`)
         return agent
       } catch (error) {
@@ -1880,7 +1889,8 @@ export function apply(ctx, config) {
     await bindSession(chat, sessionId, '', targetCwd)
     await attachToWorkspace(sessionId, meta.cwd)
     attachAgent(handle.agent, chat)
-    await applyPermission(chat, handle.agent)
+    await syncPermission(chat, handle.agent)
+    await syncSelection(chat, handle.agent)
     info(`created Telegram session ${sessionId}`)
     return handle.agent
   }
@@ -2370,6 +2380,7 @@ export function apply(ctx, config) {
    * user-initiated turn. The goal-round driver queues these turns itself.
    */
   function adoptGoalTurn(chat, source, turn = chat.pendingTurn) {
+    if (typeof source?.goalId !== 'string' || !goalIsTelegram(chat, source.goalId)) return false
     if (chat.busy || chat.turnSource !== undefined || chat.finalizing) {
       chat.queuedGoalTurn = { turn, source, ended: false }
       return false
@@ -2463,7 +2474,7 @@ export function apply(ctx, config) {
         reply_markup: { inline_keyboard: keyboard },
       }, signal)
     } catch (error) {
-      if (!signal.aborted) warn(`sendKeyboard failed: ${messageOf(error)}`)
+      if (!signal.aborted) reportError('keyboard-send', error)
       return undefined
     }
   }
@@ -2523,32 +2534,42 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Publish a lifecycle notification into All.
+   * Publish a global lifecycle notification to every allowed private chat and
+   * group. Startup messages are easy to lose during a restart, so each target
+   * gets a few attempts; one unreachable target must not hide the notice from
+   * the others.
    * @param text - HTML-safe body.
    * @param signal - request lifetime.
+   * @returns whether at least one target accepted the notice.
    */
   async function notifyAll(text, signal) {
-    if (topics.chatId === 0) return false
+    const recipients = new Set()
+    for (const id of [...allowedUsersOf(config), ...allowedChatsOf(config)]) {
+      const value = String(id ?? '').trim()
+      if (/^-?\d+$/u.test(value)) recipients.add(value)
+    }
+    if (topics.chatId !== 0) recipients.add(String(topics.chatId))
+    let sent = 0
     let lastError
-    // Startup messages are easy to lose during a restart: the bot may still be
-    // reconnecting to the network or Telegram may answer 429. Retry a few times
-    // instead of silently dropping the lifecycle notice.
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        await call('sendMessage', {
-          chat_id: topics.chatId,
-          text,
-          parse_mode: 'HTML',
-        }, signal)
-        return true
-      } catch (error) {
-        lastError = error
-        if (signal.aborted) return false
-        if (attempt < 2) await sleep(500 * (attempt + 1), signal)
+    for (const chatId of recipients) {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          await call('sendMessage', {
+            chat_id: Number(chatId),
+            text,
+            parse_mode: 'HTML',
+          }, signal)
+          sent += 1
+          break
+        } catch (error) {
+          lastError = error
+          if (signal.aborted) return sent > 0
+          if (attempt < 2) await sleep(500 * (attempt + 1), signal)
+        }
       }
     }
-    if (!signal.aborted) warn(`lifecycle notification failed: ${messageOf(lastError)}`)
-    return false
+    if (sent === 0 && !signal.aborted) warn(`lifecycle notification failed: ${messageOf(lastError)}`)
+    return sent > 0
   }
 
   /** @returns the display name for a permission preset. */
@@ -2567,8 +2588,9 @@ export function apply(ctx, config) {
    * @returns inline-keyboard rows.
    */
   async function controlKeyboard(chat) {
-    await loadModelChoices()
-    const current = selectionForChat(chat).current
+    await hydrateSelection(chat)
+    const catalog = await modelCatalog.load()
+    const current = await currentModel(chat)
     const permission = currentPermission(chat)
     const context = await contextSummary(chat)
     const contextLabel = context.used === undefined
@@ -2576,8 +2598,8 @@ export function apply(ctx, config) {
       : `${formatTokens(context.used)}/${formatTokens(context.windowSize)}`
     return [
       [
-        { text: `🤖 ${modelLabel(current.model)}`, callback_data: 'o:model' },
-        { text: `🧠 ${tr('Effort', 'Усилие')}: ${effortLabel(current.reasoningEffort)}`, callback_data: 'o:effort' },
+        { text: `🤖 ${modelName(catalog, current)}`, callback_data: 'o:model' },
+        { text: `🧠 ${tr('Effort', 'Усилие')}: ${effortName(catalog, current, defaultEffortLabel())}`, callback_data: 'o:effort' },
       ],
       [
         { text: `🛡 ${permissionLabel(permission)}`, callback_data: 'o:mode' },
@@ -2594,19 +2616,26 @@ export function apply(ctx, config) {
    * @param signal - request lifetime.
    * @param messageId - panel message to edit.
    */
-  async function sendMenu(chatId, threadId, chat, signal, messageId) {
+  async function sendMenu(chatId, threadId, chat, signal, messageId, forceNew = false) {
     try {
       await hydrateSelection(chat)
       const keyboard = await controlKeyboard(chat)
-      const target = messageId ?? chat.panelMessageId
-      if (target !== undefined && await editKeyboard(chatId, threadId, target, `<b>${tr('Session controls', 'Управление сессией')}</b>`, keyboard, signal)) {
-        chat.panelMessageId = target
-        return
+      if (!forceNew) {
+        const target = messageId ?? chat.panelMessageId
+        if (target !== undefined && await editKeyboard(chatId, threadId, target, `<b>${tr('Session controls', 'Управление сессией')}</b>`, keyboard, signal)) {
+          chat.panelMessageId = target
+          return
+        }
+      } else if (typeof chat.panelMessageId === 'number') {
+        // /menu asks for a visible panel, not a silent edit of an old one.
+        await deleteMessage(chatId, threadId, chat.panelMessageId)
+        chat.panelMessageId = undefined
       }
       const result = await sendKeyboard(chatId, threadId, `<b>${tr('Session controls', 'Управление сессией')}</b>`, keyboard, signal)
       if (typeof result?.message_id === 'number') chat.panelMessageId = result.message_id
+      else throw new Error('session controls message was not sent')
     } catch (error) {
-      if (!signal.aborted) warn(`sendMenu failed: ${messageOf(error)}`)
+      if (!signal.aborted) reportError('menu', error)
     }
   }
 
@@ -2615,16 +2644,83 @@ export function apply(ctx, config) {
    * @param chat - chat bridge state.
    * @param signal - request lifetime.
    */
-  async function showModelMenu(chat, signal, messageId) {
-    await hydrateSelection(chat)
-    const choices = await loadModelChoices()
-    const current = selectionForChat(chat).current
-    const rows = choices.map((choice) => [{
-      text: `${choice.id === current.model ? '✅ ' : ''}${choice.label} · ${choice.id}`,
-      callback_data: `m:${choice.id}`,
+  async function showModelMenu(chat, signal, messageId, page = 0) {
+    const catalog = await modelCatalog.load()
+    const target = messageId ?? chat.panelMessageId
+    const back = [{ text: tr('⬅️ Back', '⬅️ Назад'), callback_data: 'b:menu' }]
+    if (catalog === undefined || catalog.groups.length === 0) {
+      await renderMenu(chat.chatId, chat.threadId, target, `<b>${tr('Model', 'Модель')}</b>\n\n${tr('No models are available right now.', 'Сейчас нет доступных моделей.')}`, [back], signal)
+      return
+    }
+    const current = await currentModel(chat)
+    const shown = pageOf(catalog.groups, page)
+    const rows = shown.items.map((group) => [{
+      text: `${group.id === current?.provider ? '✅ ' : ''}${group.name ?? group.id} (${group.models.length})`,
+      callback_data: `mp:${catalogKey(group.id)}:0`,
     }])
-    rows.push([{ text: tr('⬅️ Back', '⬅️ Назад'), callback_data: 'b:menu' }])
-    await renderMenu(chat.chatId, chat.threadId, messageId ?? chat.panelMessageId, `<b>${tr('Model', 'Модель')}</b>\n\n${tr('Choose a model for this session.', 'Выбери модель для этой сессии.')}`, rows, signal)
+    const nav = pagerRow(shown, (index) => `pp:${index}`)
+    if (nav.length > 0) rows.push(nav)
+    rows.push(back)
+    const failed = catalog.failures.length === 0
+      ? ''
+      : `\n${tr('Unavailable', 'Недоступно')}: ${catalog.failures.map((failure) => escapeHtml(failure.name ?? failure.id)).join(', ')}`
+    await renderMenu(
+      chat.chatId,
+      chat.threadId,
+      target,
+      `<b>${tr('Model', 'Модель')}</b>\n\n${tr('Now', 'Сейчас')}: ${escapeHtml(modelName(catalog, current))}\n${tr('Choose a provider.', 'Выбери провайдера.')}${failed}`,
+      rows,
+      signal,
+    )
+  }
+
+  /**
+   * Show one provider's models.
+   * @param chat - chat bridge state.
+   * @param providerKey - `catalogKey(provider)`.
+   * @param page - model page.
+   * @param signal - request lifetime.
+   * @param messageId - panel message to edit.
+   */
+  async function showProviderModels(chat, providerKey, page, signal, messageId) {
+    const catalog = await modelCatalog.load()
+    const group = providerByKey(catalog, providerKey)
+    if (group === undefined) {
+      await showModelMenu(chat, signal, messageId)
+      return
+    }
+    const current = await currentModel(chat)
+    const shown = pageOf(group.models, page)
+    const rows = shown.items.map((model) => [{
+      text: `${group.id === current?.provider && model.id === current?.model ? '✅ ' : ''}${model.name ?? model.id}`,
+      callback_data: `ms:${catalogKey(group.id, model.id)}`,
+    }])
+    const nav = pagerRow(shown, (index) => `mp:${providerKey}:${index}`)
+    if (nav.length > 0) rows.push(nav)
+    rows.push([{ text: tr('⬅️ Providers', '⬅️ Провайдеры'), callback_data: 'o:model' }])
+    await renderMenu(
+      chat.chatId,
+      chat.threadId,
+      messageId ?? chat.panelMessageId,
+      `<b>${escapeHtml(group.name ?? group.id)}</b>\n\n${tr('Choose a model for this session.', 'Выбери модель для этой сессии.')}`,
+      rows,
+      signal,
+    )
+  }
+
+  /**
+   * Previous/next buttons for a paged picker.
+   * @param shown - `pageOf` result.
+   * @param callback - callback data for a page index.
+   * @returns the row, empty for a single page.
+   */
+  function pagerRow(shown, callback) {
+    if (shown.pages <= 1) return []
+    const row = []
+    if (shown.page > 0) row.push({ text: '◀️', callback_data: callback(shown.page - 1) })
+    row.push({ text: `${shown.page + 1}/${shown.pages}`, callback_data: callback(shown.page) })
+    if (shown.page < shown.pages - 1) row.push({ text: '▶️', callback_data: callback(shown.page + 1) })
+    return row
   }
 
   /**
@@ -2633,23 +2729,24 @@ export function apply(ctx, config) {
    * @param signal - request lifetime.
    */
   async function showEffortMenu(chat, signal, messageId) {
-    await hydrateSelection(chat)
-    const current = selectionForChat(chat).current
-    const rows = []
-    let row = []
-    for (const choice of EFFORT_CHOICES) {
-      row.push({
-        text: `${choice.id === current.reasoningEffort ? '✅ ' : ''}${choice.label}`,
-        callback_data: `e:${choice.id}`,
-      })
-      if (row.length === 2) {
-        rows.push(row)
-        row = []
-      }
-    }
-    if (row.length > 0) rows.push(row)
+    const catalog = await modelCatalog.load()
+    const current = await currentModel(chat)
+    const model = findModel(catalog, current)?.model
+    const choices = effortChoices(model, defaultEffortLabel())
+    const effective = current?.reasoningEffort ?? model?.reasoning?.defaultEffort
+    const rows = choices.map((choice) => [{
+      text: `${(choice.id ?? undefined) === effective ? '✅ ' : ''}${choice.name}`,
+      callback_data: `e:${choice.id ?? '-'}`,
+    }])
     rows.push([{ text: tr('⬅️ Back', '⬅️ Назад'), callback_data: 'b:menu' }])
-    await renderMenu(chat.chatId, chat.threadId, messageId ?? chat.panelMessageId, `<b>${tr('Reasoning effort', 'Уровень effort')}</b>\n\n${tr('Choose the effort level.', 'Выбери уровень effort.')}`, rows, signal)
+    await renderMenu(
+      chat.chatId,
+      chat.threadId,
+      messageId ?? chat.panelMessageId,
+      `<b>${tr('Reasoning effort', 'Уровень effort')}</b>\n\n${tr('Model', 'Модель')}: ${escapeHtml(modelName(catalog, current))}\n${choices.length === 0 ? tr('This model has no reasoning effort.', 'У этой модели нет reasoning effort.') : tr('Choose the effort level.', 'Выбери уровень effort.')}`,
+      rows,
+      signal,
+    )
   }
 
   /**
@@ -2694,19 +2791,19 @@ export function apply(ctx, config) {
    */
   async function showContext(chat, signal, messageId) {
     await hydrateSelection(chat)
-    await loadModelChoices()
-    const current = selectionForChat(chat).current
+    const catalog = await modelCatalog.load()
+    const current = await currentModel(chat)
     const context = await contextSummary(chat)
     const cacheHit = context.cacheRead !== undefined && context.inputTokens !== undefined
       ? `${Math.round((context.cacheRead / Math.max(1, context.inputTokens + context.cacheRead)) * 1000) / 10}%`
       : 'n/a'
     const lines = [
       `<b>${tr('Context', 'Контекст')}</b>`,
-      `${tr('Model', 'Модель')}: ${escapeHtml(modelLabel(current.model))} (<code>${escapeHtml(current.model)}</code>)`,
+      `${tr('Model', 'Модель')}: ${escapeHtml(modelName(catalog, current))} (<code>${escapeHtml(current.model)}</code>)`,
       `${tr('Window', 'Окно')}: ${formatTokens(context.windowSize)}`,
       `${tr('Last request', 'Последний запрос')}: ${context.used === undefined ? tr('unknown', 'неизвестно') : formatTokens(context.used)}`,
       `${tr('Cache hit', 'Попадание в кэш')}: ${cacheHit}`,
-      `${tr('Effort', 'Effort')}: ${effortLabel(current.reasoningEffort)}`,
+      `${tr('Effort', 'Effort')}: ${effortName(catalog, current, defaultEffortLabel())}`,
       `${tr('Mode', 'Режим')}: ${escapeHtml(permissionLabel(currentPermission(chat)))}`,
     ]
     await renderMenu(
@@ -2726,19 +2823,49 @@ export function apply(ctx, config) {
    * @param signal - request lifetime.
    */
   async function applySelection(chat, next, signal) {
-    const current = selectionForChat(chat).current
-    chat.selection.current = {
-      ...current,
+    const selection = selectionForChat(chat)
+    const previous = { ...selection.current }
+    selection.current = {
+      ...selection.current,
       ...next,
-      provider: 'deepseek-official',
+    }
+    selection.assembled = undefined
+    await persistPreferences(chat)
+    const chosen = selection.current
+    const controller = ctx.get('sessionController')
+    let applied = false
+    if (typeof controller?.selectModel === 'function' && typeof chat.sessionId === 'string') {
+      try {
+        const result = await controller.selectModel({ sessionId: chat.sessionId, ...chosen })
+        const selected = result?.selected
+        if (selected !== undefined && typeof selected.provider === 'string' && typeof selected.model === 'string') {
+          selection.current = {
+            provider: selected.provider,
+            model: selected.model,
+            reasoningEffort: selected.reasoningEffort,
+          }
+        }
+        applied = true
+      } catch (error) {
+        selection.current = previous
+        await persistPreferences(chat)
+        if (!signal.aborted) warn(`model selection apply failed: ${messageOf(error)}`)
+        throw error
+      }
+    }
+    if (!applied) {
+      try {
+        const agent = await ensureAgent(chat)
+        if (typeof agent?.model?.select === 'function') agent.model.select(selection.current)
+        else agent.session.append('model/selection', selection.current)
+      } catch (error) {
+        selection.current = previous
+        await persistPreferences(chat)
+        if (!signal.aborted) warn(`model selection apply failed: ${messageOf(error)}`)
+        throw error
+      }
     }
     await persistPreferences(chat)
-    try {
-      const agent = await ensureAgent(chat)
-      agent.session.append('model/selection', chat.selection.current)
-    } catch (error) {
-      if (!signal.aborted) warn(`model selection apply failed: ${messageOf(error)}`)
-    }
   }
 
   /** Remove a topic's local binding after Telegram deleted it. */
@@ -2749,8 +2876,15 @@ export function apply(ctx, config) {
     delete state.topicNames?.[key]
     delete state.directTopics?.[key]
     delete state.goalPanels?.[key]
+    const removedSessions = new Set()
     for (const [sessionId, record] of Object.entries(state.sessions)) {
-      if (record?.chatId === chatId && record?.threadId === threadId) delete state.sessions[sessionId]
+      if (record?.chatId === chatId && record?.threadId === threadId) {
+        removedSessions.add(sessionId)
+        delete state.sessions[sessionId]
+      }
+    }
+    for (const [goalId, origin] of Object.entries(state.goalOrigins ?? {})) {
+      if (removedSessions.has(origin?.sessionId)) delete state.goalOrigins[goalId]
     }
     await persistState()
   }
@@ -3045,7 +3179,7 @@ export function apply(ctx, config) {
     state.threads[`${chatId}:${threadId}`] = sessionId
     await persistState()
     forgetChatState(chatId, threadId)
-    await notifyAll(`📂 ${tr('Session opened', 'Открыта сессия')} <code>${escapeHtml(sessionId)}</code>`, signal)
+    await send(chatId, `📂 ${tr('Session opened', 'Открыта сессия')} <code>${escapeHtml(sessionId)}</code>`, signal, threadId)
     await deliverSessionTopic(record, chatId, signal)
     return record
   }
@@ -3277,24 +3411,51 @@ export function apply(ctx, config) {
         await sendMenu(chat.id, threadId, chatState, signal, query.message.message_id)
         return
       }
-      if (prefix === 'm' || prefix === 'e' || prefix === 'p') {
+      if (prefix === 'pp' || prefix === 'mp') {
         const chatState = await chatFor(chat.id, threadId)
         if (typeof chatState.sessionId !== 'string') {
           await send(chat.id, tr('This topic is not bound to a session.', 'Этот topic не привязан к сессии.'), signal, threadId)
           return
         }
-        if (prefix === 'm') {
-          if (!MODEL_CHOICES.some((choice) => choice.id === ref)) {
-            await send(chat.id, tr('Unknown model.', 'Неизвестная модель.'), signal, threadId)
+        if (prefix === 'pp') {
+          await showModelMenu(chatState, signal, query.message.message_id, Number(ref))
+        } else {
+          const [providerKey, page] = ref.split(':')
+          await showProviderModels(chatState, providerKey, Number(page), signal, query.message.message_id)
+        }
+        return
+      }
+      if (prefix === 'ms' || prefix === 'e' || prefix === 'p' || prefix === 'm') {
+        const chatState = await chatFor(chat.id, threadId)
+        if (typeof chatState.sessionId !== 'string') {
+          await send(chat.id, tr('This topic is not bound to a session.', 'Этот topic не привязан к сессии.'), signal, threadId)
+          return
+        }
+        if (prefix === 'ms') {
+          const found = modelByKey(await modelCatalog.load(true), ref)
+          if (found === undefined) {
+            await send(chat.id, tr('That model is no longer available. Open the model menu again.', 'Эта модель больше недоступна. Открой меню моделей заново.'), signal, threadId)
             return
           }
-          await applySelection(chatState, { model: ref }, signal)
+          await applySelection(chatState, pickedSelection(await currentModel(chatState), found.group.id, found.model), signal)
         } else if (prefix === 'e') {
-          if (!EFFORT_CHOICES.some((choice) => choice.id === ref)) {
+          const catalog = await modelCatalog.load()
+          const current = await currentModel(chatState)
+          const model = findModel(catalog, current)?.model
+          const choice = effortChoices(model, defaultEffortLabel()).find((entry) => (entry.id ?? '-') === ref)
+          if (current === undefined || choice === undefined) {
             await send(chat.id, tr('Unknown effort.', 'Неизвестный effort.'), signal, threadId)
             return
           }
-          await applySelection(chatState, { reasoningEffort: ref }, signal)
+          await applySelection(chatState, {
+            provider: current.provider,
+            model: current.model,
+            ...(choice.id === undefined ? { reasoningEffort: undefined } : { reasoningEffort: choice.id }),
+          }, signal)
+        } else if (prefix === 'm') {
+          // Buttons from the previous hardcoded picker.
+          await showModelMenu(chatState, signal, query.message.message_id)
+          return
         } else {
           const service = ctx.get('permissionPresets')
           const agent = await ensureAgent(chatState)
@@ -3759,7 +3920,7 @@ export function apply(ctx, config) {
     }
     if (command === '/menu') {
       if (!inSession) await send(chat.id, tr('The menu is available in a session topic.', 'Меню доступно в topic сессии.'), signal, threadId)
-      else await sendMenu(chat.id, threadId, chatState, signal)
+      else await sendMenu(chat.id, threadId, chatState, signal, undefined, true)
       return
     }
     if (command === '/sessions') {
@@ -3972,6 +4133,7 @@ export function apply(ctx, config) {
             return
           }
           goals.clear(agent, { id: view.id, revision: view.revision })
+          await forgetGoalOrigin(view.id)
           await clearGoalPanel(chatState, signal)
           await send(
             chat.id,
@@ -3989,6 +4151,7 @@ export function apply(ctx, config) {
             return
           }
           view = goals.pause(agent, { id: view.id, revision: view.revision })
+          await markTelegramGoal(chatState, view)
           await renderGoalPanel(chatState, view, signal)
           return
         }
@@ -4002,10 +4165,12 @@ export function apply(ctx, config) {
             return
           }
           if (view.phase === 'active' && view.activation === 'armed') {
+            await markTelegramGoal(chatState, view)
             await renderGoalPanel(chatState, view, signal)
             return
           }
           view = goals.resume(agent, { id: view.id, revision: view.revision })
+          await markTelegramGoal(chatState, view)
           await renderGoalPanel(chatState, view, signal)
           return
         }
@@ -4015,8 +4180,12 @@ export function apply(ctx, config) {
             return
           }
           if (view === undefined || view.phase === 'complete') {
-            if (view !== undefined) goals.clear(agent, { id: view.id, revision: view.revision })
+            if (view !== undefined) {
+              goals.clear(agent, { id: view.id, revision: view.revision })
+              await forgetGoalOrigin(view.id)
+            }
             view = goals.create(agent, { objective })
+            await markTelegramGoal(chatState, view)
             await renderGoalPanel(chatState, view, signal, 'fresh')
             return
           }
@@ -4030,6 +4199,7 @@ export function apply(ctx, config) {
               warn(`goal resume after edit failed: ${messageOf(error)}`)
             }
           }
+          await markTelegramGoal(chatState, view)
           await renderGoalPanel(chatState, view, signal, 'fresh')
           return
         }
@@ -4049,10 +4219,12 @@ export function apply(ctx, config) {
               warn(`goal resume after replace failed: ${messageOf(error)}`)
             }
           }
+          await markTelegramGoal(chatState, view)
           await renderGoalPanel(chatState, view, signal, 'fresh')
           return
         }
         view = goals.create(agent, { objective })
+        await markTelegramGoal(chatState, view)
         await renderGoalPanel(chatState, view, signal, 'fresh')
       } catch (error) {
         await send(chat.id, `❌ ${escapeHtml(messageOf(error))}`, signal, threadId)
@@ -4429,14 +4601,46 @@ export function apply(ctx, config) {
   }
 
   /** Show the current goal before a new assistant generation starts. */
+  /** @returns whether a goal was started or driven from this Telegram topic. */
+  function goalIsTelegram(chatState, goalId) {
+    const origin = typeof goalId === 'string' ? state.goalOrigins?.[goalId] : undefined
+    return origin !== undefined && origin.sessionId === chatState.sessionId
+  }
+
+  /** Remember that work on this goal started in a Telegram topic. */
+  async function markTelegramGoal(chatState, view) {
+    if (typeof view?.id !== 'string' || typeof chatState.sessionId !== 'string') return
+    state.goalOrigins ??= {}
+    for (const [id, origin] of Object.entries(state.goalOrigins)) {
+      if (origin?.sessionId === chatState.sessionId && id !== view.id) delete state.goalOrigins[id]
+    }
+    state.goalOrigins[view.id] = {
+      sessionId: chatState.sessionId,
+      chatId: chatState.chatId,
+      threadId: chatState.threadId,
+      at: Date.now(),
+    }
+    await persistState()
+  }
+
+  /** Drop the Telegram origin of a cleared goal. */
+  async function forgetGoalOrigin(goalId) {
+    if (typeof goalId !== 'string' || state.goalOrigins?.[goalId] === undefined) return
+    delete state.goalOrigins[goalId]
+    await persistState()
+  }
+
   async function showGoalBeforeTurn(chatState) {
     const goals = ctx.get('goals')
     if (goals === undefined || typeof chatState.sessionId !== 'string') return
     try {
       const agent = ctx.get('agents')?.get(chatState.sessionId) ?? await ensureAgent(chatState)
       const view = goals.get(agent)
-      if (view === undefined) await clearGoalPanel(chatState, bridgeAbort.signal)
-      else await renderGoalPanel(chatState, view, bridgeAbort.signal)
+      if (view === undefined || !goalIsTelegram(chatState, view.id)) {
+        await clearGoalPanel(chatState, bridgeAbort.signal)
+        return
+      }
+      await renderGoalPanel(chatState, view, bridgeAbort.signal)
     } catch (error) {
       warn(`goal panel before turn failed: ${messageOf(error)}`)
     }
@@ -4778,13 +4982,12 @@ export function apply(ctx, config) {
   async function sendToTopic(request, signal = bridgeAbort.signal) {
     await stateReady
     if (lifetime === undefined) throw new Error('The Telegram bot is not running.')
-    if (topics.chatId === 0) throw new Error('The bot has no chat yet. Send /start to the bot first.')
     const text = typeof request?.text === 'string' ? request.text : ''
     const paths = Array.isArray(request?.files) ? request.files.map(String) : []
     if (text.trim().length === 0 && paths.length === 0) throw new Error('Nothing to send: give text or files.')
-    const chatId = topics.chatId
-    const target = resolveTopicTarget(state.topicNames, chatId, request?.topic)
-    const threadId = target.threadId
+    const keys = new Set([...Object.keys(state.threads), ...Object.keys(state.topicNames ?? {})])
+    const target = resolveSendTarget([...keys], state.topicNames, request?.chat, request?.topic)
+    const { chatId, threadId } = target
     const files = []
     for (const path of paths) {
       if (!isAbsolute(path)) throw new Error(`File paths must be absolute: ${path}`)
@@ -4870,10 +5073,18 @@ export function apply(ctx, config) {
 
   /** Topic sending for other plugins: `ctx.get('telegramTopics').send(...)`. */
   const topicService = {
-    send: (topic, text, files = [], options = {}) => sendToTopic({ topic, text, files, from: options.from }),
-    topics: () => Object.entries(state.topicNames ?? {})
-      .filter(([key]) => key.startsWith(`${topics.chatId}:`))
-      .map(([key, name]) => ({ threadId: Number(key.split(':')[1]), name, sessionId: state.threads[key] ?? null })),
+    send: (topic, text, files = [], options = {}) => sendToTopic({ topic, chat: options.chat, text, files, from: options.from }),
+    topics: () => [...new Set([...Object.keys(state.threads), ...Object.keys(state.topicNames ?? {})])]
+      .map((key) => {
+        const split = key.lastIndexOf(':')
+        return {
+          chatId: Number(key.slice(0, split)),
+          threadId: Number(key.slice(split + 1)),
+          name: state.topicNames?.[key] ?? null,
+          sessionId: state.threads[key] ?? null,
+        }
+      })
+      .sort((left, right) => left.chatId - right.chatId || left.threadId - right.threadId),
   }
   if (typeof ctx.provide === 'function') ctx.provide('telegramTopics', topicService)
 
@@ -4885,6 +5096,7 @@ export function apply(ctx, config) {
       type: 'object',
       properties: {
         topic: { type: 'string', description: 'Topic name (case does not matter) or numeric thread id.' },
+        chat: { type: 'string', description: 'Numeric chat id; only needed when several chats have a topic with this name or thread id.' },
         text: { type: 'string', description: 'Message text; Markdown is converted for Telegram.' },
         files: { type: 'array', items: { type: 'string' }, description: 'Absolute paths of files to attach.' },
       },
@@ -4899,6 +5111,7 @@ export function apply(ctx, config) {
       const sessionId = exec?.agent?.id ?? exec?.agent?.session?.id
       return sendToTopic({
         topic: args.topic,
+        chat: args.chat,
         text: typeof args.text === 'string' ? args.text : '',
         files: Array.isArray(args.files) ? args.files : [],
         from: typeof sessionId === 'string' ? { label: `session ${sessionId}`, sessionId } : undefined,
@@ -4914,7 +5127,7 @@ export function apply(ctx, config) {
   /** Requests written by dsh-telegram-send or any process with DSH home access. */
   const outbox = createOutbox({
     handle: (request) => sendToTopic(request),
-    ready: () => lifetime !== undefined && topics.chatId !== 0 && !bridgeAbort.signal.aborted,
+    ready: () => lifetime !== undefined && !bridgeAbort.signal.aborted,
     onError: (error) => reportError('outbox', error),
   })
   ctx.effect(() => {
