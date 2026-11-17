@@ -37,5 +37,10 @@ export const Config = z.object({
   showThinking: z.boolean().default(true).volatile(),
   /** Mirror tool calls into the session topic. */
   showToolCalls: z.boolean().default(true).volatile(),
+  /**
+   * Also show turns started outside Telegram (Web UI, scheduled tasks) in the
+   * session's topic.
+   */
+  mirrorTurns: z.boolean().default(false).volatile(),
 })
 

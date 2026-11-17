@@ -23,7 +23,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Then enable **Disallow
 ## Features
 
 - One Telegram topic per DSH session; Web and Telegram use the same session.
-- Telegram mirrors turns initiated from Telegram; turns started in the Web UI stay in Web. Automatic goal rounds for a Telegram-bound session are mirrored too, with thinking, tool calls and the final answer.
+- Telegram mirrors turns initiated from Telegram; turns started in the Web UI stay in Web unless **Show turns from other clients** is on. Automatic goal rounds for a Telegram-bound session are mirrored too, with thinking, tool calls and the final answer.
 - `/sessions` lists workspaces and existing sessions, and can create a new session in a selected workspace.
 - A `typing…` action is shown in the topic while its turn runs and stops when the answer is ready.
 - Assistant answers stream into the topic with Telegram Markdown formatting. Messages sent while the agent is working are queued and processed after the current turn; `/clear` removes that queue without stopping the current answer.
@@ -77,6 +77,7 @@ Restart `dsh web` after installing or updating the plugin. Then open **Settings 
 | Allowed chats | Telegram chat ids or `@channelnames` |
 | Show model thinking | Show reasoning in a temporary message |
 | Show tool calls | Show tool calls in a temporary message |
+| Show turns from other clients | Also show turns started in the Web UI or by scheduled tasks in the session's topic (`mirrorTurns`); off by default |
 | Bot language | `en` (default) or `ru` |
 | Enable bot | Start or pause Telegram polling |
 
