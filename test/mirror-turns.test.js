@@ -100,3 +100,53 @@ test('mirrorTurns does not echo turns that came from Telegram', async () => {
     run.stop()
   }
 })
+
+/** Start a Web turn without ending it, so /stop can interrupt it. */
+function beginWebTurn(agent, turn) {
+  agent.emit('session/event', { id: agent.id }, { type: 'turn/start', data: { turn } })
+  agent.emit('session/event', { id: agent.id }, {
+    type: 'user/message',
+    data: {
+      id: `m-${turn}`,
+      role: 'user',
+      content: [{ type: 'text', text: 'from web' }],
+      source: { kind: 'user', rpcId: `web-${turn}` },
+    },
+  })
+  agent.emit('agent/assistant-stream', { agent, frame: { type: 'chunk', chunk: { type: 'block-start', blockType: 'text' } } })
+  agent.emit('agent/assistant-stream', { agent, frame: { type: 'chunk', chunk: { type: 'text-delta', text: 'partial answer' } } })
+}
+
+test('with mirrorTurns off, /stop leaves a Web turn alone', async () => {
+  const run = await start({ mirrorTurns: false }, bound)
+  try {
+    const agent = run.host.makeAgent(SESSION, '/tmp/default-workspace')
+    let cancelled = 0
+    agent.cancel = () => { cancelled += 1 }
+    beginWebTurn(agent, 1)
+    await wait(100)
+    run.telegram.push({ message_thread_id: THREAD, text: '/stop' })
+    await wait(200)
+    assert.equal(cancelled, 0, 'the external turn must not be cancelled')
+    assert.ok(!run.telegram.calls.some((call) => call.body?.text === '⏹ Stopped.'))
+  } finally {
+    run.stop()
+  }
+})
+
+test('with mirrorTurns on, /stop stops the mirrored Web turn', async () => {
+  const run = await start({ mirrorTurns: true }, bound)
+  try {
+    const agent = run.host.makeAgent(SESSION, '/tmp/default-workspace')
+    let cancelled = 0
+    agent.cancel = () => { cancelled += 1 }
+    beginWebTurn(agent, 1)
+    await wait(150)
+    run.telegram.push({ message_thread_id: THREAD, text: '/stop' })
+    await wait(200)
+    assert.equal(cancelled, 1, 'the mirrored turn is cancelled')
+    assert.ok(run.telegram.calls.some((call) => call.body?.text === '⏹ Stopped.'))
+  } finally {
+    run.stop()
+  }
+})
