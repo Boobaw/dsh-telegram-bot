@@ -60,6 +60,41 @@ test('mirrorTurns shows a Web turn in its topic: the prompt, then the answer onc
   }
 })
 
+test('mirrorTurns shows a goal round started outside Telegram', async () => {
+  const run = await start({ mirrorTurns: true }, bound)
+  try {
+    const agent = run.host.makeAgent(SESSION, '/tmp/default-workspace')
+    const before = run.telegram.calls.length
+    playTurn(agent, 1, { kind: 'goal', goalId: 'goal-web', revision: 1, round: 2 }, 'goal work', 'goal answer')
+    await wait(200)
+    const texts = topicTexts(run.telegram.calls.slice(before))
+    assert.equal(texts[0], '🎯 Goal · 2:\ngoal work')
+    assert.equal(texts.at(-1), 'goal answer')
+  } finally {
+    run.stop()
+  }
+})
+
+test('mirrorTurns does not duplicate a goal round started from Telegram', async () => {
+  const run = await start({ mirrorTurns: true }, {
+    ...bound,
+    goalOrigins: { 'goal-tg': { sessionId: SESSION, chatId: 100, threadId: THREAD, at: 1 } },
+  })
+  try {
+    const agent = run.host.makeAgent(SESSION, '/tmp/default-workspace')
+    const before = run.telegram.calls.length
+    playTurn(agent, 1, { kind: 'goal', goalId: 'goal-tg', revision: 1, round: 1 }, 'telegram goal', 'telegram goal answer')
+    await wait(200)
+    assert.deepEqual(
+      run.telegram.calls.slice(before).filter((call) => call.body?.message_thread_id === THREAD),
+      [],
+      'the Telegram-origin goal path owns this round',
+    )
+  } finally {
+    run.stop()
+  }
+})
+
 test('mirrorTurns shows scheduled turns with their own label', async () => {
   const run = await start({ mirrorTurns: true }, bound)
   try {

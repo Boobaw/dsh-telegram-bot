@@ -23,7 +23,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Then enable **Disallow
 ## Features
 
 - One Telegram topic per DSH session; Web and Telegram use the same session.
-- Telegram mirrors turns initiated from Telegram; turns started in the Web UI stay in Web unless **Show turns from other clients** is on. Automatic goal rounds for a Telegram-bound session are mirrored too, with thinking, tool calls and the final answer.
+- Telegram mirrors turns initiated from Telegram; turns started in the Web UI stay in Web unless **Show turns from other clients** is on. When it is on, Web-started goal rounds are mirrored too; goals started from Telegram always show their panel and rounds.
 - `/sessions` lists workspaces and existing sessions, and can create a new session in a selected workspace.
 - A `typing…` action is shown in the topic while its turn runs and stops when the answer is ready.
 - Assistant answers stream into the topic with Telegram Markdown formatting. Messages sent while the agent is working are queued and processed after the current turn; `/clear` removes that queue without stopping the current answer.
@@ -35,7 +35,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Then enable **Disallow
 - Documents and photos sent in a session topic are saved as DSH attachments and passed to the agent.
 - Each prompt from Telegram records its sender on the message source as `principal`, the field DSH uses for who is behind a user message: `{ kind: 'telegram-user', channel: 'telegram', id: '123', name: 'Ana Silva', username: 'ana', chat: { id, thread, name } }`. Scripts and plugins that read session logs can tell which allowed user wrote what.
 - `/new`, `/last`, `/goal`, `/rename`, `/fork`, `/clear`, `/stop`, `/restart`, `/status` and `/menu`.
-- `/goal` shows the current DSH goal and the command hints. `/goal <objective>` creates or replaces the goal and starts working immediately; `/goal edit <objective>` updates the objective and resumes a paused, blocked or disarmed goal; `/goal pause`, `/goal resume` and `/goal clear` manage the current goal. `/goal <objective>` and `/goal edit <objective>` replace the current panel with one fresh message; later goal changes edit that message in place. The panel is never pinned.
+- `/goal` shows the current DSH goal and the command hints. `/goal <objective>` creates or replaces the goal and starts working immediately; `/goal edit <objective>` updates the objective and resumes a paused, blocked or disarmed goal; `/goal pause`, `/goal resume` and `/goal clear` manage the current goal. `/goal <objective>` and `/goal edit <objective>` replace the current panel with one fresh message; later goal changes edit that message in place. The panel is never pinned. A goal created only in the Web UI has no Telegram panel; with **Show turns from other clients** on, its rounds still appear as `🎯 Goal · N` messages.
 - `/new` in a session topic starts a fresh DSH session in the same workspace and binds it to the same topic; the previous session stays in DSH. In All it opens a new session topic.
 - `/fork [name]` creates a DSH session fork in a new Telegram topic; without a name it uses the previous title plus the branch number.
 - The session picker also has **🔀 Continue in Telegram fork**; automatic fork topics end with `(N)`.
@@ -77,7 +77,7 @@ Restart `dsh web` after installing or updating the plugin. Then open **Settings 
 | Allowed chats | Telegram chat ids or `@channelnames` |
 | Show model thinking | Show reasoning in a temporary message |
 | Show tool calls | Show tool calls in a temporary message |
-| Show turns from other clients | Also show turns started in the Web UI or by scheduled tasks in the session's topic (`mirrorTurns`); off by default |
+| Show turns from other clients | Also show turns started in the Web UI, scheduled tasks and Web-started goals in the session's topic (`mirrorTurns`); off by default |
 | Bot language | `en` (default) or `ru` |
 | Enable bot | Start or pause Telegram polling |
 

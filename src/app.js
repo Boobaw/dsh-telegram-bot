@@ -2593,9 +2593,21 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Label for a mirrored prompt. Telegram-origin goal rounds keep their own
+   * goal path; a goal created outside Telegram is mirrored when mirrorTurns is
+   * on, with the round number.
+   */
+  function mirrorLabelFor(chat, source) {
+    if (source?.kind !== 'goal') return mirrorLabel(source)
+    if (goalIsTelegram(chat, source.goalId)) return undefined
+    const round = Number.isSafeInteger(source.round) ? ` · ${source.round}` : ''
+    return `${tr('🎯 Goal', '🎯 Цель')}${round}`
+  }
+
+  /**
    * Host-wide session events, for `mirrorTurns`. A turn is adopted only when
    * its topic is idle and its prompt did not come from Telegram, so Telegram
-   * turns and goal rounds never pass through here.
+   * turns and Telegram-origin goal rounds never pass through here.
    */
   function onMirrorEvent(session, event) {
     if (readLive(config.mirrorTurns, false) !== true || lifetime === undefined) return
@@ -2608,9 +2620,9 @@ export function apply(ctx, config) {
     }
     if (event.type === 'user/message') {
       const source = event.data?.source
-      const label = mirrorLabel(source)
+      const label = mirrorLabelFor(chat, source)
       if (label === undefined) {
-        // A Telegram prompt or goal round owns this turn.
+        // A Telegram prompt or a Telegram-origin goal round owns this turn.
         if (source?.kind === 'goal' || source?.kind === 'user') chat.mirrorCandidate = undefined
         return
       }
