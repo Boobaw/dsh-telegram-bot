@@ -2138,9 +2138,10 @@ export function apply(ctx, config) {
       // tool display edits.
       if (chat.answerFlushing || (chat.editTimer !== null && chat.text.length > 0)) return
       const epoch = chat.toolEpoch ?? 0
-      const lines = chat.tools.slice(-5).map(formatToolCall).join('\n').split('\n')
-      if (lines.length > 0) lines[lines.length - 1] = lines.at(-1).slice(0, 26).trimEnd()
-      const body = lines.join('\n')
+      // Keep every formatted line intact: slicing the last line here can cut
+      // an opening <code> tag from its closing tag and make Telegram reject
+      // the whole tool message as malformed HTML.
+      const body = chat.tools.slice(-5).map(formatToolCall).join('\n')
       if (body === chat.toolLastText) return
       chat.toolLastText = body
       if (chat.toolMessageId === null) {

@@ -254,7 +254,7 @@ test('private-chat topics send with message_thread_id and edit by message id', a
     agent.emit('agent/assistant-stream', {
       frame: {
         type: 'chunk',
-        chunk: { type: 'block-end', block: { type: 'tool-call', id: 'tool-1', name: 'bash', arguments: '{"command":"pwd"}' } },
+        chunk: { type: 'block-end', block: { type: 'tool-call', id: 'tool-1', name: 'bash', arguments: JSON.stringify({ command: 'echo ' + 'a'.repeat(120) }) } },
       },
     })
     await wait(600)
@@ -269,10 +269,14 @@ test('private-chat topics send with message_thread_id and edit by message id', a
         && typeof call.body?.text === 'string' && call.body.text.includes('Goal answer')),
       'goal round answer is mirrored into the topic',
     )
-    assert.ok(
-      telegram.calls.some((call) => (call.method === 'sendMessage' || call.method === 'editMessageText')
-        && typeof call.body?.text === 'string' && call.body.text.includes('bash')),
-      'goal round tool call is mirrored into the topic',
+    const toolText = telegram.calls
+      .map((call) => call.body?.text)
+      .find((text) => typeof text === 'string' && text.includes('bash'))
+    assert.ok(toolText !== undefined, 'goal round tool call is mirrored into the topic')
+    assert.equal(
+      (toolText.match(/<code>/gu) ?? []).length,
+      (toolText.match(/<\/code>/gu) ?? []).length,
+      'long tool arguments keep balanced HTML tags',
     )
 
     // A goal started in the Web UI has no Telegram origin: its rounds must not
