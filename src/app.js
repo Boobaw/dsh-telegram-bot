@@ -8,6 +8,7 @@ import {
   BOT_COMMANDS_RU,
   FORWARD_BATCH_MS,
   MAX_TELEGRAM_TEXT,
+  SILENT_REPLY,
   POLL_TIMEOUT_SECONDS,
   RESTART_DEBOUNCE_MS,
   RETRY_DELAY_MS,
@@ -1295,9 +1296,26 @@ export function apply(ctx, config) {
    * @returns a bounded message body.
    */
   function renderChat(chat) {
-    const text = chat.text.trim()
+    const text = withoutSilentMarker(chat.text.trim(), true)
     if (text.length === 0) return ''
     return fitAnswerText(text)
+  }
+
+  /**
+   * Cut the silence marker from the end of an answer, so a session that has
+   * already said what it wanted (a topic send, a file) can end its turn
+   * without a second message.
+   * @param text - trimmed answer text.
+   * @param streaming - also hold back a trailing part that may still become the marker.
+   * @returns the text to show.
+   */
+  function withoutSilentMarker(text, streaming = false) {
+    if (text.endsWith(SILENT_REPLY)) return text.slice(0, -SILENT_REPLY.length).trim()
+    if (streaming) {
+      const start = text.lastIndexOf('[')
+      if (start !== -1 && SILENT_REPLY.startsWith(text.slice(start))) return text.slice(0, start).trim()
+    }
+    return text
   }
 
   /** Pending inline approval prompts keyed by short callback id. */
@@ -2303,16 +2321,21 @@ export function apply(ctx, config) {
     chat.toolMessageId = null
     if (thinkingId !== null) await deleteMessage(chat.chatId, chat.threadId, thinkingId)
     if (toolId !== null) await deleteMessage(chat.chatId, chat.threadId, toolId)
-    const text = chat.text.trim()
-    const chunks = splitAnswerText(text.length > 0 ? text : tr('✅ Done.', '✅ Готово.'))
-    if (chat.messageId !== null) {
-      const edited = await editAnswer(chat.chatId, chat.messageId, chunks[0], bridgeAbort.signal, chat.threadId)
-      if (!edited) await sendAnswer(chat.chatId, chunks[0], bridgeAbort.signal, chat.threadId)
+    const answer = chat.text.trim()
+    const text = withoutSilentMarker(answer)
+    if (text.length === 0 && answer.length > 0) {
+      if (chat.messageId !== null) await deleteMessage(chat.chatId, chat.threadId, chat.messageId)
     } else {
-      await sendAnswer(chat.chatId, chunks[0], bridgeAbort.signal, chat.threadId)
-    }
-    for (const chunk of chunks.slice(1)) {
-      await sendAnswer(chat.chatId, chunk, bridgeAbort.signal, chat.threadId)
+      const chunks = splitAnswerText(text.length > 0 ? text : tr('✅ Done.', '✅ Готово.'))
+      if (chat.messageId !== null) {
+        const edited = await editAnswer(chat.chatId, chat.messageId, chunks[0], bridgeAbort.signal, chat.threadId)
+        if (!edited) await sendAnswer(chat.chatId, chunks[0], bridgeAbort.signal, chat.threadId)
+      } else {
+        await sendAnswer(chat.chatId, chunks[0], bridgeAbort.signal, chat.threadId)
+      }
+      for (const chunk of chunks.slice(1)) {
+        await sendAnswer(chat.chatId, chunk, bridgeAbort.signal, chat.threadId)
+      }
     }
     chat.text = ''
     chat.lastText = ''
