@@ -28,6 +28,7 @@ BotFather: **Bot Settings → Threaded mode → Enable**. Then enable **Disallow
 - A `typing…` action is shown in the topic while its turn runs and stops when the answer is ready.
 - Assistant answers stream into the topic with Telegram Markdown formatting. Messages sent while the agent is working are queued and processed after the current turn; `/clear` removes that queue without stopping the current answer.
 - Replies, quotes and forwards keep their context. Ordinary messages are passed unchanged; only replies, quoted parts and forwarded messages get a short context block. A replied-to photo or document is attached when Telegram allows the bot to download it.
+- An answer that ends with `[SILENT]` posts nothing more: the marker is cut, and when nothing else is left the reply message is not sent. A session that already answered with a topic send can end its turn this way.
 - Reasoning and tool calls are shown as temporary messages and removed as soon as the final answer is ready. Each tool-call entry is capped at three mobile lines.
 - Inline controls for model, reasoning effort, permission mode and context usage. The model picker uses the same provider → model catalog as the Web UI; the effort picker lists that model's own reasoning efforts. These settings belong to the DSH session: a change made in Telegram is written to the session, and a change made in the Web UI is read back before the menu or the next turn.
 - Tool approvals with **Deny** / **Allow** buttons.

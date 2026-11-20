@@ -74,6 +74,8 @@ const BOT_COMMANDS_RU = [
 
 /** Bound one Telegram message body to stay under the 4096-character API limit. */
 const MAX_TELEGRAM_TEXT = 3800
+/** A final answer ending in this text posts nothing more in the topic. */
+const SILENT_REPLY = '[SILENT]'
 /** Host-local diagnostics directory; no secrets are written here. */
 const STATUS_DIR = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'telegram')
 
@@ -84,5 +86,6 @@ export {
   BOT_COMMANDS,
   BOT_COMMANDS_RU,
   MAX_TELEGRAM_TEXT,
+  SILENT_REPLY,
   STATUS_DIR,
 }
