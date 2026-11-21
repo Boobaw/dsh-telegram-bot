@@ -10,7 +10,7 @@ let runtimeStatus = {
   username: '',
   updatedAt: new Date().toISOString(),
   transport: 'https-ipv4',
-  version: '0.4.0',
+  version: '0.4.1',
   agentBridge: 'v1',
   codeRevision: 'goal-panel-mirror',
   lastPollAt: 0,
