@@ -1736,7 +1736,8 @@ export function apply(ctx, config) {
             if (goals === undefined) return
             try {
               const view = goals.get(agent)
-              if (view === undefined || !goalIsTelegram(chat, view.id)) await clearGoalPanel(chat, bridgeAbort.signal)
+              const webPanel = readLive(config.mirrorTurns, false) === true && state.goalPanels?.[chat.key] !== undefined
+              if (view === undefined || (!goalIsTelegram(chat, view.id) && !webPanel)) await clearGoalPanel(chat, bridgeAbort.signal)
               else await renderGoalPanel(chat, view, bridgeAbort.signal, 'update-only')
             } catch (error) {
               reportError('goal-panel-change', error)
@@ -2569,7 +2570,7 @@ export function apply(ctx, config) {
    * Show a turn that started outside Telegram in its topic: the prompt, then
    * reasoning, tool calls and the answer, the same way as a goal round.
    */
-  function adoptMirrorTurn(chat, turn, prompt) {
+  function adoptMirrorTurn(chat, turn, prompt, goal = false) {
     const epoch = (chat.turnEpoch ?? 0) + 1
     chat.busy = true
     chat.done = false
@@ -2590,7 +2591,8 @@ export function apply(ctx, config) {
     startTyping(chat)
     const current = () => !chat.done && chat.turnSource === 'mirror' && chat.turnEpoch === epoch
     chat.mirrorStart = (async () => {
-      if (prompt !== undefined) await sendPlain(chat.chatId, prompt, bridgeAbort.signal, chat.threadId)
+      if (goal) await showMirrorGoalPanel(chat)
+      else if (prompt !== undefined) await sendPlain(chat.chatId, prompt, bridgeAbort.signal, chat.threadId)
       if (!current()) return
       const answer = await sendPlain(chat.chatId, tr('⏳ Generating…', '⏳ Генерирую…'), bridgeAbort.signal, chat.threadId)
       if (!current()) {
@@ -2624,8 +2626,7 @@ export function apply(ctx, config) {
   function mirrorLabelFor(chat, source) {
     if (source?.kind !== 'goal') return mirrorLabel(source)
     if (goalIsTelegram(chat, source.goalId)) return undefined
-    const round = Number.isSafeInteger(source.round) ? ` · ${source.round}` : ''
-    return `${tr('🎯 Goal', '🎯 Цель')}${round}`
+    return tr('🎯 Goal', '🎯 Цель')
   }
 
   /**
@@ -2650,16 +2651,17 @@ export function apply(ctx, config) {
         if (source?.kind === 'goal' || source?.kind === 'user') chat.mirrorCandidate = undefined
         return
       }
-      const prompt = mirrorPromptText(label, event.data)
+      const isGoal = source?.kind === 'goal'
+      const prompt = isGoal ? undefined : mirrorPromptText(label, event.data)
       if (chat.turnSource === 'mirror') {
         // Another message sent into the turn that is already shown.
-        if (prompt !== undefined) fireAndForget('mirror-prompt', () => sendPlain(chat.chatId, prompt, bridgeAbort.signal, chat.threadId))
+        if (!isGoal && prompt !== undefined) fireAndForget('mirror-prompt', () => sendPlain(chat.chatId, prompt, bridgeAbort.signal, chat.threadId))
         return
       }
       const turn = chat.mirrorCandidate
       chat.mirrorCandidate = undefined
       if (turn === undefined || chat.busy || chat.finalizing || chat.turnSource !== undefined) return
-      adoptMirrorTurn(chat, turn, prompt)
+      adoptMirrorTurn(chat, turn, prompt, isGoal)
       return
     }
     if (event.type === 'turn/end') {
@@ -4895,13 +4897,27 @@ export function apply(ctx, config) {
     await persistState()
   }
 
+  /** Show the goal panel for a Web-started goal that is being mirrored. */
+  async function showMirrorGoalPanel(chatState) {
+    const goals = ctx.get('goals')
+    if (goals === undefined || typeof chatState.sessionId !== 'string') return
+    try {
+      const agent = ctx.get('agents')?.get(chatState.sessionId) ?? await ensureAgent(chatState)
+      const view = goals.get(agent)
+      if (view !== undefined) await renderGoalPanel(chatState, view, bridgeAbort.signal)
+    } catch (error) {
+      warn(`mirror goal panel failed: ${messageOf(error)}`)
+    }
+  }
+
   async function showGoalBeforeTurn(chatState) {
     const goals = ctx.get('goals')
     if (goals === undefined || typeof chatState.sessionId !== 'string') return
     try {
       const agent = ctx.get('agents')?.get(chatState.sessionId) ?? await ensureAgent(chatState)
       const view = goals.get(agent)
-      if (view === undefined || !goalIsTelegram(chatState, view.id)) {
+      const webPanel = readLive(config.mirrorTurns, false) === true && state.goalPanels?.[chatState.key] !== undefined
+      if (view === undefined || (!goalIsTelegram(chatState, view.id) && !webPanel)) {
         await clearGoalPanel(chatState, bridgeAbort.signal)
         return
       }

@@ -64,11 +64,20 @@ test('mirrorTurns shows a goal round started outside Telegram', async () => {
   const run = await start({ mirrorTurns: true }, bound)
   try {
     const agent = run.host.makeAgent(SESSION, '/tmp/default-workspace')
+    run.host.goals.set(SESSION, {
+      id: 'goal-web',
+      objective: 'Test the WAN discovery path',
+      phase: 'active',
+      activation: 'armed',
+      roundsStarted: 2,
+      maxGoalRounds: 256,
+    })
     const before = run.telegram.calls.length
     playTurn(agent, 1, { kind: 'goal', goalId: 'goal-web', revision: 1, round: 2 }, 'goal work', 'goal answer')
     await wait(200)
     const texts = topicTexts(run.telegram.calls.slice(before))
-    assert.equal(texts[0], '🎯 Goal · 2:\ngoal work')
+    assert.ok(texts.some((text) => text.includes('🎯 <b>Goal</b>') && text.includes('Test the WAN discovery path')), 'the goal panel is posted')
+    assert.ok(!texts.some((text) => text.includes('<goal_round>') || text.includes('Continue working')), 'driver instructions stay out of Telegram')
     assert.equal(texts.at(-1), 'goal answer')
   } finally {
     run.stop()

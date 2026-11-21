@@ -12,7 +12,7 @@ let runtimeStatus = {
   transport: 'https-ipv4',
   version: '0.4.0',
   agentBridge: 'v1',
-  codeRevision: 'silent-reply',
+  codeRevision: 'goal-panel-mirror',
   lastPollAt: 0,
   lastMessageAt: 0,
   lastChatId: null,

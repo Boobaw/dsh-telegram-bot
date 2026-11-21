@@ -16,6 +16,7 @@ export function makeHost() {
   const hostEvents = new EventEmitter()
   hostEvents.setMaxListeners(100)
   const live = new Map()
+  const goals = new Map()
   const created = []
   const logs = []
   const cleanups = []
@@ -45,6 +46,7 @@ export function makeHost() {
 
   const services = {
     credentials: { resolve: async () => ({ value: 'TEST_TOKEN' }) },
+    goals: { get: (agent) => goals.get(agent?.id) },
     agents: {
       get: (id) => live.get(id),
       create: async ({ sessionId, meta }) => ({ agent: makeAgent(sessionId, meta?.cwd) }),
@@ -78,7 +80,7 @@ export function makeHost() {
     on(name, fn) { hostEvents.on(name, fn); return () => hostEvents.off(name, fn) },
     effect(fn) { cleanups.push(fn()) },
   }
-  return { ctx, live, created, logs, makeAgent, cleanup: () => { for (const fn of cleanups) fn?.() } }
+  return { ctx, live, goals, created, logs, makeAgent, cleanup: () => { for (const fn of cleanups) fn?.() } }
 }
 
 /**
